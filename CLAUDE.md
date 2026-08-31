@@ -126,15 +126,23 @@ and prints the comment. `--video <url>` skips publication when the token is abse
 
 This repository is public, so two habits are mandatory.
 
-**Scan the whole staged tree before pushing, not just the file you suspect.**
-Searching for API-key patterns is not enough — personal data hides in defaults and
-docs. A local path leaked through `.env.example`'s `VIDEO_DIR=` default and
-through a table row in the spec, both of which a secret-pattern scan walks right
-past:
+**Run `uv run python tools/check_staged.py` before every commit that will be
+pushed.** It reads the staged content and exits non-zero on local paths, tokens,
+the course spreadsheet link and personal Disk links. Searching for API-key
+patterns alone is not enough — personal data hides in defaults and docs. A local
+path leaked through `.env.example`'s `VIDEO_DIR=` default and through a table row
+in the spec, and a key-pattern scan walks straight past both.
 
-```bash
-git diff --cached --name-only -z | xargs -0 grep -nIE 'C:\\Users|D:\\|spreadsheets|yadi\.sk'
-```
+Three things that script gets right and an inline `grep` pipeline did not, all
+found by feeding it a deliberate canary:
+
+- It reads content from the **index** (`git show :file`), not the working tree —
+  what gets committed and what sits on disk diverge more often than you expect.
+- It matches **fixed strings**. Backslash patterns expand differently in the
+  shell and in ERE; `grep -E 'D:\\Denis'` silently matched nothing while
+  `grep -F` found it.
+- It skips files that document the patterns themselves, so `CLAUDE.md` does not
+  trip the check by quoting it.
 
 Personal notes stay out of the repo entirely: `spec.md` and `specs/` are
 gitignored. Anything naming a person, a local path, or a shared course document
@@ -144,6 +152,23 @@ gitignored. Anything naming a person, a local path, or a shared course document
 writes that URL into `.git/config` as the branch's upstream, where a later
 `git config --get` will happily print it. Push to `origin` with credentials
 supplied out of band instead.
+
+**Make the guard abort, not merely print.** A chain like
+`grep … && echo STOP || echo clean && git commit` does not stop anything: `&&`
+and `||` are left-associative, so the `git commit` runs after the `echo`
+succeeds, whichever branch was taken. This exact shape printed `!!! СТОП` and
+committed anyway. Write the check so failure actually blocks:
+
+```bash
+if git diff --cached --name-only -z | xargs -0 grep -qIE 'C:\\Users|D:\\|spreadsheets'; then
+  echo "personal data staged — aborting"; exit 1
+fi
+git commit …
+```
+
+The same applies to any pre-flight in this repo — `verify_capture()` raises
+instead of warning for the same reason: a check whose failure path continues is
+worse than no check, because it reads as verified.
 
 **A force-push does not erase anything on GitHub.** Orphaned commits stay
 reachable by SHA until a garbage collection that may never run on a public repo.
