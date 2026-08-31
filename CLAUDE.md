@@ -122,6 +122,35 @@ remote** — a local-only tag yields a 404 for the reviewer. It then publishes t
 video via the Yandex Disk API (`PUT /resources/publish`, then read `public_url`)
 and prints the comment. `--video <url>` skips publication when the token is absent.
 
+## Publishing to the public repo
+
+This repository is public, so two habits are mandatory.
+
+**Scan the whole staged tree before pushing, not just the file you suspect.**
+Searching for API-key patterns is not enough — personal data hides in defaults and
+docs. A local path leaked through `.env.example`'s `VIDEO_DIR=` default and
+through a table row in the spec, both of which a secret-pattern scan walks right
+past:
+
+```bash
+git diff --cached --name-only -z | xargs -0 grep -nIE 'C:\\Users|D:\\|spreadsheets|yadi\.sk'
+```
+
+Personal notes stay out of the repo entirely: `spec.md` and `specs/` are
+gitignored. Anything naming a person, a local path, or a shared course document
+(which carries *other people's* names) does not belong here.
+
+**Never put a token in a URL you hand to git.** `git push -u <url-with-token>`
+writes that URL into `.git/config` as the branch's upstream, where a later
+`git config --get` will happily print it. Push to `origin` with credentials
+supplied out of band instead.
+
+**A force-push does not erase anything on GitHub.** Orphaned commits stay
+reachable by SHA until a garbage collection that may never run on a public repo.
+If secrets or personal data reach the remote, the only reliable fix without
+GitHub Support is deleting and recreating the repository — which is why the
+pre-push scan matters more than the cleanup.
+
 ## Secrets
 
 `.env` is gitignored from the very first commit, `.env.example` documents every
