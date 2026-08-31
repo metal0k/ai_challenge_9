@@ -153,22 +153,21 @@ writes that URL into `.git/config` as the branch's upstream, where a later
 `git config --get` will happily print it. Push to `origin` with credentials
 supplied out of band instead.
 
-**Make the guard abort, not merely print.** A chain like
-`grep … && echo STOP || echo clean && git commit` does not stop anything: `&&`
-and `||` are left-associative, so the `git commit` runs after the `echo`
-succeeds, whichever branch was taken. This exact shape printed `!!! СТОП` and
-committed anyway. Write the check so failure actually blocks:
+**Make the guard abort, not merely print.** Two shapes that look like a check and
+are not, both of which shipped a commit here that should have been blocked:
 
-```bash
-if git diff --cached --name-only -z | xargs -0 grep -qIE 'C:\\Users|D:\\|spreadsheets'; then
-  echo "personal data staged — aborting"; exit 1
-fi
-git commit …
-```
+- `check && echo STOP || echo clean && git commit` — `&&` and `||` are
+  left-associative, so `git commit` runs after the `echo` succeeds, whichever
+  branch was taken.
+- A failing command on its own line followed by more lines. Nothing propagates:
+  a heredoc that raised an exception was followed by `git commit && git push`,
+  and both ran.
 
-The same applies to any pre-flight in this repo — `verify_capture()` raises
-instead of warning for the same reason: a check whose failure path continues is
-worse than no check, because it reads as verified.
+Run the check as its own step, honour its exit code, and only then commit — or
+put `set -e` at the top of the script. The same applies to every pre-flight here:
+`verify_capture()` raises instead of warning, `_check()` in `record.py` raises on
+an unexpected exit code. A check whose failure path continues is worse than no
+check, because it reads as verified.
 
 **A force-push does not erase anything on GitHub.** Orphaned commits stay
 reachable by SHA until a garbage collection that may never run on a public repo.
