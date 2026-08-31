@@ -1,0 +1,30 @@
+# --- secrets: must stay first ---
+.env
+*.env
+!.env.example
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# --- runtime artifacts ---
+logs/
+*.mp4
+
+# --- os / ide ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# сырые записи OBS до переноса в VIDEO_DIR
+logs/obs_raw/
+
+# рабочие заметки: спека, очередь, локальные пути и ссылки
+spec.md
+specs/

@@ -1,0 +1,98 @@
+"""Маппинг исключений SDK и HTTP-статусов в человеческие сообщения."""
+
+from __future__ import annotations
+
+from advent_core.config import redact
+
+
+class AdventError(Exception):
+    """Ошибка, которую показываем пользователю текстом, а не traceback."""
+
+    exit_code = 1
+
+    def __init__(self, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+
+
+class AuthError(AdventError):
+    exit_code = 3
+
+
+class RateLimitError(AdventError):
+    exit_code = 4
+
+
+class ServerError(AdventError):
+    exit_code = 5
+
+
+class NetworkError(AdventError):
+    exit_code = 6
+
+
+class StreamTruncated(AdventError):
+    exit_code = 7
+
+
+def _status_of(exc: Exception) -> int | None:
+    """Достаёт HTTP-статус из исключения SDK, не завязываясь на его класс.
+
+    В mistralai v2 ошибки приходят как SDKError со `status_code`; у httpx —
+    как HTTPStatusError с `response.status_code`. Утиная типизация здесь
+    надёжнее, чем импорт конкретного класса, который SDK может переименовать.
+    """
+    for attr in ("status_code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def translate(exc: Exception) -> AdventError:
+    """Превращает исключение в AdventError с понятным текстом."""
+    if isinstance(exc, AdventError):
+        return exc
+
+    status = _status_of(exc)
+    detail = redact(str(exc))[:500]
+
+    if status in (401, 403):
+        return AuthError(
+            f"Ключ Mistral отклонён ({status}).",
+            hint=(
+                "Проверь MISTRAL_API_KEY в .env — возможно, ключ отозван "
+                "или скопирован не полностью."
+            ),
+        )
+    if status == 404:
+        return AdventError(
+            "Mistral отвечает 404 — скорее всего, неизвестное имя модели.",
+            hint="Посмотри доступные модели: advent w01 models",
+        )
+    if status == 422:
+        return AdventError(f"Mistral отклонил параметры запроса (422): {detail}")
+    if status == 429:
+        return RateLimitError(
+            "Лимит запросов Mistral исчерпан (429).",
+            hint=(
+                "Повторные попытки уже сделаны. Подожди минуту или возьми модель "
+                "полегче: --model ministral-8b-latest"
+            ),
+        )
+    if status is not None and 500 <= status < 600:
+        return ServerError(
+            f"Mistral вернул ошибку сервера ({status}). Повторные попытки не помогли."
+        )
+
+    name = type(exc).__name__.lower()
+    if any(marker in name for marker in ("timeout", "connect", "network", "ssl")):
+        return NetworkError(
+            "Нет связи с api.mistral.ai.",
+            hint="Проверь интернет, VPN и прокси.",
+        )
+
+    return AdventError(f"Неожиданная ошибка при обращении к Mistral: {detail}")
