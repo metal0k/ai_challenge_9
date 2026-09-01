@@ -38,3 +38,23 @@ class CallResult:
     truncated: bool = False
     # Параметры, не отправленные из-за отсутствующей capability модели.
     skipped_params: list[str] = field(default_factory=list)
+    # stop | length | model_length | error | tool_calls (complete()); в
+    # stream() набор без model_length — SDK его в чанках не присылает
+    # (SPEC-w01d02.md §2). None — SDK не вернул значение вовсе.
+    finish_reason: str | None = None
+    # Вердикт по формату из formats.verify(): True/False — проверено,
+    # None — для text/yaml/md вердикт принципиально не выносится (нет ни
+    # API-гарантии, ни дешёвой верификации).
+    format_ok: bool | None = None
+    # Человекочитаемая расшифровка вердикта для footer, например
+    # "JSON ✓ · схема ✓ · items: 3" или "—" для форматов без вердикта.
+    format_detail: str | None = None
+    # Сообщения, фактически ушедшие в Mistral — то есть messages ДО этой
+    # функции плюс инструкция пресета формата, дописанная chat._payload().
+    # Журнал (week_01/cli.py → log_call) исторически писал в logs/calls.jsonl
+    # тот messages, что был построен ДО дописывания инструкции формата —
+    # source of truth для недель 2/5 расходился с тем, что реально видела
+    # модель. None — только когда вызов не дошёл до _payload() вовсе
+    # (например, CallResult(model_requested=...) для error-веток в cli.py,
+    # где messages для лога и так есть отдельно).
+    sent_messages: list[dict[str, str]] | None = None

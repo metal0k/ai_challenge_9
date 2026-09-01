@@ -36,6 +36,24 @@ class StreamTruncated(AdventError):
     exit_code = 7
 
 
+class ConfigurationError(AdventError):
+    """Ошибка конфигурации, долетевшая до слоя chat.py (обычно из formats.py).
+
+    exit_code = 2 — тот же смысл, что у advent_core.config.ConfigError
+    («настройка неверна», не сбой API), но AdventError-совместимая обёртка:
+    week_01/cli.py в REPL ловит именно `except AdventError` вокруг вызовов
+    chat.complete()/stream(), поэтому ошибка конфигурации предупреждает и не
+    убивает сессию, а advent_core.config.ConfigError таким except'ом не
+    поймать — она не наследует AdventError. advent_cli/app.py на верхнем
+    уровне читает error.exit_code, а не тип исключения, поэтому именно этот
+    exit_code=2 и доезжает до одношотового вызова (`advent w01 chat ...
+    --format schema` без --schema-file → exit 2, а не общий 1 у голого
+    AdventError).
+    """
+
+    exit_code = 2
+
+
 def _status_of(exc: Exception) -> int | None:
     """Достаёт HTTP-статус из исключения SDK, не завязываясь на его класс.
 
@@ -72,6 +90,19 @@ def translate(exc: Exception) -> AdventError:
         return AdventError(
             "Mistral отвечает 404 — скорее всего, неизвестное имя модели.",
             hint="Посмотри доступные модели: advent w01 models",
+        )
+    if status == 400:
+        # Самая частая причина здесь — отказ модели от response_format
+        # (format=json/schema): такой capability-флаг не отдаётся списком
+        # моделей ни у одной из них (SPEC-w01d02.md §2, §6.4), поэтому
+        # response_format уходит всегда и разбирается по факту отказа, а не
+        # гейтится заранее по недокументированной догадке.
+        return AdventError(
+            f"Mistral отклонил запрос (400): {detail}",
+            hint=(
+                "Часто это отказ модели от response_format (format=json/schema) "
+                "— попробуй /set format text или другую модель: advent w01 models"
+            ),
         )
     if status == 422:
         return AdventError(f"Mistral отклонил параметры запроса (422): {detail}")

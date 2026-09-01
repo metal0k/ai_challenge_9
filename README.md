@@ -44,13 +44,14 @@ uv run advent w01 models                   # какие модели досту�
 | Неделя | День | Задание | Код | Видео |
 |--------|------|---------|-----|-------|
 | 01 | 01 | Первый запрос к LLM через API | [`w01d01`](https://github.com/metal0k/ai_challenge_9/tree/w01d01) | — |
+| 01 | 02 | Формат ответа | [`w01d02`](https://github.com/metal0k/ai_challenge_9/tree/w01d02) | — |
 
 ## Структура
 
 ```
 advent_core/    общий слой: конфиг, клиент Mistral, стрим, логирование, вывод
 advent_cli/     команды advent: корневой app, record, submit
-week_01/        код первой недели + условия задач task_NN.md
+week_01/        код первой недели + условия задач в tasks.md (разделы ## Day NN)
 tests/          тесты без обращения к сети
 tools/          проверка индекса перед публикацией
 ```
@@ -69,7 +70,8 @@ tools/          проверка индекса перед публикацие�
 | `advent submit --day 1` | Проверить тег и видео, напечатать комментарий для таблицы |
 
 Полезные флаги `chat`: `--model`, `--system`, `--temperature`, `--top-p`,
-`--max-tokens`, `--seed`, `--stop`, `--reasoning-effort`, `--no-stream`, `--verbose`.
+`--max-tokens`, `--seed`, `--stop`, `--reasoning-effort`, `--no-stream`,
+`--verbose`, `--format`, `--schema-file`, `--done`, `--mode`, `--max-turns`.
 
 Команды внутри REPL:
 
@@ -80,8 +82,9 @@ tools/          проверка индекса перед публикацие�
 | `/model <имя>` | переключить модель |
 | `/model list` | таблица chat-моделей (`list all` — вообще все) |
 | `/model info` | карточка модели: контекст, возможности, рекомендованная t° |
-| `/params` | текущие параметры генерации |
-| `/set <параметр> <значение>` | изменить параметр (`default` — сбросить) |
+| `/params` | текущие параметры генерации и итоговый system prompt |
+| `/set <параметр> <значение>` | изменить параметр, включая `format`/`schema_file`/`done`/`mode`/`max_turns` (`default` — сбросить) |
+| `/again` | повторить последний вопрос с текущими настройками, без истории |
 | `/reset` | очистить историю |
 | `/exit` | выход |
 

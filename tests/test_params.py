@@ -79,6 +79,37 @@ def test_reasoning_effort_is_skipped_for_incapable_model():
     assert skipped == ["reasoning_effort"]
 
 
+def test_as_payload_never_sends_local_params():
+    """format/schema_file/done/mode/max_turns управляют CLI, не уходят на сервер.
+
+    Локальный параметр не должен попасть ни в payload, ни в skipped —
+    skipped значит «сервер бы отклонил», а тут сервер вообще не видит имени.
+    """
+    params = GenerationParams.build(
+        temperature=0.5,
+        format="json",
+        schema_file="week_01/schemas/ingredients.json",
+        done="text:[ГОТОВО]",
+        mode="dialog",
+        max_turns=5,
+    )
+    payload, skipped = params.as_payload(REASONING)
+    assert payload == {"temperature": 0.5}
+    assert skipped == []
+
+
+def test_max_turns_defaults_to_ten_not_none():
+    """Дефолт диалога — содержательное значение 10, а не «сервер решит»."""
+    assert GenerationParams().max_turns == 10
+
+
+def test_set_max_turns_default_resets_to_none():
+    """Потребитель (цикл mode=dialog) обязан трактовать None как 10 — это его дело."""
+    params = GenerationParams()
+    assert params.set("max_turns", "default") is None
+    assert params.max_turns is None
+
+
 def test_unknown_capabilities_send_everything():
     """Список моделей мог не загрузиться — тогда не отсеиваем ничего сами."""
     payload, skipped = GenerationParams.build(reasoning_effort="low").as_payload(None)

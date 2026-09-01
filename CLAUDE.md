@@ -70,8 +70,8 @@ Three layers, deliberately separated:
 - **`advent_core/`** — shared across all weeks: config, generation params, Mistral
   client, chat/streaming, telemetry, JSONL journal, console output.
 - **`week_NN/`** — all code for that week in one folder, with the task statements
-  (`task_NN.md`) beside it. The week is **one application that grows day by day**,
-  not one file per day.
+  in one `tasks.md` beside it (`## Day NN` sections, not a file per day). The
+  week is **one application that grows day by day**, not one file per day.
 - **`advent_cli/`** — the `advent` entry point, plus `record` (OBS) and `submit`
   (GitHub + Yandex Disk). A week registers its own typer group, so `advent w01 …`
   keeps working after later weeks move ahead.
@@ -104,6 +104,34 @@ the rest. Add a new gated param by setting `requires=` on its `Spec` in
 **The API echoes back the model name you sent**, so `-latest` stays `-latest` in
 the response. The concrete version shown in the footer and the log is resolved
 from the models list (`resolve_alias`), not from the response.
+
+**JSON mode does not decide the shape of the JSON — only that it's valid.**
+`response_format={"type": "json_object"}` guarantees parseable JSON, nothing
+about its keys. The Mistral docs say it in one sentence: "When using JSON mode
+you MUST also instruct the model to produce JSON yourself with a system or a
+user message." Skipping the prompt instruction because the parameter "already
+guarantees it" is the most common way to get valid-but-wrong JSON.
+
+**A `stop` sequence never reaches the output.** Per the Mistral docs: "The
+output will not contain the stop sequence." That rules out `stop` as the
+completion marker for a multi-turn dialog loop — if the model is told to end
+the conversation with a marker string and that same string is also passed as
+`stop`, the API strips it before the caller ever sees it, and there is nothing
+left to detect. The marker and the `stop` value must never be the same string.
+
+**No model in this account's 48-model list carries a capability for
+structured output.** `capabilities` has `function_calling`, `vision`,
+`reasoning`, and a few more — nothing named for `response_format`/JSON
+schema. So `response_format` cannot be gated the way `reasoning_effort` is;
+it is sent unconditionally, and a model's refusal comes back as a 400 that
+`errors.py` translates into a hinted message instead of a traceback.
+
+Gating it on `function_calling` as a proxy was considered and rejected — and a
+live sweep later proved the point: **all 29 chat models on this account accept
+`json_schema`, and all 29 carry `function_calling: true`**. The proxy would have
+filtered out nothing at all, while looking like a safeguard. A demo step built on
+"this model refuses structured output" had to be rewritten for the same reason:
+no model on this account refuses.
 
 **stdout/stderr contract:** the model's answer goes to stdout, everything else
 (footer, warnings, REPL prompt, input echo) to stderr. This keeps
@@ -184,6 +212,18 @@ found by feeding it a deliberate canary:
 Personal notes stay out of the repo entirely: `spec.md` and `specs/` are
 gitignored. Anything naming a person, a local path, or a shared course document
 (which carries *other people's* names) does not belong here.
+
+**Pasted chat transcripts are the leak this repo actually came closest to
+shipping.** Clarifications from the course chat were pasted verbatim into
+`week_01/tasks.md` — three real participant names, staged for a public push, and
+`check_staged.py` passed it: its needles look for paths and tokens, and a
+person's name is neither. Names cannot be added to the guard either, since the
+guard itself is public and the list would leak with it. What the guard now
+matches is the **shape** of a chat export — a `[dd.mm.yyyy hh:mm]` timestamp at
+the head of a line, plus `in reply to` — which catches a pasted transcript
+without knowing anything about who is in it. When a task statement needs a
+clarification from the chat, paraphrase it; keep verbatim quotes in `specs/`,
+which is gitignored.
 
 **Never put a token in a URL you hand to git.** `git push -u <url-with-token>`
 writes that URL into `.git/config` as the branch's upstream, where a later

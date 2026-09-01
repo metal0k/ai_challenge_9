@@ -1,7 +1,9 @@
-"""`advent record --day 01` — записать демо через OBS.
+"""`advent record --day N` — записать демо через OBS.
 
-Сценарий фиксированный: LLM отвечает каждый раз по-разному, а порядок шагов
-и то, что показано на экране, — нет. Это делает дубли сравнимыми.
+Сценарий фиксированный на каждый день: LLM отвечает каждый раз по-разному,
+а порядок шагов и то, что показано на экране, — нет. Это делает дубли
+сравнимыми. Сценарии прошлых дней остаются в коде рядом с новыми (см.
+`demo_steps`) — старые команды `advent record --day N` продолжают работать.
 """
 
 from __future__ import annotations
@@ -44,7 +46,18 @@ class Step:
     env: dict[str, str] = field(default_factory=dict)
 
 
-def demo_steps(week: int) -> list[Step]:
+def demo_steps(week: int, day: int) -> list[Step]:
+    """Сценарий демо для конкретного дня недели.
+
+    Сценарии прошлых дней остаются в коде и выбираются по номеру —
+    `advent record --day 1` обязана продолжать работать ровно как раньше.
+    """
+    if week == 1 and day == 2:
+        return _demo_steps_w01d02()
+    return _demo_steps_w01d01(week)
+
+
+def _demo_steps_w01d01(week: int) -> list[Step]:
     prefix = f"w{week:02d}"
     return [
         Step(
@@ -87,6 +100,143 @@ def demo_steps(week: int) -> list[Step]:
     ]
 
 
+# Сквозной вопрос дня 02: ложится и в items[{name, amount}] (json/schema), и в
+# таблицу Markdown, и в YAML-список, и связан с диалогом про салат из шага 5 —
+# видео читается как единый сюжет, а не пять несвязанных прогонов.
+_SALAD_QUESTION = "Назови 3 ингредиента для греческого салата с количеством"
+
+
+def _demo_steps_w01d02() -> list[Step]:
+    """Day 02 — формат ответа: переключалки формата, длины и условия завершения.
+
+    Каждый REPL-шаг начинается с `/reset`. Без него первый вопрос шага уходит
+    вместе с историей, подхваченной из прошлого запуска (REPL восстанавливает
+    её при старте), и «тот же самый запрос» перестаёт быть тем же самым —
+    ровно то, что этот день и демонстрирует. На живом прогоне история
+    подхватывалась в 10 сообщений.
+    """
+    return [
+        Step(
+            title="1. Тот же вопрос без ограничений — базовая линия",
+            args=["w01", "chat", _SALAD_QUESTION],
+        ),
+        # /again работает только на «последний вопрос обычного REPL»
+        # (Session.last_question заполняется внутри _repl, не в one-shot) —
+        # поэтому здесь и в шаге 3 вопрос идёт первой строкой stdin в REPL,
+        # а не позиционным аргументом chat (который вернул бы ответ и вышел
+        # раньше, чем прочитались бы команды /set//again).
+        Step(
+            title="2. format: json → schema → yaml → md через /set + /again",
+            args=["w01", "chat"],
+            stdin_lines=[
+                "/reset",
+                _SALAD_QUESTION,
+                "/set format json",
+                "/again",
+                "/set format schema",
+                "/set schema_file week_01/schemas/ingredients.json",
+                "/again",
+                "/set format yaml",
+                "/again",
+                "/set format md",
+                "/again",
+                "/exit",
+            ],
+        ),
+        Step(
+            title="3. /again ×3 при format=schema — структура одинакова",
+            args=["w01", "chat"],
+            stdin_lines=[
+                "/reset",
+                _SALAD_QUESTION,
+                "/set format schema",
+                "/set schema_file week_01/schemas/ingredients.json",
+                "/again",
+                "/again",
+                "/again",
+                "/exit",
+            ],
+        ),
+        # 4а/4б — два одношотовых вызова, не REPL: `/set system` в REPL не
+        # существует (system prompt — это только файл, флаг --system или
+        # ADVENT_SYSTEM_PROMPT в .env, см. advent_core/config.py), поэтому
+        # инструкция «не более 3 предложений» идёт через отдельный файл
+        # week_01/prompts/brief_system.md, а не через /set внутри одной сессии.
+        # 20, а не 40: на живом прогоне модель укладывает ответ про салат в 34
+        # токена и завершает сама — finish=stop, и шаг не показывает ровно то,
+        # ради чего он есть. Порог должен быть заведомо ниже длины ответа.
+        Step(
+            title="4а. max_tokens 20 — обрыв генерации на полуслове, finish=length",
+            args=["w01", "chat", _SALAD_QUESTION, "--max-tokens", "20"],
+        ),
+        Step(
+            title="4б. инструкция «не более 3 предложений» — модель сама завершает, finish=stop",
+            args=[
+                "w01",
+                "chat",
+                _SALAD_QUESTION,
+                "--system",
+                "week_01/prompts/brief_system.md",
+            ],
+        ),
+        Step(
+            title="5. mode=dialog, done=json:done — уточняющие вопросы про салат",
+            args=["w01", "chat"],
+            stdin_lines=[
+                "/reset",
+                "/set mode dialog",
+                "/set done json:done",
+                "Хочу приготовить салат",
+                "Греческий, овощной, без мяса",
+                "На двоих, без особых ограничений",
+                "/exit",
+            ],
+        ),
+        # Одношотовый вызов по той же причине, что и шаг 4б: маркер завершения
+        # задаётся системным промптом из файла, а stop — флагом CLI.
+        Step(
+            title="6. stop с тем же маркером — ловушка: API вырезает стоп-строку из вывода",
+            args=[
+                "w01",
+                "chat",
+                _SALAD_QUESTION,
+                "--stop",
+                "ГОТОВО",
+                "--system",
+                "week_01/prompts/stop_marker_system.md",
+            ],
+        ),
+        # Здесь был шаг «модель без structured output отказывает». Он выкинут:
+        # на этом аккаунте отказа добиться нечем. Проверены codestral,
+        # ministral-3b, voxtral, mistral-code-fim, magistral-medium — все 29
+        # chat-моделей принимают json_schema, и у всех 29 стоит
+        # function_calling=true. То есть и гейтинг по этому флагу не сработал бы
+        # никогда: решение слать response_format всегда — единственное рабочее.
+        #
+        # Замена сильнее исходного шага: она доказывает, что вердикт формата
+        # настоящий, а не печатает «✓» при любом ответе.
+        Step(
+            title="7а. json + жёсткий потолок длины — JSON рвётся, вердикт это видит",
+            args=[
+                "w01",
+                "chat",
+                "Назови 5 ингредиентов для греческого салата с количеством",
+                "--format",
+                "json",
+                "--max-tokens",
+                "25",
+            ],
+        ),
+        # Ошибку конфигурации показываем клиентскую: она не зависит ни от сети,
+        # ни от того, какие модели доступны аккаунту, поэтому дубль не сорвётся.
+        Step(
+            title="7б. format=schema без schema_file — понятная ошибка вместо traceback",
+            args=["w01", "chat", _SALAD_QUESTION, "--format", "schema"],
+            expect_failure=True,
+        ),
+    ]
+
+
 def rehearsal_step(week: int) -> Step:
     """Дешёвый прогон той же машинерии, что ведёт демо.
 
@@ -118,7 +268,7 @@ def record(
 
     if dry_run:
         console.note("dry-run: OBS не задействован")
-        _play(demo_steps(week))
+        _play(demo_steps(week, day))
         return
 
     if rehearse:
@@ -141,7 +291,7 @@ def record(
         console.note("запись пошла")
         time.sleep(TITLE_PAUSE)
         try:
-            _play(demo_steps(week))
+            _play(demo_steps(week, day))
         finally:
             time.sleep(STEP_PAUSE)
             source = obs.stop_recording(client)
@@ -274,12 +424,17 @@ def _remux(source: Path, target: Path) -> None:
         [
             ffmpeg,
             "-hide_banner",
-            "-loglevel", "error",
+            "-loglevel",
+            "error",
             "-y",
-            "-i", str(source),
-            "-c", "copy",
-            "-f", "mp4",  # формат задаём явно, не полагаясь на расширение
-            "-movflags", "+faststart",
+            "-i",
+            str(source),
+            "-c",
+            "copy",
+            "-f",
+            "mp4",  # формат задаём явно, не полагаясь на расширение
+            "-movflags",
+            "+faststart",
             str(temporary),
         ],
         capture_output=True,

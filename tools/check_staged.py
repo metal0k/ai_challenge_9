@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 
@@ -32,7 +33,16 @@ NEEDLES = (
     ("github_pat_", "GitHub token"),
     ("ghp_", "GitHub token"),
     ("sk-", "похоже на API-ключ"),
+    ("in reply to", "похоже на дамп переписки — там чужие имена"),
 )
+
+# Регулярки — только там, где ловится ФОРМА, а не конкретная строка.
+# Имена людей фиксированной строкой не поймать, а вписать их сюда нельзя:
+# этот файл сам уходит в публичный репозиторий, и список имён утёк бы вместе
+# с ним. Поэтому ловим характерную разметку экспорта чата — «[дд.мм.гггг чч:мм]»
+# в начале строки. Так guard срабатывает на вставленную переписку, ничего не
+# зная о её участниках.
+PATTERNS = ((re.compile(r"\[\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}\]"), "дамп чата с датами реплик"),)
 
 # Файлы, которые документируют сами паттерны и потому находят себя.
 SELF_REFERENTIAL = {"CLAUDE.md", "tools/check_staged.py"}
@@ -70,6 +80,9 @@ def main() -> int:
         for line_no, line in enumerate(content.splitlines(), 1):
             for needle, why in NEEDLES:
                 if needle in line:
+                    findings.append(f"  {path}:{line_no}  {why}\n    {line.strip()[:100]}")
+            for pattern, why in PATTERNS:
+                if pattern.search(line):
                     findings.append(f"  {path}:{line_no}  {why}\n    {line.strip()[:100]}")
 
     if findings:

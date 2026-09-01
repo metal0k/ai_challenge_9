@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from contextlib import suppress
 
@@ -48,8 +49,30 @@ def finish_answer() -> None:
     sys.stdout.flush()
 
 
+def print_answer(result: CallResult, format_name: str | None) -> None:
+    """Печатает нестримленный ответ в stdout (контракт: ответ — в stdout).
+
+    format=json/schema печатается разобранным и с отступами — это тоже
+    часть демонстрации дня: три `/again` подряд читаются глазами за секунду,
+    а не построчным сравнением сырых строк (SPEC-w01d02.md §6.6). Условие —
+    result.format_ok is True: formats.verify() уже разобрал JSON один раз,
+    повторный json.loads() здесь — не вторая проверка, а просто способ
+    получить объект для pretty-print без второго источника истины насчёт
+    того, валиден ли ответ. Битый JSON (format_ok is False/None) печатается
+    как есть — не терять текст ответа на несовпадении формата.
+    """
+    text = result.text
+    if format_name in ("json", "schema") and result.format_ok:
+        # format_ok уже сказал "валиден" — suppress здесь на случай, если это
+        # когда-нибудь разойдётся, а не как ожидаемый путь выполнения.
+        with suppress(json.JSONDecodeError):
+            text = json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+    write_chunk(text)
+    finish_answer()
+
+
 def footer(result: CallResult) -> None:
-    """Телеметрия после ответа: модель, latency, токены."""
+    """Телеметрия после ответа: модель, latency, токены, finish_reason, формат."""
     model = result.model_actual or result.model_requested
     if result.model_actual and result.model_actual != result.model_requested:
         model = f"{result.model_requested} → {result.model_actual}"
@@ -57,13 +80,35 @@ def footer(result: CallResult) -> None:
     parts = [f"model {model}", f"{result.latency_ms} ms"]
     usage = result.usage
     if not usage.is_empty():
-        parts.append(
-            f"tokens {usage.prompt_tokens}/{usage.completion_tokens}/{usage.total_tokens}"
-        )
+        parts.append(f"tokens {usage.prompt_tokens}/{usage.completion_tokens}/{usage.total_tokens}")
     if result.truncated:
         parts.append("[yellow]ответ оборван[/yellow]")
 
     err.print(f"[dim]· {'  ·  '.join(parts)}[/dim]")
+
+    # Вторая строка: finish_reason отличает "модель закончила сама" от
+    # "упёрлась в max_tokens" (главный сигнал дня, SPEC-w01d02.md §6.3), и
+    # вердикт по формату. Обе части опциональны по отдельности — CallResult,
+    # собранный вручную для лога ошибки (week_01/cli.py), может не нести ни
+    # одной из них.
+    detail_bits: list[str] = []
+    if result.finish_reason:
+        length_ish = result.finish_reason in ("length", "model_length")
+        detail_bits.append(
+            f"[yellow]finish={result.finish_reason} ⚠[/yellow]"
+            if length_ish
+            else f"finish={result.finish_reason}"
+        )
+    if result.format_detail is not None:
+        detail = result.format_detail
+        if result.format_ok is False and result.finish_reason in ("length", "model_length"):
+            # Обрыв по длине — самая частая причина невалидного JSON; явное
+            # слово рядом с "✗" избавляет от догадок, глядя на footer.
+            detail += " обрыв"
+        style = {True: "green", False: "red"}.get(result.format_ok)
+        detail_bits.append(f"[{style}]{detail}[/{style}]" if style else detail)
+    if detail_bits:
+        err.print(f"[dim] {'  ·  '.join(detail_bits)}[/dim]")
 
 
 def echo_input(text: str) -> None:

@@ -1,0 +1,34 @@
+{
+  "title": "recipe",
+  "description": "Ответ mode=dialog в сценарии «рецепт салата»: пока не готово — question, когда готово — done и result.",
+  "type": "object",
+  "properties": {
+    "done": { "type": "boolean" },
+    "question": { "type": "string" },
+    "result": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "amount": { "type": "string" }
+            },
+            "required": ["name", "amount"],
+            "additionalProperties": false
+          }
+        },
+        "steps": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": ["done"],
+  "additionalProperties": false
+}

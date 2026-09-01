@@ -1,0 +1,21 @@
+{
+  "title": "ingredients",
+  "description": "Список ингредиентов с количеством — сквозной вопрос демо Day 02.",
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "amount": { "type": "string" }
+        },
+        "required": ["name", "amount"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["items"],
+  "additionalProperties": false
+}

@@ -10,6 +10,8 @@ from dataclasses import dataclass, fields
 from typing import Any
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+FORMAT_CHOICES = ("text", "json", "schema", "yaml", "md")
+MODE_CHOICES = ("chat", "dialog")
 
 
 class ParamError(Exception):
@@ -28,6 +30,9 @@ class Spec:
     choices: tuple[str, ...] | None = None
     # Возможность из capabilities модели, без которой параметр не отправляем.
     requires: str | None = None
+    # Локальный параметр (формат, диалог, …): в payload API не попадает вообще,
+    # это не то же самое, что «срезан по capabilities» — см. as_payload().
+    local: bool = False
 
 
 SPECS: tuple[Spec, ...] = (
@@ -48,6 +53,40 @@ SPECS: tuple[Spec, ...] = (
         "Глубина рассуждения. Только для моделей с capability reasoning.",
         choices=REASONING_EFFORTS,
         requires="reasoning",
+    ),
+    Spec(
+        "format",
+        "choice",
+        "Пресет формата ответа: text (без ограничений) / json / schema / yaml / md.",
+        choices=FORMAT_CHOICES,
+        local=True,
+    ),
+    Spec(
+        "schema_file",
+        "path",
+        "Путь к .json со схемой ответа — нужен для format=schema.",
+        local=True,
+    ),
+    Spec(
+        "done",
+        "string",
+        'Условие завершения диалога: "text:<строка>" или "json:<поле>".',
+        local=True,
+    ),
+    Spec(
+        "mode",
+        "choice",
+        "Режим REPL: chat (обычный) или dialog (вопросы до готовности).",
+        choices=MODE_CHOICES,
+        local=True,
+    ),
+    Spec(
+        "max_turns",
+        "int",
+        "Потолок ходов диалога в mode=dialog.",
+        1,
+        None,
+        local=True,
     ),
 )
 
@@ -74,6 +113,12 @@ def _parse(spec: Spec, raw: Any) -> Any:
             allowed = ", ".join(spec.choices or ())
             raise ParamError(f"{spec.name} принимает только: {allowed}")
         return value
+    elif spec.kind in ("string", "path"):
+        # Разбор содержимого (префикс done, существование файла схемы и т.п.)
+        # сознательно не здесь — Spec валидирует только форму значения,
+        # семантику знает advent_core/formats.py (parse_done, load_schema).
+        text = str(raw).strip()
+        return text or None
     else:  # list
         if isinstance(raw, list):
             items = [str(x).strip() for x in raw]
@@ -107,6 +152,17 @@ class GenerationParams:
     stop: list[str] | None = None
     reasoning_effort: str | None = None
 
+    # Локальные параметры (Spec.local=True) — управляют CLI/REPL, на сервер
+    # не уходят. max_turns хранит содержательный дефолт (10), а не None:
+    # это не «дай серверу решить», это дефолт цикла диалога. `/set max_turns
+    # default` всё равно сбросит его в None по общей логике set() ниже —
+    # потребитель (цикл mode=dialog) обязан трактовать None как 10.
+    format: str | None = None
+    schema_file: str | None = None
+    done: str | None = None
+    mode: str | None = None
+    max_turns: int | None = 10
+
     @classmethod
     def build(cls, **raw: Any) -> GenerationParams:
         known = {f.name for f in fields(cls)}
@@ -138,6 +194,12 @@ class GenerationParams:
         for spec in SPECS:
             value = getattr(self, spec.name)
             if value is None:
+                continue
+            if spec.local:
+                # Срезаются штатно и молча: skipped — предупреждение об уже
+                # заданном параметре, который сервер бы отклонил или
+                # проигнорировал, а не про параметр, который туда и не должен
+                # был идти.
                 continue
             if spec.requires and capabilities is not None and not capabilities.get(spec.requires):
                 skipped.append(spec.name)
