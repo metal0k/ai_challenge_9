@@ -4,9 +4,46 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Coursework for [AI Advent 9](https://mobiledeveloper.tech/ai_advent_9) — 9 weeks,
-one task per day, built on the Mistral API. Each finished day is submitted as a
-pair of links (code + video) commented into a shared Google Sheet.
+Coursework for [AI Advent](https://mobiledeveloper.tech/ai_advent_9), 9th cohort
+(hence the `_9` in the URL and the repo name) — **7 weeks**, five tasks a week,
+built on the Mistral API. Each finished day is submitted as a pair of links
+(code + video) commented into a shared Google Sheet.
+
+### Schedule and deadlines
+
+A task drops every weekday at **14:00 MSK**; the week's five are due by **14:00
+MSK the following Monday**. Miss the set and you are dropped from the chat and
+get no further tasks. A theory video lands on Mondays, ahead of that week's
+tasks. Every submission is working code **plus a demo video** plus a short
+explanation — public demonstration is mandatory, not optional. The course budgets
+1–2 hours a day, which is the real constraint: `advent record` and
+`advent submit` exist so that shipping a day costs minutes, not an evening.
+
+### Programme
+
+Theme names are the course's own, kept verbatim.
+
+| Week | Theme | Covers |
+|------|-------|--------|
+| 1 | Основы LLM | entry into the topic |
+| 2 | База про агентов | agent implementation, keeping and **compacting** context, token accounting |
+| 3 | Оптимизация агента | state management |
+| 4 | MCP | Model-Context-Protocol |
+| 5 | RAG | retrieval augmented generation applied to your own projects |
+| 6 | Локальный ИИ | a local LLM run as a private service |
+| 7 | Пайплайн | integrating an LLM into your own tasks and automating them |
+
+An Advanced track (+3 weeks: Code Assistance, FineTune, Security) is a separate
+product, not part of this one.
+
+**What the programme implies for this repo.** Weeks 2–3 grow an agent on top of
+the existing client, so context compaction and token accounting belong in
+`advent_core`, not inside a week folder. Weeks 4 and 6 do not: an MCP server and
+a local model server are separate processes, so "one app that grows day by day"
+holds *within* a week, not across the course — `week_04` and `week_06` will need
+their own entry points rather than another `advent wNN` typer group. The JSONL
+call journal and the token telemetry written on Day 01 are week-2 and week-5
+material, not decoration.
 
 ## Commands
 

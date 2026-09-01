@@ -13,7 +13,14 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from pathlib import Path
+
+# Вывод здесь кириллический, а stdout при запуске из хука или через пайп берёт
+# кодировку из локали — на этой машине cp1252. Без принудительного UTF-8
+# проверка падает с UnicodeEncodeError на собственном сообщении об успехе:
+# guard, который умирает на выводе, читается как сломанный и будет обойдён.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 # Фиксированные строки, а не регулярки: паттерны с обратными слэшами
 # по-разному раскрываются в shell и в ERE и молча перестают срабатывать.
@@ -42,9 +49,7 @@ def staged_files() -> list[str]:
 
 
 def staged_content(path: str) -> str | None:
-    result = subprocess.run(
-        ["git", "show", f":{path}"], capture_output=True, check=False
-    )
+    result = subprocess.run(["git", "show", f":{path}"], capture_output=True, check=False)
     if result.returncode != 0:
         return None
     try:
