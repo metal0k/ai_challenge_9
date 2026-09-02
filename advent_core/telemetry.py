@@ -1,7 +1,8 @@
-"""Результат одного вызова LLM: текст, usage, latency."""
+"""Результат одного вызова LLM: текст, usage, latency, и сумма по нескольким."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 
@@ -24,7 +25,17 @@ class Usage:
         )
 
     def is_empty(self) -> bool:
-        return self.total_tokens is None and self.prompt_tokens is None
+        """Нечем считать: usage не пришёл вовсе или пришёл частично.
+
+        Частичный usage (пришёл completion, но не пришёл prompt) считается
+        отсутствующим намеренно. Иначе вызов не попадает в missing_usage,
+        неизвестное слагаемое суммируется как 0, и Totals.tokens_label()
+        печатает «0/7» без оговорки — то есть показывает неизвестное значение
+        точным нулём. Ровно эту ошибку missing_usage и заведён предотвращать.
+        """
+        if self.total_tokens is not None:
+            return False
+        return self.prompt_tokens is None or self.completion_tokens is None
 
 
 @dataclass(slots=True)
@@ -58,3 +69,83 @@ class CallResult:
     # (например, CallResult(model_requested=...) для error-веток в cli.py,
     # где messages для лога и так есть отдельно).
     sent_messages: list[dict[str, str]] | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class Totals:
+    """Сумма по нескольким CallResult: вызовы, токены, время.
+
+    Живёт в core, а не в week_01: цена ответа складывается из нескольких
+    вызовов начиная с Day 03 (панель экспертов — четыре вызова на один
+    ответ), а неделя 2 с её учётом токенов и компактизацией контекста будет
+    складывать ровно то же самое. Отдельный тип, а не кортеж, потому что
+    складывать приходится и суммы между собой (прогоны одной стратегии).
+
+    frozen: сумма считается один раз по готовому списку вызовов и дальше
+    только читается — случайная правка поля означала бы, что телеметрия
+    разошлась с журналом.
+
+    missing_usage — число вызовов, у которых usage не пришёл вовсе или пришёл
+    частично (см. Usage.is_empty). Без него "0 токенов" читается как
+    «бесплатно», хотя на деле это «неизвестно»: стрим отдаёт usage только
+    последним чанком, и оборванный ответ приходит без него совсем.
+    """
+
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    latency_ms: int = 0
+    missing_usage: int = 0
+
+    @classmethod
+    def of(cls, results: Iterable[CallResult]) -> Totals:
+        """Складывает результаты вызовов в одну сумму."""
+        calls = prompt = completion = total = latency = missing = 0
+        for result in results:
+            calls += 1
+            latency += result.latency_ms
+            usage = result.usage
+            if usage.is_empty():
+                missing += 1
+            prompt += usage.prompt_tokens or 0
+            completion += usage.completion_tokens or 0
+            # total_tokens сервер присылает сам; когда его нет, а слагаемые
+            # есть — считаем сами, иначе колонка "Токены" покажет 0 при
+            # ненулевых prompt/completion.
+            total += usage.total_tokens or (
+                (usage.prompt_tokens or 0) + (usage.completion_tokens or 0)
+            )
+        return cls(calls, prompt, completion, total, latency, missing)
+
+    def __add__(self, other: Totals) -> Totals:
+        if not isinstance(other, Totals):
+            return NotImplemented
+        return Totals(
+            calls=self.calls + other.calls,
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+            latency_ms=self.latency_ms + other.latency_ms,
+            missing_usage=self.missing_usage + other.missing_usage,
+        )
+
+    def has_usage(self) -> bool:
+        return self.calls > self.missing_usage
+
+    def tokens_label(self) -> str:
+        """prompt/completion для таблицы сравнения (§9 SPEC-w01d03)."""
+        if not self.has_usage():
+            return "—"
+        label = f"{self.prompt_tokens}/{self.completion_tokens}"
+        if self.missing_usage:
+            # Часть вызовов не отдала usage — сумма занижена, и молчать об
+            # этом нельзя: колонка сравнивает стоимость стратегий.
+            label += f" (без usage: {self.missing_usage})"
+        return label
+
+    def time_label(self) -> str:
+        """Суммарное время: миллисекунды до секунды, дальше секунды."""
+        if self.latency_ms < 1000:
+            return f"{self.latency_ms} ms"
+        return f"{self.latency_ms / 1000:.1f} s"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import os
 import sys
 import time
@@ -40,6 +41,23 @@ def connect():
         import obsws_python as obs
     except ImportError as exc:
         raise AdventError("Не установлен obsws-python. Выполни: uv sync") from exc
+
+    # obsws-python печатает traceback на КАЖДЫЙ неуспешный запрос: в reqs.py
+    # стоит `logger.exception(...)` перед `raise`. Печатает даже тогда, когда
+    # вызывающий код ошибку ловит, повторяет и успешно доводит дело до конца, —
+    # то есть traceback на экране означает не падение, а всего лишь неудачную
+    # попытку. На записи это худший вид шума: зритель видит «ошибку» там, где
+    # ничего не сломалось.
+    #
+    # Поймано на записи Day 03: SetRecordDirectory вернул 500 на первой попытке
+    # вернуть папку записи (OBS ещё дописывал контейнер после StopRecord) и
+    # прошёл на второй. Папка восстановилась, exit code был нулевой, а в кадре
+    # остался traceback.
+    #
+    # Гасим только вывод библиотеки. Свои ошибки проект показывает сам:
+    # AdventError с текстом и подсказкой, а неудавшееся восстановление — явным
+    # предупреждением из _restore(). Ни одна из них не теряется.
+    logging.getLogger("obsws_python").setLevel(logging.CRITICAL)
 
     host = os.getenv("OBS_WS_HOST", "localhost")
     port = int(os.getenv("OBS_WS_PORT", "4455"))
@@ -257,9 +275,7 @@ def record_directory(client, directory: Path):
     try:
         client.set_record_directory(str(directory))
     except Exception as exc:
-        raise AdventError(
-            f"Не удалось переключить папку записи OBS на {directory}: {exc}"
-        ) from exc
+        raise AdventError(f"Не удалось переключить папку записи OBS на {directory}: {exc}") from exc
 
     try:
         yield

@@ -150,8 +150,7 @@ def publish_and_get_url(token: str, remote_path: str) -> str:
         raise AdventError(
             "Яндекс.Диск отклонил токен (401).",
             hint=(
-                "Проверь YANDEX_DISK_TOKEN и его scopes: "
-                "cloud_api:disk.read, cloud_api:disk.write."
+                "Проверь YANDEX_DISK_TOKEN и его scopes: cloud_api:disk.read, cloud_api:disk.write."
             ),
         )
     if response.status_code == 404:

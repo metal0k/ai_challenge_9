@@ -1,0 +1,37 @@
+{
+  "title": "judge",
+  "description": "Оценка судьи по нескольким ответам на одну задачу: балл и комментарий на каждую метку плюс общее ранжирование.",
+  "type": "object",
+  "properties": {
+    "scores": {
+      "type": "array",
+      "description": "По одному элементу на каждую поданную метку.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Метка ответа: A, B, C или D."
+          },
+          "score": {
+            "type": "integer",
+            "description": "Балл за качество рассуждения, от 1 до 10."
+          },
+          "comment": {
+            "type": "string",
+            "description": "Одно короткое предложение — за что такой балл."
+          }
+        },
+        "required": ["label", "score", "comment"],
+        "additionalProperties": false
+      }
+    },
+    "ranking": {
+      "type": "array",
+      "description": "Все метки от лучшей к худшей, каждая ровно один раз.",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["scores", "ranking"],
+  "additionalProperties": false
+}

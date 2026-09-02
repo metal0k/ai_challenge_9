@@ -52,6 +52,8 @@ uv sync                                   # install/refresh the environment
 uv run advent w01 chat "вопрос"           # one-shot answer
 uv run advent w01 chat                    # REPL with history
 uv run advent w01 models                  # models from the live API (--all for non-chat)
+uv run advent w01 solve                   # one problem, four reasoning strategies, judged
+uv run advent w01 solve --strategy panel --runs 3 --no-judge
 uv run advent record --day 1              # record the demo through OBS
 uv run advent record --day 1 --dry-run    # run the demo without recording
 uv run advent submit --day 1              # verify tag + video, print the sheet comment
@@ -133,6 +135,103 @@ filtered out nothing at all, while looking like a safeguard. A demo step built o
 "this model refuses structured output" had to be rewritten for the same reason:
 no model on this account refuses.
 
+**Prompting strategies only diverge on a narrow class of problem.** A live sweep
+of 18 candidates, 4 runs each on `mistral-small-latest`, is what the comparison
+day rests on, and almost nothing separated the four strategies:
+
+- Classic trick riddles ("the fifth daughter", "five machines in five minutes",
+  counting letters in a word) are solved 4/4. They sit in the training data —
+  the model recalls them rather than reasoning, so every strategy wins.
+- Long arithmetic chains are solved 4/4 too. The model counts better than the
+  premise of the day assumed.
+- The one class that broke consistently: **counting relations where the child is
+  not counted among their own siblings**. `children` (answer 7) missed 7 times
+  out of 8 on a direct answer and was right 3 out of 4 step by step.
+- **Two of the hand-written reference answers were themselves wrong** (socks: 6,
+  not 7; trains: 265.7 km, not 240 — and there the model had been right all four
+  times). A key in the problem bank is as much an object of verification as the
+  model's output; `"placeholder": true` marks one that has not been checked
+  against a live run.
+
+So the demo problem is pinned by an explicit `"default": true` flag in the
+bank rather than by "first file alphabetically" — that implicit link breaks the
+moment a problem with an earlier id is added.
+
+**A candidate that misses is not yet a candidate that separates the strategies,
+and only the finished pipeline can tell you which it is.** `children` (answer 7)
+survived the 18-candidate sweep on those numbers and was then measured again on
+the assembled `solve` command, 5 runs per strategy: step-by-step was right 2 out
+of 5 — exactly as often as the direct answer, so the day had nothing to compare.
+The problem that shipped is `alice` (answer 3, "how many sisters does Alice's
+brother have"): **1 out of 10 direct against 10 out of 10 step by step**.
+Re-measure the gap on the same path that will run on camera, not on the sweep
+harness — and re-measure it with enough runs. An early 5-run sample put `steps`
+at 4/5; ten runs put the same prompt at 5/10. Five runs cannot tell 50% from 80%.
+
+**The wording of the step-by-step instruction moved the result more than
+anything else in the day.** Three prompts, 10 runs each on `alice`:
+
+| instruction | correct |
+|---|---|
+| direct answer, no instruction | 0/10 |
+| numbered rules ending in "substitute the result back and check" | 5/10 |
+| "break the statement apart, introduce notation, write the equations" | 9/10 |
+
+The verification rule was the problem: asked to check its own answer, the model
+re-derived the sibling count from the wrong point of view and talked itself out
+of the right answer. Naming the entities up front beat checking the result
+afterwards, so `reason_steps.md` is the short algebraic form.
+
+A fourth variant scored 9/10 too by adding "note whose point of view the
+question is asked from" — a hint aimed straight at this problem's trap. It was
+rejected: a strategy prompt tuned to the benchmark problem measures the tuning,
+not the strategy.
+
+**The project's default system prompt is deliberately NOT mixed into a strategy
+call, because that persona cancels the effect the day measures.**
+`advent_core/prompts/default_system.md` says "be a concise assistant, answer to
+the point, no filler", and the model obeys it over "reason step by step".
+Measured on `children`, `mistral-small`, 5 runs each: with the persona, `steps`
+is right **2 out of 5** at an average answer length of **679 characters**;
+without it, **4 out of 5** at **1232 characters**. The persona halves the
+reasoning and doubles the error rate. So `build_strategy_system()`
+(`week_01/strategies.py`) drops `config.system_prompt()` whenever the path is
+still `DEFAULT_SYSTEM_PROMPT`, and keeps it only when the user set `--system` /
+`ADVENT_SYSTEM_PROMPT` explicitly — an explicit choice is not ours to ignore.
+The rule generalises: **any day that measures reasoning quality has to disable
+the default persona first, or it is measuring the persona.** Anything layered on
+top of `chat_core` later (the week-2 agent) inherits this trap.
+
+**`strategy=direct` must stay the plain chat path, not a strategy that happens to
+add nothing.** Every strategy appends the same `ОТВЕТ:` marker instruction and
+runs without streaming. Routing `direct` through that machinery would make an
+ordinary `advent w01 chat "привет"` demand a marker line and lose the stream, so
+`chat` sends a question into `week_01/strategies.py` only when the strategy is
+*not* `direct`.
+
+**A default value differs per command, and the params registry is the only place
+that knows it.** `strategy` defaults to `direct` in `chat` and `all` in `solve`;
+`judge` is on in `solve`, off in `chat`. That lives in `Spec.defaults` +
+`apply_defaults(command)`, not in the two typer signatures — otherwise one rule
+is written down twice and drifts. Consequence for the REPL: `/set <param>
+default` restores the *command's* default (in the REPL, always `chat`'s), which
+is not the same thing as `None`.
+
+**A default argument binds at import time, which defeats the way these tests
+remove the network.** `strategies.solve()/run_strategy()/judge()` take
+`complete: CompleteFn = chat_core.complete`; that default is captured when
+`week_01.strategies` is imported, so `monkeypatch.setattr(cli.chat_core,
+"complete", fake)` — how the existing tests mock the client — never reaches it.
+The CLI therefore passes `complete=chat_core.complete` explicitly at every call
+site. Any new seam with a function default needs the same treatment.
+
+**An LLM judge disagreeing with the reference answer is a result, not a bug.**
+The judge is given the four answers under labels A–D with the strategy names
+stripped (otherwise "panel of experts" wins on its name alone) and without the
+key, so it grades the reasoning. When its first place is wrong by the key, the
+output says so in words instead of hiding it. Its known limitation — a fixed
+A–D order, hence positional bias — is stated rather than compensated for.
+
 **stdout/stderr contract:** the model's answer goes to stdout, everything else
 (footer, warnings, REPL prompt, input echo) to stderr. This keeps
 `advent w01 chat "…" > answer.txt` honest. Do not print status to stdout.
@@ -176,6 +275,25 @@ learned the hard way:
 - `record` rehearses the subprocess/pipe machinery (with Cyrillic input) before
   starting the recording, so encoding bugs surface in seconds instead of in a
   finished file.
+- **obsws-python prints a traceback for every failed request, including ones the
+  caller catches and retries successfully.** `reqs.py` does
+  `logger.exception(...)` immediately before `raise`, so a traceback on screen
+  means "one attempt failed", not "the program crashed". On the Day 03 recording
+  `SetRecordDirectory` returned 500 on the first restore attempt — OBS was still
+  finalising the container after `StopRecord` — and succeeded on the second: the
+  directory came back, the exit code was zero, and a traceback sat on the console
+  anyway. `connect()` therefore raises the `obsws_python` logger to CRITICAL. Our
+  own errors are unaffected: they surface as `AdventError` text or as the
+  explicit warning from `_restore()`.
+- **The demo prints into the current console, and OBS captures a window by
+  title**, so recording only works from a visible Windows Terminal whose title
+  matches — `tools/record_demo.ps1` sets it and is the entry point. A headless or
+  background shell produces a black frame, which `verify_capture()` catches
+  before recording rather than after.
+- **OBS accepts a record directory that does not exist** — `SetRecordDirectory`
+  to `Q:/nope` returns success and changes the setting. It is not a validation
+  point, so never probe request failures with it; a bad scene name fails cleanly
+  and changes nothing.
 
 The demo scenario lives in `demo_steps()` in `advent_cli/record.py` and is
 deliberately fixed: the model answers differently every time, the script must not.

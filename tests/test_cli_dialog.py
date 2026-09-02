@@ -42,6 +42,22 @@ MODELS = [
 
 
 @pytest.fixture(autouse=True)
+def no_journal(monkeypatch):
+    """Тесты не должны дописывать строки в настоящий logs/calls.jsonl.
+
+    `log_call()` по контракту никогда не роняет вызывающий код — он молча
+    писал в реальный журнал при каждом прогоне suite'а. А журнал это
+    единственное, что сохраняет день 03: отдельного `--out` нет, и по этим
+    строкам неделя 2 будет считать токены. Выдуманные диалоги про греческий
+    салат с `usage: null` в нём означают испорченный подсчёт.
+
+    Тесты, которым журнал нужен по существу, подменяют `log_call` сами — их
+    monkeypatch применяется позже и перекрывает этот.
+    """
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: None)
+
+
+@pytest.fixture(autouse=True)
 def no_network(monkeypatch):
     """Session.refresh() не должна стучаться в сеть, а _run() — стримить."""
     monkeypatch.setattr(cli, "list_models", lambda config: MODELS)
@@ -262,7 +278,9 @@ def test_ask_once_logs_current_day_not_hardcoded_one(monkeypatch):
 
     cli._ask_once(config, "вопрос")
 
-    assert cli.DAY == 2
+    # Поднимается вместе с cli.DAY: смысл проверки не в конкретном числе, а в
+    # том, что журнал пишет текущий день, а не зашитую единицу.
+    assert cli.DAY == 3
     assert logged["day"] == cli.DAY
 
 

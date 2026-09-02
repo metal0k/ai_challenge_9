@@ -22,6 +22,7 @@ cp .env.example .env      # и вписать MISTRAL_API_KEY
 uv run advent w01 chat "Что такое LLM?"   # один вопрос — один ответ
 uv run advent w01 chat                     # интерактивный диалог
 uv run advent w01 models                   # какие модели доступны аккаунту
+uv run advent w01 solve                    # одна задача четырьмя способами рассуждения
 ```
 
 ## Программа
@@ -45,6 +46,7 @@ uv run advent w01 models                   # какие модели досту�
 |--------|------|---------|-----|-------|
 | 01 | 01 | Первый запрос к LLM через API | [`w01d01`](https://github.com/metal0k/ai_challenge_9/tree/w01d01) | — |
 | 01 | 02 | Формат ответа | [`w01d02`](https://github.com/metal0k/ai_challenge_9/tree/w01d02) | — |
+| 01 | 03 | Разные способы рассуждения | [`w01d03`](https://github.com/metal0k/ai_challenge_9/tree/w01d03) | — |
 
 ## Структура
 
@@ -66,12 +68,21 @@ tools/          проверка индекса перед публикацие�
 |---------|-----------|
 | `advent w01 chat [вопрос]` | Вопрос модели; без аргумента — REPL с историей |
 | `advent w01 models` | Список моделей из живого API |
+| `advent w01 solve` | Решить задачу четырьмя способами рассуждения и сравнить |
 | `advent record --day 1` | Записать демо через OBS и положить как `WWDD.mp4` |
 | `advent submit --day 1` | Проверить тег и видео, напечатать комментарий для таблицы |
 
 Полезные флаги `chat`: `--model`, `--system`, `--temperature`, `--top-p`,
 `--max-tokens`, `--seed`, `--stop`, `--reasoning-effort`, `--no-stream`,
-`--verbose`, `--format`, `--schema-file`, `--done`, `--mode`, `--max-turns`.
+`--verbose`, `--format`, `--schema-file`, `--done`, `--mode`, `--max-turns`,
+`--strategy`.
+
+Флаги `solve`: `--problem`, `--strategy`, `--runs`, `--judge/--no-judge`,
+`--judge-model`, `--model`, `--system`, `--verbose`. Способы рассуждения —
+`direct` (прямой ответ), `steps` (пошагово), `meta` (модель сама пишет промпт
+для решения), `panel` (аналитик, инженер, критик и синтез); `all` прогоняет все
+четыре и печатает таблицу сравнения с вердиктом по эталону и оценкой
+LLM-судьи. Подробности — в [`week_01/README.md`](week_01/README.md#day-03--разные-способы-рассуждения).
 
 Команды внутри REPL:
 
@@ -83,7 +94,7 @@ tools/          проверка индекса перед публикацие�
 | `/model list` | таблица chat-моделей (`list all` — вообще все) |
 | `/model info` | карточка модели: контекст, возможности, рекомендованная t° |
 | `/params` | текущие параметры генерации и итоговый system prompt |
-| `/set <параметр> <значение>` | изменить параметр, включая `format`/`schema_file`/`done`/`mode`/`max_turns` (`default` — сбросить) |
+| `/set <параметр> <значение>` | изменить параметр, включая `format`/`schema_file`/`done`/`mode`/`max_turns`/`strategy` (`default` — вернуть умолчание команды) |
 | `/again` | повторить последний вопрос с текущими настройками, без истории |
 | `/reset` | очистить историю |
 | `/exit` | выход |

@@ -6,12 +6,31 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 FORMAT_CHOICES = ("text", "json", "schema", "yaml", "md")
 MODE_CHOICES = ("chat", "dialog")
+
+# Названия стратегий рассуждения дня 03. Живут здесь, а не в
+# week_01/strategies.py, по той же причине, что FORMAT_CHOICES и MODE_CHOICES
+# дня 02: реестр параметров обязан валидировать значение сам, а импортировать
+# неделю в core нельзя — зависимость идёт только в обратную сторону.
+# strategies.py импортирует этот кортеж, чтобы список стратегий не пришлось
+# править в двух файлах.
+STRATEGIES = ("direct", "steps", "meta", "panel")
+STRATEGY_CHOICES = (*STRATEGIES, "all")
+
+# Команды CLI, у которых есть собственные значения по умолчанию (Spec.defaults).
+CHAT_COMMAND = "chat"
+SOLVE_COMMAND = "solve"
+
+# Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
+# видео читается, `--no-judge` в командной строке — тоже, и обе формы должны
+# работать одинаково.
+BOOL_TRUE = ("1", "true", "yes", "on", "y", "да", "вкл")
+BOOL_FALSE = ("0", "false", "no", "off", "n", "нет", "выкл")
 
 
 class ParamError(Exception):
@@ -33,6 +52,12 @@ class Spec:
     # Локальный параметр (формат, диалог, …): в payload API не попадает вообще,
     # это не то же самое, что «срезан по capabilities» — см. as_payload().
     local: bool = False
+    # Значение по умолчанию, своё для каждой команды CLI: `strategy` — direct в
+    # chat и all в solve, `judge` — выкл в chat и вкл в solve (SPEC-w01d03.md
+    # §4). Держим здесь, а не в сигнатурах typer: иначе одно и то же правило
+    # оказалось бы записано в двух командах и разъехалось при первой же правке.
+    # Пустой словарь означает «умолчания нет, None и есть значение».
+    defaults: dict[str, Any] = field(default_factory=dict)
 
 
 SPECS: tuple[Spec, ...] = (
@@ -88,9 +113,50 @@ SPECS: tuple[Spec, ...] = (
         None,
         local=True,
     ),
+    Spec(
+        "strategy",
+        "choice",
+        "Способ рассуждения: direct / steps / meta / panel / all.",
+        choices=STRATEGY_CHOICES,
+        local=True,
+        defaults={CHAT_COMMAND: "direct", SOLVE_COMMAND: "all"},
+    ),
+    Spec(
+        "problem",
+        "string",
+        'id задачи из банка week_01/problems (по умолчанию — с флагом "default": true).',
+        local=True,
+    ),
+    Spec(
+        "runs",
+        "int",
+        "Прогонов на стратегию: >1 показывает разброс вместо одного броска.",
+        1,
+        None,
+        local=True,
+        defaults={SOLVE_COMMAND: 1},
+    ),
+    Spec(
+        "judge",
+        "bool",
+        "Оценивать ли ответы LLM-судьёй (эталона судья не видит).",
+        local=True,
+        defaults={CHAT_COMMAND: False, SOLVE_COMMAND: True},
+    ),
+    Spec(
+        "judge_model",
+        "string",
+        "Модель судьи. Не задана — судит та же модель, что решала.",
+        local=True,
+    ),
 )
 
 BY_NAME = {spec.name: spec for spec in SPECS}
+
+
+def defaults_for(command: str) -> dict[str, Any]:
+    """Умолчания параметров для команды CLI: `chat` и `solve` различаются."""
+    return {spec.name: spec.defaults[command] for spec in SPECS if command in spec.defaults}
 
 
 def _parse(spec: Spec, raw: Any) -> Any:
@@ -113,6 +179,17 @@ def _parse(spec: Spec, raw: Any) -> Any:
             allowed = ", ".join(spec.choices or ())
             raise ParamError(f"{spec.name} принимает только: {allowed}")
         return value
+    elif spec.kind == "bool":
+        # bool раньше str(): булев флаг typer приходит уже разобранным, а
+        # `/set judge вкл` — строкой, и обе формы обязаны дать один результат.
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        if text in BOOL_TRUE:
+            return True
+        if text in BOOL_FALSE:
+            return False
+        raise ParamError(f"{spec.name} принимает вкл/выкл: {', '.join((*BOOL_TRUE, *BOOL_FALSE))}")
     elif spec.kind in ("string", "path"):
         # Разбор содержимого (префикс done, существование файла схемы и т.п.)
         # сознательно не здесь — Spec валидирует только форму значения,
@@ -163,6 +240,14 @@ class GenerationParams:
     mode: str | None = None
     max_turns: int | None = 10
 
+    # Параметры дня 03. Значения по умолчанию не проставляются здесь: они
+    # разные у chat и solve, и живут в Spec.defaults — см. apply_defaults().
+    strategy: str | None = None
+    problem: str | None = None
+    runs: int | None = None
+    judge: bool | None = None
+    judge_model: str | None = None
+
     @classmethod
     def build(cls, **raw: Any) -> GenerationParams:
         known = {f.name for f in fields(cls)}
@@ -170,6 +255,18 @@ class GenerationParams:
         if unknown:
             raise ParamError(f"Неизвестные параметры: {', '.join(sorted(unknown))}")
         return cls(**{name: _parse(BY_NAME[name], value) for name, value in raw.items()})
+
+    def apply_defaults(self, command: str) -> None:
+        """Проставляет умолчания команды в параметры, которых пользователь не задал.
+
+        Зовётся и на старте команды, и после каждого `/set … default` в REPL:
+        «default» означает «умолчание этой команды», а не «пусто навсегда».
+        Уже заданное значение (в том числе False у judge) не трогается —
+        именно поэтому проверка на None, а не на ложность.
+        """
+        for name, value in defaults_for(command).items():
+            if getattr(self, name) is None:
+                setattr(self, name, value)
 
     def set(self, name: str, raw: Any) -> Any:
         """Меняет один параметр по имени. Используется командой `/set`."""
@@ -215,6 +312,11 @@ class GenerationParams:
             value = getattr(self, spec.name)
             if value is None:
                 shown = "—"
+            elif isinstance(value, bool):
+                # Раньше isinstance(value, list): bool — не список и не строка,
+                # и без этой ветки judge печатался бы как "False", что читается
+                # как значение, а не как выключенный флаг.
+                shown = "вкл" if value else "выкл"
             elif isinstance(value, list):
                 shown = ",".join(value)
             else:

@@ -23,11 +23,18 @@ def log_call(
     day: int | None = None,
     error: str | None = None,
     path: Path | None = None,
+    extra: dict[str, object] | None = None,
 ) -> None:
     """Дописывает одну строку в JSONL. Никогда не роняет вызывающий код.
 
     Логирование — побочный эффект демо; упавшая запись в лог не должна
     убивать уже полученный ответ на экране пользователя.
+
+    `extra` — метки вызова, которые знает только вызывающая сторона: с дня 03
+    один ответ складывается из нескольких вызовов, и без пометки «стратегия
+    panel, роль critic» строки в журнале неразличимы. Ключи кладутся рядом с
+    остальными полями, но не поверх них: имя из extra, совпавшее со штатным
+    полем, молча подменило бы источник истины.
     """
     record = {
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -47,6 +54,8 @@ def log_call(
         "truncated": result.truncated,
         "error": redact(error) if error else None,
     }
+    for key, value in (extra or {}).items():
+        record.setdefault(key, value)
 
     target = path or (LOG_DIR / "calls.jsonl")
     try:

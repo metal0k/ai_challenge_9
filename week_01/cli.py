@@ -19,10 +19,21 @@ from advent_core.client import (
     model_names,
     resolve_alias,
 )
-from advent_core.config import LOG_DIR, Config, ConfigError
+from advent_core.config import DEFAULT_SYSTEM_PROMPT, LOG_DIR, Config, ConfigError
 from advent_core.errors import AdventError, ConfigurationError
 from advent_core.journal import log_call
-from advent_core.params import BY_NAME, FORMAT_CHOICES, MODE_CHOICES, REASONING_EFFORTS, ParamError
+from advent_core.params import (
+    BY_NAME,
+    CHAT_COMMAND,
+    FORMAT_CHOICES,
+    MODE_CHOICES,
+    REASONING_EFFORTS,
+    SOLVE_COMMAND,
+    STRATEGY_CHOICES,
+    ParamError,
+)
+from advent_core.telemetry import CallResult
+from week_01 import strategies
 
 WEEK = 1
 # Поднимать вместе с номером текущего дня — единственное место, которое это
@@ -31,9 +42,14 @@ WEEK = 1
 # logs/calls.jsonl день 1 (НАХОДКА 4 code review). Протаскивать day через всю
 # цепочку вызовов ради одной константы — избыточно; альтернатива проще и
 # заведомо не разъедется, пока не забыть её поднять.
-DAY = 2
+DAY = 3
 HISTORY_PATH = LOG_DIR / "repl_history_w01.json"
 DIALOG_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "dialog.md"
+
+# Параметры дня 03, которые читает только команда `solve`. В REPL про них надо
+# сказать вслух: выставленный параметр, ни на что не влияющий, выглядит как
+# поломка — ровно та же логика, что у предупреждения про capabilities в /set.
+SOLVE_ONLY_PARAMS = ("problem", "runs", "judge", "judge_model")
 
 REPL_COMMANDS = [
     ("/help", "показать этот список"),
@@ -44,7 +60,8 @@ REPL_COMMANDS = [
     ("/params", "текущие параметры генерации (и итоговый system prompt)"),
     (
         "/set <параметр> <значение>",
-        "изменить параметр, включая format/schema_file/done/mode/max_turns (default — сбросить)",
+        "изменить параметр, включая format/schema_file/done/mode/max_turns/strategy "
+        "(default — вернуть умолчание команды)",
     ),
     ("/again", "повторить последний вопрос с текущими настройками, без истории"),
     ("/reset", "очистить историю диалога"),
@@ -86,6 +103,14 @@ def chat_command(
     max_turns: int | None = typer.Option(
         None, "--max-turns", help="Потолок ходов в --mode dialog (по умолчанию 10)."
     ),
+    strategy: str | None = typer.Option(
+        None,
+        "--strategy",
+        help=(
+            f"Способ рассуждения над вопросом: {', '.join(STRATEGY_CHOICES)}. "
+            "direct — обычный чат без добавок."
+        ),
+    ),
     no_stream: bool = typer.Option(False, "--no-stream", help="Получить ответ одним куском."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Детали запроса в stderr."),
 ) -> None:
@@ -112,11 +137,24 @@ def chat_command(
         done=done,
         mode=mode,
         max_turns=max_turns,
+        strategy=strategy,
     )
+    # Умолчания у chat и solve разные (strategy=direct против all), и знает об
+    # этом реестр параметров, а не сигнатура typer: иначе одно правило было бы
+    # записано в двух командах.
+    config.params.apply_defaults(CHAT_COMMAND)
     _guard_one_shot_dialog(question, config)
 
     if question:
-        _ask_once(config, question)
+        # direct — это отсутствие каких-либо добавок к промпту, то есть ровно
+        # обычный путь дней 01–02 со стримом и всем прочим. Поэтому стратегия
+        # уводит вопрос в машинерию дня 03 только когда она НЕ direct: иначе
+        # каждый обычный `chat "привет"` начал бы требовать строку ОТВЕТ: и
+        # потерял бы стрим.
+        if config.params.strategy == "direct":
+            _ask_once(config, question)
+        else:
+            _ask_with_strategy(Session(config), question)
     else:
         _repl(config)
 
@@ -140,32 +178,22 @@ def _guard_one_shot_dialog(question: str | None, config: Config) -> None:
         )
 
 
-def _apply_local_flags(
-    config: Config,
-    *,
-    format: str | None,
-    schema_file: str | None,
-    done: str | None,
-    mode: str | None,
-    max_turns: int | None,
-) -> None:
-    """Кладёт флаги --format/--schema-file/--done/--mode/--max-turns в config.params.
+def _apply_local_flags(config: Config, **flags: object) -> None:
+    """Кладёт локальные флаги команды (--format, --strategy, …) в config.params.
 
-    Одна и та же валидация, что у `/set`: GenerationParams.set() проверяет
-    форму значения (choices, непустая строка, …), а `_check_local_param()`
-    следом проверяет смысл (файл схемы существует, префикс `done` понятен) —
-    на старте CLI ошибка должна остановить программу, а не всплыть только на
-    первом запросе к модели.
+    Именованные аргументы, а не фиксированная сигнатура: у `chat` и `solve`
+    наборы флагов разные, а обрабатываются они одинаково. Неизвестное имя не
+    проглатывается — `GenerationParams.set()` поднимет ParamError, как на
+    опечатку в `/set`.
+
+    Валидация та же, что у `/set`: GenerationParams.set() проверяет форму
+    значения (choices, непустая строка, …), а `_check_local_param()` следом
+    проверяет смысл (файл схемы существует, задача есть в банке) — на старте
+    CLI ошибка должна остановить программу, а не всплыть только на первом
+    запросе к модели.
     """
-    given = (
-        ("format", format),
-        ("schema_file", schema_file),
-        ("done", done),
-        ("mode", mode),
-        ("max_turns", max_turns),
-    )
     try:
-        for name, raw in given:
+        for name, raw in flags.items():
             if raw is None:
                 continue
             config.params.set(name, raw)
@@ -174,19 +202,23 @@ def _apply_local_flags(
         raise ConfigError(str(exc)) from exc
 
 
-def _check_local_param(name: str, value: str) -> None:
-    """Ранняя проверка смысла (не только формы) для schema_file/done.
+def _check_local_param(name: str, value: object) -> None:
+    """Ранняя проверка смысла (не только формы) для schema_file/done/problem.
 
     Spec в params.py валидирует только форму значения (см. её комментарий);
     смысл — существование и валидность файла схемы, распознаваемый префикс
-    done — знают formats.load_schema()/formats.parse_done(). Здесь их зовут
-    ради самой дешёвой точки сообщить об ошибке: сразу, а не на первом
-    запросе к модели или посреди демо.
+    done, наличие задачи в банке — знают formats.load_schema(),
+    formats.parse_done() и strategies.load_problem(). Здесь их зовут ради
+    самой дешёвой точки сообщить об ошибке: сразу, а не на первом запросе к
+    модели или посреди демо. Для `problem` это особенно важно: опечатка в id
+    иначе всплыла бы после девяти оплаченных вызовов.
     """
     if name == "schema_file":
-        formats.load_schema(value)
+        formats.load_schema(str(value))
     elif name == "done":
-        formats.parse_done(value)
+        formats.parse_done(str(value))
+    elif name == "problem":
+        strategies.load_problem(str(value))
 
 
 @app.command("models")
@@ -204,6 +236,143 @@ def models_command(
     if actual := resolve_alias(models, config.model):
         console.note(f"{config.model} сейчас разрешается в {actual}")
     console.note(f"показано {len(shown)} из {len(models)}; t° — рекомендованная моделью")
+
+
+@app.command("solve")
+def solve_command(
+    problem: str | None = typer.Option(None, "--problem", help="id задачи из банка problems/."),
+    strategy: str | None = typer.Option(
+        None,
+        "--strategy",
+        help=f"Способ рассуждения: {', '.join(STRATEGY_CHOICES)}. all — все четыре подряд.",
+    ),
+    runs: int | None = typer.Option(
+        None, "--runs", help="Прогонов на стратегию: >1 показывает разброс (по умолчанию 1)."
+    ),
+    judge: bool | None = typer.Option(
+        None, "--judge/--no-judge", help="Оценка ответов LLM-судьёй (по умолчанию включена)."
+    ),
+    judge_model: str | None = typer.Option(
+        None, "--judge-model", help="Модель судьи. По умолчанию судит та же, что решала."
+    ),
+    model: str | None = typer.Option(None, "--model", "-m", help="Имя модели Mistral."),
+    system: Path | None = typer.Option(None, "--system", help="Файл с system prompt."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Детали запуска в stderr."),
+) -> None:
+    """Решить одну задачу разными способами рассуждения и сравнить результаты."""
+    config = Config.resolve(model=model, system=system, verbose=verbose)
+    _apply_local_flags(
+        config,
+        problem=problem,
+        strategy=strategy,
+        runs=runs,
+        judge=judge,
+        judge_model=judge_model,
+    )
+    config.params.apply_defaults(SOLVE_COMMAND)
+    params = config.params
+
+    task = strategies.load_problem(params.problem)
+    names = _strategy_names(params.strategy)
+    # None здесь означает «сброшено через /set runs default» — по контракту
+    # params.py это умолчание команды, то есть 1, а не «ноль прогонов».
+    count = params.runs or 1
+
+    session = Session(config)
+    _check_judge_model(session)
+
+    if config.verbose:
+        console.note(
+            f"model={config.model} problem={task.id} strategies={', '.join(names)} "
+            f"runs={count} judge={'вкл' if params.judge else 'выкл'}"
+        )
+
+    strategies.print_problem(task)
+
+    warned: set[str] = set()
+
+    def on_step(step: strategies.Step) -> None:
+        """Вызов состоялся — печатаем и пишем в журнал немедленно.
+
+        Единица и печати, и записи — вызов, а не прогон и не стратегия.
+        Раньше и то и другое шло пачкой после законченной стратегии: 429 на
+        четвёртом вызове панели уносил три уже оплаченных ответа и с экрана,
+        и из logs/calls.jsonl — а журнал единственное, что этот день
+        сохраняет. Заодно исчезает минута молчания на записи: ответ виден
+        сразу, а не после девятого вызова.
+        """
+        _adopt_results([step.result], session, warned)
+        strategies.print_step(step)
+        strategies.log_step(step, week=WEEK, day=DAY, problem=task.id)
+
+    outcomes = strategies.solve(
+        task,
+        config,
+        strategies=names,
+        runs=count,
+        capabilities=session.capabilities,
+        # complete передаётся явно, хотя у solve() ровно такой дефолт:
+        # значение по умолчанию связывается в момент импорта strategies, и
+        # подмена chat_core.complete (так тесты убирают сеть — см.
+        # tests/test_cli_dialog.py) до него уже не достаёт.
+        complete=chat_core.complete,
+        on_step=on_step,
+        # Вердикт по эталону существует только после последнего вызова
+        # прогона, поэтому он отдельным колбэком, а не внутри on_step.
+        on_run=strategies.print_verdict,
+    )
+
+    verdict = None
+    if params.judge:
+        # capabilities судьи считаются по ЕГО модели, а не по решавшей: при
+        # --judge-model отсев параметров шёл по чужой карточке и, например,
+        # reasoning_effort уезжал модели без такой возможности — 400 вместо
+        # оценки, колонка «судья» превращалась в «—» после девяти оплаченных
+        # вызовов. Свой warned-набор по той же причине: предупреждение о
+        # срезанном параметре относится к другой модели.
+        judge_name = params.judge_model or config.model
+        judge_warned: set[str] = set()
+        verdict = strategies.judge(
+            task,
+            outcomes,
+            config,
+            capabilities=capabilities_of(session.models, judge_name) if session.models else None,
+            model=params.judge_model,
+            complete=chat_core.complete,  # см. комментарий у solve() выше
+        )
+        if verdict.result is not None:
+            _adopt_results([verdict.result], session, judge_warned, model=params.judge_model)
+        strategies.log_judge(verdict, week=WEEK, day=DAY, problem=task.id)
+
+    strategies.print_comparison(task, outcomes, verdict)
+
+
+def _strategy_names(strategy: str | None) -> tuple[str, ...]:
+    """`all` разворачивается в четыре стратегии в фиксированном порядке.
+
+    Порядок задаёт и таблицу, и метки судьи A–D, поэтому берётся как есть из
+    реестра и не сортируется.
+    """
+    if strategy is None or strategy == "all":
+        return strategies.STRATEGIES
+    return (strategy,)
+
+
+def _check_judge_model(session: Session) -> None:
+    """Проверяет модель судьи до первого вызова, а не после девяти.
+
+    strategies.judge() переживает недоступную модель штатно — ошибка попадает
+    в JudgeVerdict.error и таблица всё равно печатается. Но узнать про
+    опечатку в имени после всех вызовов решения — значит оплатить прогон
+    впустую, поэтому проверяем по уже загруженному списку моделей аккаунта.
+    """
+    name = session.config.params.judge_model
+    if not name or not session.models:
+        return
+    if name not in model_names(session.models):
+        raise ConfigError(
+            f"Модель судьи {name!r} недоступна аккаунту.\nПосмотри список: advent w01 models"
+        )
 
 
 class Session:
@@ -305,6 +474,21 @@ def _repl(config: Config) -> None:
             if _handle_command(line, session, history):
                 break
             continue
+
+        # Стратегия дня 03 применяется к каждому вопросу REPL (SPEC-w01d03.md
+        # §3). direct — это отсутствие добавок, то есть обычный путь ниже, а
+        # не отдельная ветка: иначе `/set strategy direct` вёл бы себя иначе,
+        # чем чат по умолчанию.
+        if session.config.params.strategy not in (None, "direct"):
+            if session.config.params.mode == "dialog":
+                # Диалог — многоходовый разговор с историей, стратегия — один
+                # независимый прогон. Совместить их нельзя, и молча выбрать
+                # одно из двух хуже, чем сказать, что именно выполняется.
+                console.warn("strategy не применяется в mode=dialog — идёт диалог")
+            else:
+                session.last_question = line
+                _strategy_question(session, line)
+                continue
 
         # mode=dialog уводит обычную реплику в отдельный цикл «вопрос за
         # вопросом» (см. _run_dialog) — история обычного REPL здесь не
@@ -430,6 +614,40 @@ def _show_params(session: Session) -> None:
     else:
         console.note("system prompt не задан")
 
+    # Показать «итоговый» system при активной стратегии нельзя: у panel их
+    # четыре разных, у meta второй вообще пишет сама модель. Молчать тоже
+    # нельзя — /params врал бы ровно так же, как врал на mode=dialog (НАХОДКА
+    # 1 code review), просто в другую сторону.
+    strategy = session.config.params.strategy
+    if strategy in (None, "direct"):
+        return
+
+    if session.config.params.mode == "dialog":
+        # В mode=dialog REPL стратегию не применяет вовсе (см. _repl): диалог
+        # многоходовый и с историей, стратегия — один независимый прогон.
+        # Обещать здесь промпт стратегии значило бы врать про запрос, которого
+        # не будет, — тем же способом, каким /params врал про dialog раньше.
+        console.note(f"strategy={strategy} не применяется в mode=dialog — идёт диалог")
+        return
+
+    # Штатный system-пресет проекта («лаконичный ассистент, без воды») в
+    # стратегию не подмешивается вовсе (strategies.build_strategy_system): он
+    # противоречит инструкции рассуждать пошагово и измеримо её обнуляет.
+    # Значит показанный выше «итоговый system prompt» к вызовам стратегии
+    # отношения не имеет, и говорить «поверх этого system» — ложь.
+    explicit = session.config.system_prompt_path != DEFAULT_SYSTEM_PROMPT
+    fate = (
+        "явно заданный system при этом сохраняется"
+        if explicit
+        else "показанный выше system prompt в вызовы стратегии НЕ уходит"
+    )
+    console.note(
+        f"strategy={strategy}: штатный system-пресет проекта в стратегию не подмешивается "
+        f"({fate}). Каждый вызов собирает system заново: промпт из "
+        f"week_01/prompts/reason_*.md плюс общая добавка про маркер "
+        f"{strategies.ANSWER_MARKER}"
+    )
+
 
 def _final_system_prompt(session: Session) -> str | None:
     """system пользователя + дописанная инструкция пресета формата/диалога.
@@ -481,11 +699,24 @@ def _handle_set(args: list[str], session: Session) -> None:
         console.warn(str(error))
         return
 
+    # `/set strategy default` означает «верни умолчание команды» (для REPL это
+    # всегда chat), а не «оставь пусто»: пустая strategy иначе читалась бы
+    # ниже как direct случайно, а не по правилу из реестра параметров.
+    session.config.params.apply_defaults(CHAT_COMMAND)
+    value = getattr(session.config.params, name)
+
+    if name in SOLVE_ONLY_PARAMS:
+        console.warn(f"{name} читает только команда solve — на вопросы в этом REPL не влияет")
+
     # rich_escape: значения вроде done=text:[ГОТОВО] (пример из спеки дня)
     # содержат квадратные скобки — без экранирования console.note() (Rich
     # markup) тихо съедает их как незакрытый тег, и маркер пропадает с экрана.
     if value is None:
         shown = "сброшен"
+    elif isinstance(value, bool):
+        # Раньше строки: bool попал бы в ветку else и напечатался как "False",
+        # что читается как значение параметра, а не как выключенный флаг.
+        shown = "вкл" if value else "выкл"
     elif isinstance(value, str):
         shown = rich_escape(value)
     else:
@@ -569,6 +800,13 @@ def _handle_again(session: Session) -> None:
         return
     if session.last_question is None:
         console.warn("нечего повторять — сначала задай вопрос")
+        return
+
+    if session.config.params.strategy not in (None, "direct"):
+        # Повтор должен быть повтором того же самого: если вопросы идут через
+        # стратегию, /again обязан идти через неё же, иначе сравнивались бы
+        # разные механики.
+        _strategy_question(session, session.last_question)
         return
 
     messages = chat_core.build_messages(
@@ -735,6 +973,95 @@ def _run_dialog(session: Session, task: str) -> str | None:
             # ничего не потеряется и ничего не уйдёт в модель.
             console.note("диалог: получена команда — выходим в обычный REPL")
             return line
+
+
+def _ask_with_strategy(session: Session, question: str) -> None:
+    """Вопрос через стратегию рассуждения дня 03 — вторая поверхность дня.
+
+    Обе поверхности (`solve` и `chat --strategy`) ходят в один и тот же
+    week_01/strategies.py, поэтому разъехаться в поведении не могут
+    (SPEC-w01d03.md §3). Отличие ровно одно: эталона у вопроса из чата нет,
+    поэтому печатаются только сами вызовы (print_step), без вердикта.
+
+    История REPL сознательно не трогается: стратегия строит свои messages с
+    нуля (панель экспертов независима по определению), и дописать её ответ в
+    историю значило бы показать модели разговор, которого она не видела.
+    Это тот же принцип, что у `/again`.
+    """
+    problem = strategies.question_as_problem(question)
+    warned: set[str] = set()
+
+    def on_step(step: strategies.Step) -> None:
+        # Печать и журнал по факту вызова — та же причина, что в solve_command.
+        _adopt_results([step.result], session, warned)
+        strategies.print_step(step)
+        strategies.log_step(step, week=WEEK, day=DAY, problem=problem.id)
+
+    for position, name in enumerate(_strategy_names(session.config.params.strategy)):
+        # Тот же прогресс в stderr, что печатает strategies.solve(): на записи
+        # между шагами панели проходят десятки секунд, и молчащий экран
+        # выглядит зависшим.
+        console.note(name)
+        strategies.run_strategy(
+            name,
+            problem,
+            session.config,
+            capabilities=session.capabilities,
+            complete=chat_core.complete,  # см. комментарий у solve() выше
+            # Предупреждения про stop/format зависят от конфига, а не от
+            # стратегии: на `chat --strategy all` они иначе печатаются четыре
+            # раза подряд. Сама правка конфига при этом делается каждый раз.
+            warn_unsafe_params=position == 0,
+            on_step=on_step,
+        )
+
+
+def _strategy_question(session: Session, question: str) -> None:
+    """То же, что _ask_with_strategy(), но переживает ошибку — версия для REPL.
+
+    В REPL ошибка не должна убивать сессию (тот же принцип, что и в обычной
+    ветке). В журнал при этом уходит сам вопрос, а не реальные messages
+    стратегии: их построил и потерял упавший вызов внутри run_strategy(), и
+    придумывать их здесь значило бы записать в лог то, чего не отправляли.
+    """
+    try:
+        _ask_with_strategy(session, question)
+    except AdventError as error:
+        console.fail(error)
+        log_call(
+            CallResult(model_requested=session.config.model),
+            [{"role": "user", "content": question}],
+            week=WEEK,
+            day=DAY,
+            error=error.message,
+            extra={"strategy": session.config.params.strategy},
+        )
+
+
+def _adopt_results(
+    results: list[CallResult],
+    session: Session,
+    warned: set[str],
+    model: str | None = None,
+) -> None:
+    """Достраивает результаты, полученные в обход `_run()`.
+
+    Стратегии зовут chat.complete() напрямую, поэтому две вещи, которые
+    обычно делает `_run()`, приходится сделать здесь: подставить конкретную
+    версию модели (API возвращает присланное имя — `-latest` так и остаётся
+    `-latest`, см. CLAUDE.md) и предупредить о параметрах, срезанных по
+    capabilities. `warned` копит уже сказанное: девять вызовов подряд иначе
+    напечатали бы одно и то же предупреждение девять раз.
+    """
+    requested = model or session.config.model
+    resolved = resolve_alias(session.models, requested) if session.models else None
+    for result in results:
+        if resolved:
+            result.model_actual = resolved
+        for name in result.skipped_params:
+            if name not in warned:
+                warned.add(name)
+                console.warn(f"{requested} не поддерживает {name} — параметр не отправлен")
 
 
 def _run(session: Session, messages: list[chat_core.Message]) -> chat_core.CallResult:
