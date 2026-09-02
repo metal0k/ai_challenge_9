@@ -264,6 +264,12 @@ sanitised specification lives in `specs/SPEC.md`.
 
 - `specs/SPEC.md` is the agreed specification; `specs/TODO.md` is the live queue.
   Keep both current — the queue must survive a session restart.
+- **Every finished day gets a short report in `specs/reports/wNNdDD.md`**, written
+  after `advent submit` succeeds. The spec says what was planned and the queue says
+  what is left; neither answers "what came out of it and what did we trip over".
+  Template and rationale: `specs/reports/README.md`. Whatever in it is permanent
+  project knowledge also goes into "Things that will bite you" above — the report
+  is the source, not the substitute.
 - README files and chat are in Russian; this file and code comments are English.
 - Comments explain *why*, especially where the code looks odd on purpose (the
   traps above). Do not add comments that restate the code.
