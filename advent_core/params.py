@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -25,6 +26,7 @@ STRATEGY_CHOICES = (*STRATEGIES, "all")
 # Команды CLI, у которых есть собственные значения по умолчанию (Spec.defaults).
 CHAT_COMMAND = "chat"
 SOLVE_COMMAND = "solve"
+TEMP_COMMAND = "temp"
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
 # видео читается, `--no-judge` в командной строке — тоже, и обе формы должны
@@ -61,12 +63,16 @@ class Spec:
 
 
 SPECS: tuple[Spec, ...] = (
+    # maximum=1.5, не 2.0: живой замер 2026-09-03 (SPEC-w01d04.md §2) дал 422
+    # "Input should be less than or equal to 1.5" уже на 1.51 — одинаково у
+    # mistral-small-latest и magistral-medium-latest. 0..2 — диапазон OpenAI,
+    # у Mistral его нет; баг ехал с Day 01.
     Spec(
         "temperature",
         "float",
-        "Разброс ответа: 0 — детерминированно, выше — креативнее.",
+        "Разброс ответа: ниже — стабильнее, выше — разнообразнее. Потолок API 1.5.",
         0.0,
-        2.0,
+        1.5,
     ),
     Spec("top_p", "float", "Nucleus sampling: доля вероятностной массы.", 0.0, 1.0),
     Spec("max_tokens", "int", "Потолок длины ответа в токенах.", 1, None),
@@ -126,6 +132,7 @@ SPECS: tuple[Spec, ...] = (
         "string",
         'id задачи из банка week_01/problems (по умолчанию — с флагом "default": true).',
         local=True,
+        defaults={TEMP_COMMAND: "all"},
     ),
     Spec(
         "runs",
@@ -134,13 +141,18 @@ SPECS: tuple[Spec, ...] = (
         1,
         None,
         local=True,
-        defaults={SOLVE_COMMAND: 1},
+        defaults={SOLVE_COMMAND: 1, TEMP_COMMAND: 3},
     ),
     Spec(
         "judge",
         "bool",
         "Оценивать ли ответы LLM-судьёй (эталона судья не видит).",
         local=True,
+        # TEMP_COMMAND сознательно не здесь: LLM-судья дня 04 убран целиком
+        # (пользовательское решение — креативность open-задач оценивает
+        # человек, week_01/temperature.py.print_human_review(), а не API).
+        # `judge`/`judge_model` остаются в реестре ради `solve` — команда
+        # `temp` их больше не читает вовсе.
         defaults={CHAT_COMMAND: False, SOLVE_COMMAND: True},
     ),
     Spec(
@@ -148,6 +160,15 @@ SPECS: tuple[Spec, ...] = (
         "string",
         "Модель судьи. Не задана — судит та же модель, что решала.",
         local=True,
+    ),
+    Spec(
+        "temps",
+        "floats",
+        "Список температур для развёртки (day 04).",
+        0.0,
+        1.5,
+        local=True,
+        defaults={TEMP_COMMAND: [0.0, 0.7, 1.2]},
     ),
 )
 
@@ -168,6 +189,12 @@ def _parse(spec: Spec, raw: Any) -> Any:
             value = float(raw)
         except (TypeError, ValueError) as exc:
             raise ParamError(f"{spec.name} должен быть числом, а не {raw!r}") from exc
+        # math.isnan() отдельно от minimum/maximum ниже: NaN не меньше и не
+        # больше ничего (сравнение по IEEE754 всегда ложно), обе проверки
+        # границ молча пропускают его — `--temperature nan` доехал бы до
+        # payload и до Mistral как нестрогий JSON-литерал NaN.
+        if math.isnan(value):
+            raise ParamError(f"{spec.name} не может быть NaN")
     elif spec.kind == "int":
         try:
             value = int(raw)
@@ -196,6 +223,37 @@ def _parse(spec: Spec, raw: Any) -> Any:
         # семантику знает advent_core/formats.py (parse_done, load_schema).
         text = str(raw).strip()
         return text or None
+    elif spec.kind == "floats":
+        # Разбор — как у "list" (строка через запятую или готовый список), но
+        # каждый элемент приводится к float и сверяется с minimum/maximum сразу
+        # здесь: ветка возвращает список и до общей проверки границ ниже
+        # (она рассчитана на одиночное float/int в value) не доходит. Порядок
+        # и дубликаты сохраняются — пользователь мог намеренно попросить одну
+        # температуру дважды.
+        if isinstance(raw, list):
+            items = [str(x).strip() for x in raw]
+        else:
+            items = [part.strip() for part in str(raw).split(",")]
+        items = [item for item in items if item]
+        if not items:
+            return None
+        values: list[float] = []
+        for item in items:
+            try:
+                item_value = float(item)
+            except (TypeError, ValueError) as exc:
+                raise ParamError(f"{spec.name}: элемент {item!r} должен быть числом") from exc
+            # Та же дыра, что у одиночного kind="float" выше: NaN не меньше
+            # minimum и не больше maximum, поэтому без явной проверки проезжает
+            # в список температур молча (`--temps 0,nan,1.2`).
+            if math.isnan(item_value):
+                raise ParamError(f"{spec.name}: элемент {item!r} не может быть NaN")
+            if spec.minimum is not None and item_value < spec.minimum:
+                raise ParamError(f"{spec.name}: элемент {item!r} меньше {spec.minimum}")
+            if spec.maximum is not None and item_value > spec.maximum:
+                raise ParamError(f"{spec.name}: элемент {item!r} больше {spec.maximum}")
+            values.append(item_value)
+        return values
     else:  # list
         if isinstance(raw, list):
             items = [str(x).strip() for x in raw]
@@ -248,6 +306,11 @@ class GenerationParams:
     judge: bool | None = None
     judge_model: str | None = None
 
+    # Параметр дня 04 (SPEC-w01d04.md §5). Тоже локальный: развёртка по
+    # температурам делает week_01/temperature.py отдельными вызовами chat_core,
+    # список сам по себе в payload не идёт.
+    temps: list[float] | None = None
+
     @classmethod
     def build(cls, **raw: Any) -> GenerationParams:
         known = {f.name for f in fields(cls)}
@@ -266,7 +329,14 @@ class GenerationParams:
         """
         for name, value in defaults_for(command).items():
             if getattr(self, name) is None:
-                setattr(self, name, value)
+                # list(value), а не value как есть: Spec.defaults[TEMP_COMMAND]
+                # для temps — один list-объект, общий на весь модуль (SPECS
+                # строится один раз при импорте). Присвоить его напрямую
+                # значило бы, что все инстансы GenerationParams, получившие
+                # дефолт temps, делят один и тот же список — мутация в одном
+                # (например .append() где-то ниже по стеку) была бы видна
+                # всем остальным, включая следующий build() без temps.
+                setattr(self, name, list(value) if isinstance(value, list) else value)
 
     def set(self, name: str, raw: Any) -> Any:
         """Меняет один параметр по имени. Используется командой `/set`."""
@@ -317,6 +387,11 @@ class GenerationParams:
                 # и без этой ветки judge печатался бы как "False", что читается
                 # как значение, а не как выключенный флаг.
                 shown = "вкл" if value else "выкл"
+            elif spec.kind == "floats":
+                # ":g", а не str(): str(0.0) даёт "0.0", а не "0" — читается
+                # как отдельное число из другого разбора, хотя ввод и вывод
+                # должны совпадать буквально ("0,0.7,1.2").
+                shown = ",".join(f"{v:g}" for v in value)
             elif isinstance(value, list):
                 shown = ",".join(value)
             else:

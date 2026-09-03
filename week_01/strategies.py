@@ -82,6 +82,14 @@ StepHook = Callable[["Step"], None]
 # Банк задач
 # --------------------------------------------------------------------------
 
+# Значения Problem.format_check. Константы, а не голые строки в load/сравнении
+# — "marker" и "single_line" иначе разбросаны по _read_problem(),
+# week_01/temperature.py и тестам, и опечатка в одном месте молча не совпадёт
+# с другим (SPEC-w01d04.md §6).
+FORMAT_CHECK_MARKER = "marker"
+FORMAT_CHECK_SINGLE_LINE = "single_line"
+FORMAT_CHECKS = (FORMAT_CHECK_MARKER, FORMAT_CHECK_SINGLE_LINE)
+
 
 @dataclass(slots=True, frozen=True)
 class Problem:
@@ -102,6 +110,18 @@ class Problem:
     # задачу с более ранним id, и демо поедет не на той задаче
     # (SPEC-w01d03.md §5).
     default: bool = False
+    # open=True значит не «ответ пустой», а «правильного ответа не существует
+    # в принципе» (SPEC-w01d04.md §6) — у задачи вроде "придумай название
+    # кофейни" нет ключа, с которым можно сверяться. check_answer() на такой
+    # задаче звать нельзя: она молча сверит пустой answer с чем угодно и
+    # выдаст ложный вердикт. Вызывающий код (week_01/temperature.py) обязан
+    # проверять этот флаг сам и вместо сверки с эталоном звать судью.
+    open: bool = False
+    # Как проверяется соблюдение формата: "marker" — присутствие ОТВЕТ: (как у
+    # всех задач Day 03), "single_line" — ровно одна непустая строка после
+    # strip() (SPEC-w01d04.md §7). По умолчанию "marker" — это сохраняет
+    # поведение всего существующего банка без правки его файлов.
+    format_check: str = FORMAT_CHECK_MARKER
 
 
 def load_problems(directory: Path | None = None) -> dict[str, Problem]:
@@ -190,13 +210,33 @@ def _read_problem(path: Path) -> Problem:
     if not isinstance(data, dict):
         raise ConfigError(f"Задача в {path} должна быть JSON-объектом")
 
-    missing = [key for key in ("id", "title", "statement", "answer") if not data.get(key)]
+    # answer обязателен для всех задач, КРОМЕ open=true: у open-задачи
+    # ("coffee") эталона нет по определению (SPEC-w01d04.md §6), и требовать
+    # непустой answer означало бы заставить банк врать про наличие ключа,
+    # которого нет.
+    required = ("id", "title", "statement")
+    if not data.get("open"):
+        required += ("answer",)
+    missing = [key for key in required if not data.get(key)]
     if missing:
         raise ConfigError(f"В задаче {path} не заполнены поля: {', '.join(missing)}")
 
     accept = data.get("accept") or []
     if not isinstance(accept, list):
         raise ConfigError(f'Поле "accept" в {path} должно быть списком строк')
+
+    # Незаданный format_check — это FORMAT_CHECK_MARKER, поведение всего
+    # банка Day 03 без правки его файлов. А вот ЗАДАННОЕ, но опечатанное
+    # значение (например "makrer") обязано падать явной ошибкой, а не тихо
+    # повести себя как marker, — иначе опечатку заметят только по неверной
+    # колонке в таблице, через несколько дней после того, как файл правили
+    # (SPEC-w01d04.md §6).
+    format_check = str(data.get("format_check") or FORMAT_CHECK_MARKER)
+    if format_check not in FORMAT_CHECKS:
+        allowed = ", ".join(FORMAT_CHECKS)
+        raise ConfigError(
+            f'Поле "format_check" в {path} = {format_check!r}, ожидалось одно из: {allowed}'
+        )
 
     # Неизвестные ключи игнорируются молча: банк — данные, а не схема, и
     # заметка автора задачи не должна ронять загрузчик.
@@ -209,6 +249,8 @@ def _read_problem(path: Path) -> Problem:
         note=str(data.get("note") or "").strip(),
         placeholder=bool(data.get("placeholder")),
         default=bool(data.get("default")),
+        open=bool(data.get("open")),
+        format_check=format_check,
     )
 
 

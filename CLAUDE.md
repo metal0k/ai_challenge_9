@@ -251,6 +251,104 @@ rather than importing SDK exception classes, which move between versions.
 `ConfigError` is separate from `AdventError` — the REPL catches both so a typo in
 `/model` or `/set` warns instead of killing the session.
 
+**Mistral's `temperature` ceiling is 1.5, not 2.0.** Verified 2026-09-03 by raw
+REST against `mistral-small-latest` and `magistral-medium-latest`: `1.5` returns
+200, `1.51` and `2.0` return 422 with the server's own validator text —
+`"Input should be less than or equal to 1.5"`, `ctx: {"le": 1.5}`. The 0–2 range
+is OpenAI's; Mistral does not have it. `params.py` shipped `maximum=2.0` from
+Day 01, so `--temperature 2` passed local validation and died on the API. The
+bound now lives in exactly one place, and the three prose copies of "0..2" that
+had drifted out of sync with it (`cli.py` flag help, `.env.example`,
+`specs/SPEC.md`) are a standing reminder: a range written as text next to a
+range written as code is a second source of truth.
+
+**`temperature=0` is not deterministic, and `random_seed` does not fix it.**
+Same prompt, 5 runs: 2 distinct answers at `t=0`, and still 2 with
+`random_seed=42`. On the assembled `temp` pipeline at 10 runs: 2 distinct out of
+10 on `alice`, **5 out of 10** on `digits5`, 2 out of 10 on `coffee` — not one
+cell reached "1 of 10". The seed is not broken: at `t=0` decoding is greedy,
+there is no sampling step for a seed to control, and what is left comes from
+floating-point ordering in parallel server-side computation — a property of
+every LLM API. `digits5` diverges most because its reasoning chain is the
+longest and therefore has the most places to diverge. Mistral's docs promise
+"deterministic results" from `random_seed`; that promise does not survive
+measurement. The narrow, defensible claim is "`t=0` does not guarantee the same
+answer", not "seed does not work".
+
+**Temperature does not raise or lower accuracy — it widens the spread around
+whatever the model already considers most likely.** Measured on the assembled
+pipeline, 10 runs per cell, `mistral-small-latest`:
+
+| task | t=0 | t=0.7 | t=1.2 |
+|---|---|---|---|
+| `digits5` (model's modal answer is **right**) | **10/10** | 8/10 | 5/10 |
+| `alice` (model's modal answer is **wrong**) | **0/10** | 2/10 | 5/10 |
+
+When the modal answer is right, spread can only hurt. When it is wrong, spread
+is the only source of a correct answer — `alice` goes from 0/10 to 5/10 as
+temperature rises. Both converge on 5/10 at 1.2, where the model leans less on
+its own preference and more on chance. So **"low temperature means accuracy" is
+a myth of the same kind as "t=0 means deterministic"**: low temperature buys
+*repeatability*, and if the modal answer is wrong it guarantees being wrong
+every single time. The practical consequence is the opposite of the intuitive
+one — for a task the model reliably fails, several high-temperature runs plus a
+vote beat one run at zero.
+
+This is also why `TEMP_PROBLEMS` holds **both** `digits5` and `alice`. Either
+one alone produces a confident and wrong generalisation, and the question "which
+temperature is more accurate" has no answer that is not a lie until you name the
+task. Never drop one of the pair to shorten a demo.
+
+**Format compliance is a property of the prompt, not of the temperature.** An
+early REST probe showed the model emitting three variants with commentary at
+`t≥1.2` when asked to "answer in one line", which looked like temperature
+breaking the format. With `«без пояснений и без вариантов»` added to the
+statement, compliance is **10/10 at every temperature on every task**. The
+day's own problem-bank `note` had predicted the breakdown and was rewritten
+against the measurement. Two rules follow: a claim that a parameter degrades
+output has to be re-tested against a *strong* instruction before it is believed,
+and a `note` in the bank must never be printed before the run that would
+confirm it — `print_problem_header()` deliberately does not print it, because
+pre-announcing the finding turns a measurement into a formality.
+
+**Diversity and creativity are different things, and only diversity is
+monotonic in temperature.** Distinct answers rise on every task (5→10→10,
+2→10→10, 2→8→9). Creativity does not follow: a judge run during development
+ranked `t=0.7` above both `t=0` and `t=1.2` on the creative task, faulting the
+1.2 answer for "almost duplicating answer A, losing originality to letter
+case". Measuring "creativity" as "distinct count" would have inverted the
+result — the two must never be collapsed into one number.
+
+**Creativity is not scored by a model in this project; the day prints the data
+and the person judges.** Day 04 shipped an LLM judge first and it was removed on
+the user's instruction — "отдай оценку креативности человеку, просто выведи
+данные". What replaced it is every run's answer, grouped by temperature, so a
+reader compares them at a glance. The point is not that the judge was
+inaccurate: it is that on an open task with no reference there is nothing to be
+accurate *against*, so a number invents an authority the measurement does not
+have. Note the asymmetry with Day 03, where the judge stays: there it grades
+*reasoning* against a problem that has a right answer, and its disagreement with
+the key is itself a reportable result. A judge is defensible where a ground
+truth exists to disagree with, and decorative where none does. When removing
+such a thing, remove it — prompt, schema, parser, column, flags and tests — do
+not leave it behind a default-off flag; a switch nobody turns on is the same
+dead weight plus a maintenance claim.
+
+**A "winner" printed on a tie is a lie the day cannot afford.** `max()` returns
+the first maximum, so a flat accuracy column (0/3, 0/3, 0/3 — a likely outcome
+on `alice` at three runs) would have printed "точнее всего — t=0.0 (0/3)",
+naming a winner where nobody won. Every summary line built from `max()`/`min()`
+over measured cells needs an explicit tie check before it claims a leader.
+
+**A per-module `DAY` constant stops working the moment one module holds two
+days' commands.** `week_01/cli.py` writes `day=DAY` into the JSONL journal;
+`temp` was added on Day 04 while `chat`/`solve` were last touched on Day 03, so
+one constant would mislabel one of them. There are now `DAY` and `TEMP_DAY`.
+The test that was supposed to catch this compared the journal against
+`cli.DAY` — the same constant the journal is filled from — so it passed at any
+value. **A test whose expected value comes from the same source as the code
+under test cannot go red**; assert the literal.
+
 ## OBS recording
 
 `advent record` drives OBS through obs-websocket. Non-obvious constraints, all

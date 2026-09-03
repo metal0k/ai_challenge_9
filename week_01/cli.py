@@ -30,26 +30,50 @@ from advent_core.params import (
     REASONING_EFFORTS,
     SOLVE_COMMAND,
     STRATEGY_CHOICES,
+    TEMP_COMMAND,
     ParamError,
 )
 from advent_core.telemetry import CallResult
-from week_01 import strategies
+from week_01 import strategies, temperature
 
 WEEK = 1
-# Поднимать вместе с номером текущего дня — единственное место, которое это
-# знает. Раньше log_call() звался с зашитым day=1 буквально везде, включая
-# код дня 02 (_handle_again, _run_dialog): `advent record --day 2` писал в
-# logs/calls.jsonl день 1 (НАХОДКА 4 code review). Протаскивать day через всю
-# цепочку вызовов ради одной константы — избыточно; альтернатива проще и
-# заведомо не разъедется, пока не забыть её поднять.
+# Поднимать вместе с номером дня, который последним трогал ЭТОТ код —
+# единственное место, которое это знает. Раньше log_call() звался с зашитым
+# day=1 буквально везде, включая код дня 02 (_handle_again, _run_dialog):
+# `advent record --day 2` писал в logs/calls.jsonl день 1 (НАХОДКА 4 code
+# review). Протаскивать day через всю цепочку вызовов ради одной константы —
+# избыточно; альтернатива проще и заведомо не разъедется, пока не забыть её
+# поднять.
+#
+# День 04 добавил `temp` — код, которого chat/dialog/solve не касаются и
+# который последним меняли не в день 03. Общая константа на весь модуль здесь
+# уже не работает: подняв DAY до 4 бездумно, получили бы день 4 и у вызовов
+# chat/solve, хотя эти команды в день 04 не менялись — их последняя правка
+# по-прежнему день 03 (см. tests/test_cli_dialog.py, где cli.DAY==3 закреплён
+# отдельной проверкой). Поэтому у chat/solve остаётся DAY, а у temp —
+# отдельная TEMP_DAY ниже; при следующем дне, который тронет chat или solve,
+# поднимать нужно будет именно DAY, а не эту константу.
 DAY = 3
+# Только для temp_command — единственной команды, написанной в день 04.
+TEMP_DAY = 4
 HISTORY_PATH = LOG_DIR / "repl_history_w01.json"
 DIALOG_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "dialog.md"
 
-# Параметры дня 03, которые читает только команда `solve`. В REPL про них надо
-# сказать вслух: выставленный параметр, ни на что не влияющий, выглядит как
-# поломка — ровно та же логика, что у предупреждения про capabilities в /set.
-SOLVE_ONLY_PARAMS = ("problem", "runs", "judge", "judge_model")
+# Параметры дней 03-04, которые REPL (всегда контекст `chat`) не читает — их
+# читают только команды `solve`/`temp`. В REPL про них надо сказать вслух:
+# выставленный параметр, ни на что не влияющий, выглядит как поломка — ровно
+# та же логика, что у предупреждения про capabilities в /set. `temps` —
+# единственный параметр здесь, который решает только `temp`; `problem`/`runs`
+# общие для `solve` и `temp`; `judge`/`judge_model` читает только `solve` —
+# LLM-судья дня 04 убран целиком (пользовательское решение), `temp` эти два
+# параметра больше не читает вовсе.
+NON_CHAT_PARAMS = {
+    "problem": "solve и temp",
+    "runs": "solve и temp",
+    "judge": "solve",
+    "judge_model": "solve",
+    "temps": "temp",
+}
 
 REPL_COMMANDS = [
     ("/help", "показать этот список"),
@@ -76,7 +100,13 @@ def chat_command(
     question: str | None = typer.Argument(None, help="Вопрос. Без аргумента открывается REPL."),
     model: str | None = typer.Option(None, "--model", "-m", help="Имя модели Mistral."),
     system: Path | None = typer.Option(None, "--system", help="Файл с system prompt."),
-    temperature: float | None = typer.Option(None, "--temperature", "-t", help="0..2."),
+    # help берётся из реестра, а не пишется здесь второй раз: тот же текст уже
+    # печатает /params через Spec.describe(), и «0..2.» здесь однажды разошлось
+    # с потолком API 1.5 в Spec (SPEC-w01d04.md §2) — одно место истины не даёт
+    # этому повториться.
+    temperature: float | None = typer.Option(
+        None, "--temperature", "-t", help=BY_NAME["temperature"].help
+    ),
     top_p: float | None = typer.Option(None, "--top-p", help="Nucleus sampling, 0..1."),
     max_tokens: int | None = typer.Option(None, "--max-tokens", help="Потолок длины ответа."),
     seed: int | None = typer.Option(None, "--seed", help="Seed для воспроизводимости."),
@@ -178,31 +208,38 @@ def _guard_one_shot_dialog(question: str | None, config: Config) -> None:
         )
 
 
-def _apply_local_flags(config: Config, **flags: object) -> None:
+def _apply_local_flags(config: Config, *, allow_all_problem: bool = False, **flags: object) -> None:
     """Кладёт локальные флаги команды (--format, --strategy, …) в config.params.
 
-    Именованные аргументы, а не фиксированная сигнатура: у `chat` и `solve`
-    наборы флагов разные, а обрабатываются они одинаково. Неизвестное имя не
-    проглатывается — `GenerationParams.set()` поднимет ParamError, как на
-    опечатку в `/set`.
+    Именованные аргументы, а не фиксированная сигнатура: у `chat`, `solve` и
+    `temp` наборы флагов разные, а обрабатываются они одинаково. Неизвестное
+    имя не проглатывается — `GenerationParams.set()` поднимет ParamError, как
+    на опечатку в `/set`.
 
     Валидация та же, что у `/set`: GenerationParams.set() проверяет форму
     значения (choices, непустая строка, …), а `_check_local_param()` следом
     проверяет смысл (файл схемы существует, задача есть в банке) — на старте
     CLI ошибка должна остановить программу, а не всплыть только на первом
     запросе к модели.
+
+    `allow_all_problem` — только для `temp`: там "all" у `--problem» значит
+    «обе задачи дня» (week_01.temperature.TEMP_PROBLEMS), а не id из банка,
+    так что искать его через strategies.load_problem() нельзя — этот же
+    вопрос уже решён для strategy=all на Day 03, только там magic-значение
+    ловится валидацией choices, а problem — свободная строка (SPEC-w01d04.md
+    §5).
     """
     try:
         for name, raw in flags.items():
             if raw is None:
                 continue
             config.params.set(name, raw)
-            _check_local_param(name, raw)
+            _check_local_param(name, raw, allow_all_problem=allow_all_problem)
     except ParamError as exc:
         raise ConfigError(str(exc)) from exc
 
 
-def _check_local_param(name: str, value: object) -> None:
+def _check_local_param(name: str, value: object, *, allow_all_problem: bool = False) -> None:
     """Ранняя проверка смысла (не только формы) для schema_file/done/problem.
 
     Spec в params.py валидирует только форму значения (см. её комментарий);
@@ -211,13 +248,16 @@ def _check_local_param(name: str, value: object) -> None:
     formats.parse_done() и strategies.load_problem(). Здесь их зовут ради
     самой дешёвой точки сообщить об ошибке: сразу, а не на первом запросе к
     модели или посреди демо. Для `problem` это особенно важно: опечатка в id
-    иначе всплыла бы после девяти оплаченных вызовов.
+    иначе всплыла бы после девяти (а у `temp` — после девятнадцати) оплаченных
+    вызовов.
     """
     if name == "schema_file":
         formats.load_schema(str(value))
     elif name == "done":
         formats.parse_done(str(value))
     elif name == "problem":
+        if allow_all_problem and str(value) == "all":
+            return
         strategies.load_problem(str(value))
 
 
@@ -373,6 +413,103 @@ def _check_judge_model(session: Session) -> None:
         raise ConfigError(
             f"Модель судьи {name!r} недоступна аккаунту.\nПосмотри список: advent w01 models"
         )
+
+
+@app.command("temp")
+def temp_command(
+    problem: str | None = typer.Option(
+        None,
+        "--problem",
+        help="id задачи из банка problems/, all — обе задачи дня (по умолчанию).",
+    ),
+    temps: str | None = typer.Option(
+        None,
+        "--temps",
+        help="Температуры через запятую, потолок API 1.5 (по умолчанию 0,0.7,1.2).",
+    ),
+    runs: int | None = typer.Option(
+        None, "--runs", help="Прогонов на ячейку задача×температура (по умолчанию 3)."
+    ),
+    model: str | None = typer.Option(None, "--model", "-m", help="Имя модели Mistral."),
+    system: Path | None = typer.Option(None, "--system", help="Файл с system prompt."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Детали запуска в stderr."),
+) -> None:
+    """Один и тот же запрос при разных температурах: точность, формат, разнообразие.
+
+    Креативность open-задач эта команда не оценивает сама — печатает все
+    ответы рядом (week_01.temperature.print_human_review), а балл ставит
+    человек, глядя на экран. Прежний LLM-судья дня 04 убран целиком
+    (пользовательское решение); `--judge`/`--judge-model` у этой команды
+    больше нет — они остаются только у `solve` (Day 03).
+    """
+    config = Config.resolve(model=model, system=system, verbose=verbose)
+    _apply_local_flags(
+        config,
+        problem=problem,
+        temps=temps,
+        runs=runs,
+        # "all" у --problem здесь не id из банка, а «обе задачи дня» — см.
+        # комментарий у _apply_local_flags().
+        allow_all_problem=True,
+    )
+    config.params.apply_defaults(TEMP_COMMAND)
+    params = config.params
+
+    # load_temp_problems() — та же самая дешёвая точка отказа, что и
+    # strategies.load_problem() у solve: опечатка в id обязана остановить
+    # программу здесь, до Session (а значит и до первого сетевого вызова), а
+    # не после части из девятнадцати оплаченных прогонов развёртки.
+    problems = temperature.load_temp_problems(params.problem)
+
+    # _check_judge_model(session) здесь намеренно НЕТ (было в дне 04 с
+    # судьёй): `temp` больше не читает judge_model вовсе — LLM-судья дня 04
+    # убран целиком, креативность open-задач оценивает человек
+    # (temperature.print_human_review). У `solve` (Day 03) эта проверка
+    # остаётся — там судья по-прежнему есть.
+    session = Session(config)
+
+    if config.verbose:
+        console.note(
+            f"model={config.model} problems={', '.join(p.id for p in problems)} "
+            f"temps={','.join(f'{t:g}' for t in params.temps)} runs={params.runs}"
+        )
+
+    for task in problems:
+        temperature.print_problem_header(task)
+
+    warned: set[str] = set()
+
+    def on_step(step: temperature.HeatStep) -> None:
+        """Вызов состоялся — печатаем и пишем в журнал немедленно.
+
+        Тот же принцип, что у solve_command.on_step: единица и печати, и
+        записи — вызов, а не ячейка и не задача целиком. Обрыв посреди
+        развёртки не должен унести с экрана и из logs/calls.jsonl уже
+        оплаченные прогоны.
+        """
+        _adopt_results([step.result], session, warned)
+        temperature.print_heat_step(step)
+        temperature.log_heat_step(step, week=WEEK, day=TEMP_DAY)
+
+    sweeps = temperature.run_temperature_sweep(
+        config,
+        problems,
+        params.temps,
+        params.runs or 1,
+        capabilities=session.capabilities,
+        # complete передаётся явно, хотя у run_temperature_sweep() ровно такой
+        # дефолт: значение по умолчанию связывается в момент импорта
+        # week_01.temperature, и подмена chat_core.complete (так тесты убирают
+        # сеть) до него уже не достаёт — та же ловушка Day 03 (CLAUDE.md, «A
+        # default argument binds at import time»).
+        complete=chat_core.complete,
+        on_step=on_step,
+    )
+
+    for sweep in sweeps:
+        temperature.print_cell_table(sweep.problem, sweep.cells)
+
+    temperature.print_conclusions(sweeps)
 
 
 class Session:
@@ -705,8 +842,11 @@ def _handle_set(args: list[str], session: Session) -> None:
     session.config.params.apply_defaults(CHAT_COMMAND)
     value = getattr(session.config.params, name)
 
-    if name in SOLVE_ONLY_PARAMS:
-        console.warn(f"{name} читает только команда solve — на вопросы в этом REPL не влияет")
+    if name in NON_CHAT_PARAMS:
+        console.warn(
+            f"{name} читает только команда {NON_CHAT_PARAMS[name]} — "
+            "на вопросы в этом REPL не влияет"
+        )
 
     # rich_escape: значения вроде done=text:[ГОТОВО] (пример из спеки дня)
     # содержат квадратные скобки — без экранирования console.note() (Rich
