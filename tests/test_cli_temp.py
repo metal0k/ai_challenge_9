@@ -41,6 +41,15 @@ MODELS = [
         "aliases": ["magistral-medium-latest"],
         "capabilities": {"completion_chat": True, "reasoning": True},
     },
+    # DEFAULT_MODEL сменился на ministral-14b-latest (SPEC-w01d05.md §15) —
+    # Session.refresh() валидирует config.model против этого списка, и без
+    # записи любой вызов без явного --model падает ConfigError'ом ещё до
+    # первого complete() (найдено по красным test_cli_temp.py, отчёт фазы 1).
+    {
+        "id": "ministral-14b-2512",
+        "aliases": ["ministral-14b-latest"],
+        "capabilities": {"completion_chat": True},
+    },
 ]
 
 _ENV_KEYS = (

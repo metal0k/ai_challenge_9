@@ -17,6 +17,100 @@ from advent_core.errors import translate
 
 MODELS_URL = "https://api.mistral.ai/v1/models"
 
+# Атрибут, под которым на клиенте живёт проба заголовков. Своё имя с
+# префиксом, чтобы не столкнуться ни с чем в объекте SDK.
+_PROBE_ATTR = "_advent_rate_limit_probe"
+
+
+class _RateLimitProbe:
+    """Запоминает заголовки последнего успешного ответа.
+
+    Нужна ровно для лимитов частоты: Mistral отдаёт их только в заголовках
+    (`x-ratelimit-limit-req-minute` и остальные), а разобранное тело ответа их
+    не содержит — `chat.complete()` возвращает уже распакованный
+    `ChatCompletionResponse`, из которого `httpx.Response` не достать.
+
+    Это НЕ утка в приватный SDK: `SDKHooks.after_success()` перебирает
+    зарегистрированные хуки и зовёт у каждого `after_success(ctx, response)`
+    без всякой проверки типа, поэтому обычного объекта с этим методом
+    достаточно — наследоваться от `mistralai.client._hooks.types.AfterSuccessHook`
+    (приватный модуль) не требуется.
+
+    Хук ОБЯЗАН вернуть response: `SDKHooks.after_success()` присваивает
+    возвращённое значение обратно в цепочку, и `None` сломал бы разбор ответа
+    у всех последующих хуков.
+    """
+
+    def __init__(self) -> None:
+        self.headers: dict[str, str] = {}
+
+    def after_success(self, hook_ctx: object, response: object) -> object:
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            # Заголовки httpx нечувствительны к регистру, dict — уже нет,
+            # поэтому ключи приводятся сразу, а не при каждом чтении.
+            self.headers = {str(k).lower(): str(v) for k, v in headers.items()}
+        return response
+
+
+def _attach_rate_limit_probe(client: Mistral) -> None:
+    """Вешает пробу на клиент; молча ничего не делает, если SDK изменился.
+
+    Точка регистрации приватная: `Mistral.__init__` кладёт объект хуков в
+    `self.sdk_configuration.__dict__["_hooks"]`, публичного способа добавить
+    хук после создания клиента SDK не даёт (генератор Speakeasy предполагает
+    правку `_hooks/registration.py`, то есть файла внутри пакета).
+
+    Отсюда два следствия, оба сознательные:
+      * всё завёрнуто в широкий except — телеметрия не имеет права уронить
+        сам вызов, а этот шов может исчезнуть в любом минорном апдейте SDK;
+      * когда шов исчезнет, проба останется пустой, и потребитель обязан
+        считать лимит НЕизвестным, а не подставлять умолчание. Молчащий
+        «ноль» здесь был бы хуже отсутствующего значения.
+    """
+    try:
+        hooks = getattr(client.sdk_configuration, "_hooks", None)
+        register = getattr(hooks, "register_after_success_hook", None)
+        if register is None:
+            return
+        probe = _RateLimitProbe()
+        register(probe)
+        setattr(client, _PROBE_ATTR, probe)
+    except Exception:  # noqa: BLE001 — см. docstring: телеметрия не роняет вызов
+        return
+
+
+def rate_limit_headers(client: object) -> dict[str, str]:
+    """Заголовки лимита из последнего успешного ответа этого клиента.
+
+    Пустой словарь означает «неизвестно» — либо шов регистрации отвалился,
+    либо успешного ответа ещё не было.
+    """
+    probe = getattr(client, _PROBE_ATTR, None)
+    return dict(getattr(probe, "headers", {}) or {})
+
+
+def _header_int(headers: dict[str, str], name: str) -> int | None:
+    """Заголовок как целое; None вместо исключения на любом мусоре."""
+    raw = headers.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def requests_per_minute(client: object) -> int | None:
+    """Лимит запросов в минуту для модели последнего вызова, из заголовка.
+
+    У Mistral он ПОМОДЕЛЬНЫЙ: 2026-09-04 на одном ключе `ministral-3b-latest`
+    отдавал 750, `ministral-14b-latest` — 30, а `mistral-small-latest` — 0 и
+    429 в те же секунды. Поэтому значение осмысленно только рядом с моделью,
+    которой был сделан вызов, и кэшировать его на аккаунт нельзя.
+    """
+    return _header_int(rate_limit_headers(client), "x-ratelimit-limit-req-minute")
+
 
 @contextmanager
 def mistral_client(config: Config) -> Iterator[Mistral]:
@@ -35,6 +129,8 @@ def mistral_client(config: Config) -> Iterator[Mistral]:
         # Утилиты retry лежат в приватном модуле и могут переехать между
         # минорными версиями SDK. Без них клиент всё равно рабочий.
         client = Mistral(api_key=config.api_key)
+
+    _attach_rate_limit_probe(client)
 
     try:
         with client as mistral:

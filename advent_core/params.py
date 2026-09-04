@@ -27,6 +27,7 @@ STRATEGY_CHOICES = (*STRATEGIES, "all")
 CHAT_COMMAND = "chat"
 SOLVE_COMMAND = "solve"
 TEMP_COMMAND = "temp"
+BENCH_COMMAND = "bench"
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
 # видео читается, `--no-judge` в командной строке — тоже, и обе формы должны
@@ -141,7 +142,7 @@ SPECS: tuple[Spec, ...] = (
         1,
         None,
         local=True,
-        defaults={SOLVE_COMMAND: 1, TEMP_COMMAND: 3},
+        defaults={SOLVE_COMMAND: 1, TEMP_COMMAND: 3, BENCH_COMMAND: 3},
     ),
     Spec(
         "judge",
@@ -169,6 +170,19 @@ SPECS: tuple[Spec, ...] = (
         1.5,
         local=True,
         defaults={TEMP_COMMAND: [0.0, 0.7, 1.2]},
+    ),
+    Spec(
+        "models",
+        "models",
+        "Список моделей для развёртки (day 05), через запятую.",
+        local=True,
+        defaults={
+            BENCH_COMMAND: [
+                "ministral-3b-latest",
+                "ministral-8b-latest",
+                "ministral-14b-latest",
+            ]
+        },
     ),
 )
 
@@ -254,6 +268,21 @@ def _parse(spec: Spec, raw: Any) -> Any:
                 raise ParamError(f"{spec.name}: элемент {item!r} больше {spec.maximum}")
             values.append(item_value)
         return values
+    elif spec.kind == "models":
+        # Тот же разбор через запятую, что у "list", но пустой список — это
+        # ParamError, а не None: у "list" (stop) пустое значение осмысленно
+        # («стоп-строк нет»), а у "models" пустая лестница означает, что
+        # bench нечего перебирать — молчаливое None утонуло бы в
+        # apply_defaults() и подменилось бы дефолтом там, где пользователь
+        # явно (пусть и неудачно) задал --models "" или "--models , ,".
+        if isinstance(raw, list):
+            items = [str(x).strip() for x in raw]
+        else:
+            items = [part.strip() for part in str(raw).split(",")]
+        items = [item for item in items if item]
+        if not items:
+            raise ParamError(f"{spec.name}: список моделей не может быть пустым")
+        return items
     else:  # list
         if isinstance(raw, list):
             items = [str(x).strip() for x in raw]
@@ -310,6 +339,11 @@ class GenerationParams:
     # температурам делает week_01/temperature.py отдельными вызовами chat_core,
     # список сам по себе в payload не идёт.
     temps: list[float] | None = None
+
+    # Параметр дня 05 (SPEC-w01d05.md §8): лестница моделей для `bench` —
+    # список имён, а не Config.model, потому что bench перебирает несколько
+    # моделей за один прогон, а не работает с одной.
+    models: list[str] | None = None
 
     @classmethod
     def build(cls, **raw: Any) -> GenerationParams:

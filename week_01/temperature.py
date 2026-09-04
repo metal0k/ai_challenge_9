@@ -224,12 +224,17 @@ class ProblemSweep:
     cells: tuple[Cell, ...]
 
 
-def _runs_label(n: int) -> str:
+def runs_label(n: int) -> str:
     """Согласует числительное с «прогон»: 1 прогон, 2 прогона, 5 прогонов.
 
     «1 прогонов» на экране (заголовок таблицы, заголовок ячейки) читается на
     записи как ошибка речи, а не как мелочь (review М2) — используется везде,
     где число прогонов идёт в текст, а не только в отладочный вывод.
+
+    Публичная (без подчёркивания): day 05 (week_01/models_bench.py) заводит
+    ту же развёртку N-прогонов-на-ячейку и переиспользует эту функцию вместо
+    второй копии согласования числительных (CLAUDE.md — «переиспользуй
+    существующее»).
     """
     tail, tens = n % 10, n % 100
     if tail == 1 and tens != 11:
@@ -247,8 +252,11 @@ def _format_ok(text: str, problem: Problem, check: Check | None) -> bool:
     "single_line" (coffee): ровно одна непустая строка после strip(). "marker"
     (alice): присутствие ОТВЕТ: — Check.has_marker, когда сверка уже
     посчитана (не-open задачи); extract_answer() напрямую иначе, чтобы формат
-    можно было проверить и без эталона.
+    можно было проверить и без эталона. "none" (день 05, вне TEMP_PROBLEMS
+    этого дня) формата не требует вовсе — соблюдён тривиально, любым текстом.
     """
+    if problem.format_check == strategies.FORMAT_CHECK_NONE:
+        return True
     if problem.format_check == strategies.FORMAT_CHECK_SINGLE_LINE:
         lines = [line for line in text.splitlines() if line.strip()]
         return len(lines) == 1
@@ -262,15 +270,13 @@ def load_temp_problems(
 ) -> list[Problem]:
     """Задачи для развёртки: обе TEMP_PROBLEMS (None/"all") или одна по id.
 
-    "all" — то же магическое значение, что strategy=all на Day 03: коллизия с
-    реальным id "all" в банке принята осознанно, как и там (SPEC §5).
+    Тонкая обёртка над strategies.load_problem_set() — правило разбора
+    None/"all" общее с Day 05 (week_01/models_bench.py), набор задач свой.
     """
-    if problem_id is None or problem_id == "all":
-        return [strategies.load_problem(pid, directory) for pid in TEMP_PROBLEMS]
-    return [strategies.load_problem(problem_id, directory)]
+    return strategies.load_problem_set(TEMP_PROBLEMS, problem_id, directory)
 
 
-def _heat_hygiene(config: Config) -> Config:
+def heat_hygiene(config: Config) -> Config:
     """Гигиена замера (SPEC-w01d04.md §9) — обе правки видны пользователю в stderr.
 
     top_p обнуляется с предупреждением: Mistral рекомендует менять либо
@@ -286,6 +292,11 @@ def _heat_hygiene(config: Config) -> Config:
     stop, пересекающийся с маркером ОТВЕТ:, снимается тем же кодом, что и на
     Day 03 (strategies._solving_config) — переписать эту логику здесь значило
     бы завести второй источник истины, который разойдётся при первой правке.
+
+    Публичная (без подчёркивания): day 05 (week_01/models_bench.py) меряет
+    модели, а не температуру, но нуждается в той же гигиене (снятие персоны
+    через strategies._solving_config, top_p, предупреждение про random_seed)
+    — переиспользуется отсюда вместо второй копии (CLAUDE.md).
     """
     config = strategies._solving_config(config)
 
@@ -444,7 +455,7 @@ def run_temperature_sweep(
     if not problems:
         raise ConfigError("список задач пуст")
 
-    config = _heat_hygiene(config)
+    config = heat_hygiene(config)
 
     sweeps: list[ProblemSweep] = []
     for problem in problems:
@@ -523,7 +534,7 @@ def print_heat_step(step: HeatStep) -> None:
     раз, в самом заголовке, только если их больше одного.
     """
     if step.first_in_cell:
-        suffix = f" · {_runs_label(step.runs)}" if step.runs > 1 else ""
+        suffix = f" · {runs_label(step.runs)}" if step.runs > 1 else ""
         header = f"── {step.problem.id} · t={step.temperature:g}{suffix} ──"
         console.note(header)
         console.write_chunk(step.text)
@@ -546,7 +557,7 @@ def print_cell_table(problem: Problem, cells: Sequence[Cell]) -> None:
     """
     runs = cells[0].total if cells else 0
     reference = "эталона нет" if problem.open else f"эталон {problem.answer}"
-    title = f"{problem.title} · {reference} · {_runs_label(runs)}"
+    title = f"{problem.title} · {reference} · {runs_label(runs)}"
 
     table = Table(title=title)
     table.add_column("t°", justify="right")
@@ -662,7 +673,7 @@ def _accuracy_conclusion(cells: Sequence[Cell]) -> str:
         if best == 0:
             return (
                 f"  точность нулевая у всех температур — ни одна не дала верного "
-                f"ответа за {_runs_label(total)}"
+                f"ответа за {runs_label(total)}"
             )
         return f"  точность одинакова у всех температур: {best}/{total}"
     winner = winners[0]

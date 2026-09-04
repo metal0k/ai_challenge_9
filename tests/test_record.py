@@ -173,3 +173,47 @@ def test_day_04_does_not_promise_token_decay_it_cannot_reproduce():
     оказывался враньём про собственный экран — ловушка Day 02."""
     for step in record_mod.demo_steps(1, 4):
         assert "распад" not in step.title.lower()
+
+
+# --------------------------------------------------------------------------
+# Day 05 (SPEC-w01d05.md §16): свой сценарий, дни 01-04 не тронуты — ни один
+# из тестов выше не переписан, только добавлены новые ниже.
+# --------------------------------------------------------------------------
+
+
+def test_day_05_has_its_own_scenario_not_the_day_01_fallback():
+    """demo_steps() выбирает сценарий по (week, day) через цепочку if/return
+    (см. её докстринг) — без ветки на day==5 вызов молча проваливается в
+    _demo_steps_w01d01() и `advent record --day 5` записал бы День 01 под
+    видом Дня 05. Проверяется содержательно (зовёт `bench`, которого не было
+    в дне 01), а не просто «списки разные»."""
+    day5 = record_mod.demo_steps(1, 5)
+    assert day5 != record_mod.demo_steps(1, 1)
+    assert any("bench" in (step.args or []) for step in day5), (
+        "сценарий дня 05 обязан звать команду bench"
+    )
+
+
+def test_day_05_scenario_names_latency_tokens_price_and_which_model_aloud():
+    """SPEC-w01d05.md §16: демо обязано назвать вслух время, токены, цену и
+    «какую модель выбирать» — не оставлять зрителю самому читать колонки
+    таблицы. Та же ловушка, что чинил test_day_04_scenario_covers_all_three_
+    axes_of_the_task: метрика, посчитанная, но не произнесённая, задание не
+    закрывает."""
+    text = " ".join(
+        f"{step.title} {step.note or ''}" for step in record_mod.demo_steps(1, 5)
+    ).lower()
+
+    assert "врем" in text or "latency" in text or " мс" in text, "время ответа не названо"
+    assert "токен" in text, "токены не названы"
+    assert "цен" in text or "$" in text or "стоимост" in text, "цена не названа"
+    assert "какую модель" in text, "вывод «какую модель выбирать» не произнесён"
+
+
+def test_day_05_scenario_has_no_step_without_an_action_or_a_note():
+    """Тот же контроль качества, что test_every_recorded_day_has_a_scenario
+    держит для дней 01-04 — здесь не тронут тот тест (дни 01-04 не менялись),
+    а дню 05 заведена своя проверка."""
+    steps = record_mod.demo_steps(1, 5)
+    assert steps, "день 05 остался без сценария"
+    assert all(step.args or step.note for step in steps), "день 05: шаг без действия и без текста"

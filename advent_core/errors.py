@@ -111,7 +111,11 @@ def translate(exc: Exception) -> AdventError:
             "Лимит запросов Mistral исчерпан (429).",
             hint=(
                 "Повторные попытки уже сделаны. Подожди минуту или возьми модель "
-                "полегче: --model ministral-8b-latest"
+                "полегче: --model ministral-8b-latest. Если 429 повторяется на "
+                "КАЖДОЙ попытке — модель, возможно, недоступна на текущем тарифе "
+                "(у Mistral это выглядит как x-ratelimit-limit-req-minute: 0 в "
+                "заголовке ответа, а не как 403); попробуй другую модель через "
+                "--model."
             ),
         )
     if status is not None and 500 <= status < 600:

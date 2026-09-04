@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from advent_core import chat as chat_core
+from advent_core import client as client_mod
 from advent_core.chat import _extract_delta, build_messages, should_stream, trim_history
 from advent_core.client import model_names, resolve_alias
 from advent_core.config import Config
@@ -334,3 +335,74 @@ def test_payload_local_params_never_reach_the_request():
     )
     for name in ("format", "schema_file", "done", "mode", "max_turns"):
         assert name not in payload
+
+
+# --------------------------------------------------------------------------
+# Лимит частоты из заголовка ответа (Day 05, SPEC-w01d05.md §13)
+# --------------------------------------------------------------------------
+
+
+class _FakeHeaders:
+    """httpx-подобный ответ: важна только нечувствительность ключей к регистру,
+    которую _RateLimitProbe обязан снять при сохранении."""
+
+    def __init__(self, headers):
+        self.headers = headers
+
+
+def test_probe_lowercases_header_names():
+    """Заголовки httpx регистронезависимы, обычный dict — уже нет. Если не
+    привести ключи при сохранении, чтение по 'x-ratelimit-...' промахнётся на
+    ответе, где сервер прислал 'X-RateLimit-...'."""
+    probe = client_mod._RateLimitProbe()
+
+    probe.after_success(None, _FakeHeaders({"X-RateLimit-Limit-Req-Minute": "30"}))
+
+    assert probe.headers["x-ratelimit-limit-req-minute"] == "30"
+
+
+def test_probe_returns_the_response_unchanged():
+    """SDKHooks присваивает возвращённое значение обратно в цепочку хуков:
+    вернуть None здесь значило бы сломать разбор ответа всем следующим."""
+    probe = client_mod._RateLimitProbe()
+    response = _FakeHeaders({"x-ratelimit-limit-req-minute": "30"})
+
+    assert probe.after_success(None, response) is response
+
+
+def test_requests_per_minute_reads_zero_as_zero_not_as_unknown():
+    """Ноль — законный ответ Mistral для модели, недоступной на тарифе
+    (проверено 2026-09-04), и путать его с None нельзя: None означает
+    «заголовка не было», а ноль — «звать эту модель бесполезно»."""
+    fake = _FakeMistral()
+    fake._advent_rate_limit_probe = client_mod._RateLimitProbe()
+    fake._advent_rate_limit_probe.headers = {"x-ratelimit-limit-req-minute": "0"}
+
+    assert client_mod.requests_per_minute(fake) == 0
+
+
+def test_requests_per_minute_is_none_without_a_probe():
+    """Шов регистрации хука приватный и может исчезнуть в апдейте SDK. Тогда
+    честный ответ — «неизвестно», а не подставленное умолчание."""
+    assert client_mod.requests_per_minute(_FakeMistral()) is None
+
+
+def test_requests_per_minute_is_none_on_garbage():
+    fake = _FakeMistral()
+    fake._advent_rate_limit_probe = client_mod._RateLimitProbe()
+    fake._advent_rate_limit_probe.headers = {"x-ratelimit-limit-req-minute": "много"}
+
+    assert client_mod.requests_per_minute(fake) is None
+
+
+def test_complete_carries_the_rate_limit_into_the_result(monkeypatch):
+    """Развёртка Day 05 считает по нему паузу — без этого поля она вернулась бы
+    к зашитой константе."""
+    fake = _FakeMistral(complete_response=_complete_response("привет", "stop"))
+    fake._advent_rate_limit_probe = client_mod._RateLimitProbe()
+    fake._advent_rate_limit_probe.headers = {"x-ratelimit-limit-req-minute": "30"}
+    _patch_client(monkeypatch, fake)
+
+    result = chat_core.complete(_config(), [{"role": "user", "content": "q"}])
+
+    assert result.rate_limit_rpm == 30

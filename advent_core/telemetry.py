@@ -11,17 +11,37 @@ class Usage:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    # Из usage.prompt_tokens_details.cached_tokens (SPEC-w01d05.md §10):
+    # промпт-кэш биллится по input в 10 раз дешевле. Опциональная деталь
+    # биллинга, а не признак того, что usage не пришёл, — поэтому в
+    # is_empty() не участвует: отсутствие prompt_tokens_details означает
+    # «кэша не было», а не «usage не пришёл».
+    cached_tokens: int | None = None
 
     @classmethod
     def from_raw(cls, raw: object) -> Usage:
-        """Собирает usage и из dict, и из pydantic-модели SDK."""
+        """Собирает usage и из dict, и из pydantic-модели SDK.
+
+        prompt_tokens_details — вложенный объект той же двойной природы, что
+        и сам usage: и dict, и pydantic-модель SDK, — поэтому разбирается тем
+        же приёмом (get/getattr), а не напрямую raw["prompt_tokens_details"].
+        """
         if raw is None:
             return cls()
         get = raw.get if isinstance(raw, dict) else lambda k: getattr(raw, k, None)
+        details = get("prompt_tokens_details")
+        if details is None:
+            cached_tokens = None
+        else:
+            get_detail = (
+                details.get if isinstance(details, dict) else lambda k: getattr(details, k, None)
+            )
+            cached_tokens = get_detail("cached_tokens")
         return cls(
             prompt_tokens=get("prompt_tokens"),
             completion_tokens=get("completion_tokens"),
             total_tokens=get("total_tokens"),
+            cached_tokens=cached_tokens,
         )
 
     def is_empty(self) -> bool:
@@ -32,6 +52,11 @@ class Usage:
         неизвестное слагаемое суммируется как 0, и Totals.tokens_label()
         печатает «0/7» без оговорки — то есть показывает неизвестное значение
         точным нулём. Ровно эту ошибку missing_usage и заведён предотвращать.
+
+        cached_tokens сюда не входит: это опциональная деталь биллинга, а не
+        признак прихода usage — модель без промпт-кэша законно не пришлёт
+        prompt_tokens_details вовсе, и это не то же самое, что «usage не
+        пришёл».
         """
         if self.total_tokens is not None:
             return False
@@ -69,6 +94,13 @@ class CallResult:
     # (например, CallResult(model_requested=...) для error-веток в cli.py,
     # где messages для лога и так есть отдельно).
     sent_messages: list[dict[str, str]] | None = None
+    # Лимит запросов в минуту ДЛЯ МОДЕЛИ ЭТОГО ВЫЗОВА, из заголовка
+    # x-ratelimit-limit-req-minute (SPEC-w01d05.md §13). None — «неизвестно»:
+    # либо шов регистрации хука в SDK отвалился, либо ответ пришёл без
+    # заголовка. Ноль здесь — законное значение, а не «нет данных»: именно
+    # ноль отдаёт Mistral для модели, недоступной на тарифе, и путать его с
+    # None нельзя.
+    rate_limit_rpm: int | None = None
 
 
 @dataclass(slots=True, frozen=True)

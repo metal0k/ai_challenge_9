@@ -6,6 +6,7 @@ import pytest
 
 from advent_core.client import capabilities_of, chat_models, find_model
 from advent_core.params import (
+    BENCH_COMMAND,
     CHAT_COMMAND,
     SOLVE_COMMAND,
     STRATEGIES,
@@ -286,3 +287,64 @@ def test_set_strategy_default_returns_none_and_command_default_is_reapplied():
 
     params.apply_defaults(CHAT_COMMAND)
     assert params.strategy == "direct"
+
+
+# --------------------------------------------------------------------------
+# kind="models" — лестница моделей для bench (Day 05)
+# --------------------------------------------------------------------------
+
+
+def test_models_param_splits_on_commas_and_trims_spaces():
+    params = GenerationParams.build(models=" ministral-3b-latest , ministral-14b-latest ")
+
+    assert params.models == ["ministral-3b-latest", "ministral-14b-latest"]
+
+
+def test_models_param_drops_empty_items_between_commas():
+    """`--models a,,b` — опечатка, а не запрос пустой модели: пустое имя
+    улетело бы в API как model="" и вернулось 400 посреди развёртки."""
+    params = GenerationParams.build(models="ministral-3b-latest,,ministral-8b-latest,")
+
+    assert params.models == ["ministral-3b-latest", "ministral-8b-latest"]
+
+
+@pytest.mark.parametrize("raw", ["", "   ", ",", " , , "])
+def test_models_param_rejects_an_empty_ladder(raw):
+    """Пустой список — ParamError, а НЕ None. None утонул бы в apply_defaults()
+    и молча подменился дефолтной лестницей там, где пользователь явно задал
+    --models: тихая подмена явного выбора хуже отказа."""
+    with pytest.raises(ParamError):
+        GenerationParams.build(models=raw)
+
+
+def test_models_param_accepts_a_ready_list():
+    """Дефолт реестра приходит уже списком, и он обязан проходить тем же путём."""
+    params = GenerationParams.build(models=["ministral-3b-latest"])
+
+    assert params.models == ["ministral-3b-latest"]
+
+
+def test_bench_default_ladder_comes_from_the_registry_not_from_the_cli():
+    """Умолчание --models и --runs живёт в реестре: иначе одно и то же число
+    записано дважды и однажды разъедется (CLAUDE.md)."""
+    defaults = defaults_for(BENCH_COMMAND)
+
+    assert defaults["models"] == [
+        "ministral-3b-latest",
+        "ministral-8b-latest",
+        "ministral-14b-latest",
+    ]
+    assert defaults["runs"] == 3
+
+
+def test_bench_default_ladder_is_copied_not_shared():
+    """Общий мутируемый дефолт: правка списка в одном прогоне не имеет права
+    просочиться в следующий. Именно поэтому apply_defaults копирует list."""
+    first = GenerationParams.build()
+    first.apply_defaults(BENCH_COMMAND)
+    first.models.append("codestral-latest")
+
+    second = GenerationParams.build()
+    second.apply_defaults(BENCH_COMMAND)
+
+    assert "codestral-latest" not in second.models

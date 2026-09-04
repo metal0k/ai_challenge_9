@@ -88,7 +88,12 @@ StepHook = Callable[["Step"], None]
 # с другим (SPEC-w01d04.md §6).
 FORMAT_CHECK_MARKER = "marker"
 FORMAT_CHECK_SINGLE_LINE = "single_line"
-FORMAT_CHECKS = (FORMAT_CHECK_MARKER, FORMAT_CHECK_SINGLE_LINE)
+# Day 05 (SPEC-w01d05.md §11): открытая объяснительная задача ("почему небо
+# голубое") не проверяется по формату вовсе — день не про формат, а маркер
+# ОТВЕТ: или требование одной строки здесь были бы произвольным ограничением
+# на связный многоабзацный ответ, который как раз и сравнивает человек.
+FORMAT_CHECK_NONE = "none"
+FORMAT_CHECKS = (FORMAT_CHECK_MARKER, FORMAT_CHECK_SINGLE_LINE, FORMAT_CHECK_NONE)
 
 
 @dataclass(slots=True, frozen=True)
@@ -174,6 +179,23 @@ def _default_problem(problems: dict[str, Problem]) -> Problem:
 
 def problem_ids(directory: Path | None = None) -> list[str]:
     return list(load_problems(directory))
+
+
+def load_problem_set(
+    ids: Sequence[str], problem_id: str | None = None, directory: Path | None = None
+) -> list[Problem]:
+    """Задачи фиксированного набора дня: все `ids` (None/"all") или одна по id.
+
+    Общий код за `temperature.load_temp_problems` (Day 04, набор TEMP_PROBLEMS)
+    и `models_bench.load_bench_problems` (Day 05, набор BENCH_PROBLEMS) — оба
+    дня заводят свой список задач сценария, но правило разбора флага
+    `--problem` (None/"all" значит «весь набор», иначе — конкретный id) у них
+    одно и то же. "all" — то же магическое значение, что strategy=all: коллизия
+    с реальным id "all" в банке принята осознанно (SPEC-w01d04.md §5).
+    """
+    if problem_id is None or problem_id == "all":
+        return [load_problem(pid, directory) for pid in ids]
+    return [load_problem(problem_id, directory)]
 
 
 # id задачи-обёртки для вопроса из chat: в журнале по нему видно, что задача

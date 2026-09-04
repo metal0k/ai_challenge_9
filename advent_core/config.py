@@ -11,7 +11,12 @@ from dotenv import load_dotenv
 from advent_core.params import GenerationParams, ParamError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL = "mistral-small-latest"
+# ministral-14b-latest, не mistral-small-latest: живой замер 2026-09-04
+# (SPEC-w01d05.md §2) — mistral-small отдаёт 429 с
+# x-ratelimit-limit-req-minute=0 на этом аккаунте, то есть прежний дефолт
+# ломает `advent w01 chat` у любого, кто склонирует репозиторий. 14b — самая
+# сильная модель из трёх реально доступных (§3).
+DEFAULT_MODEL = "ministral-14b-latest"
 DEFAULT_SYSTEM_PROMPT = PROJECT_ROOT / "advent_core" / "prompts" / "default_system.md"
 LOG_DIR = PROJECT_ROOT / "logs"
 

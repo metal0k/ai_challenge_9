@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable, Iterable
 
 from advent_core import formats
-from advent_core.client import mistral_client
+from advent_core.client import mistral_client, requests_per_minute
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError, ConfigurationError, translate
 from advent_core.telemetry import CallResult, Usage
@@ -148,6 +148,8 @@ def complete(
             response = mistral.chat.complete(**payload)
         except Exception as exc:
             raise translate(exc) from exc
+        # Внутри with: клиент (а с ним и проба) живёт только здесь.
+        rate_limit_rpm = requests_per_minute(mistral)
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     choices = getattr(response, "choices", None) or []
@@ -175,6 +177,7 @@ def complete(
         format_ok=verdict.ok,
         format_detail=verdict.detail,
         sent_messages=payload["messages"],
+        rate_limit_rpm=rate_limit_rpm,
     )
 
 
@@ -227,6 +230,10 @@ def stream(
                 result.truncated = True
             else:
                 raise translate(exc) from exc
+        # Внутри with и ПОСЛЕ except: оборванный стрим всё равно успел
+        # получить заголовки ответа, и лимит из них знать полезнее всего
+        # именно тогда, когда что-то пошло не так.
+        result.rate_limit_rpm = requests_per_minute(mistral)
 
     result.text = "".join(parts)
     result.latency_ms = int((time.perf_counter() - started) * 1000)

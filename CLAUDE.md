@@ -54,6 +54,9 @@ uv run advent w01 chat                    # REPL with history
 uv run advent w01 models                  # models from the live API (--all for non-chat)
 uv run advent w01 solve                   # one problem, four reasoning strategies, judged
 uv run advent w01 solve --strategy panel --runs 3 --no-judge
+uv run advent w01 temp                    # one prompt at t=0 / 0.7 / 1.2, no judge
+uv run advent w01 bench                   # one prompt across ministral 3b/8b/14b
+uv run advent w01 bench --runs 10 --problem children
 uv run advent record --day 1              # record the demo through OBS
 uv run advent record --day 1 --dry-run    # run the demo without recording
 uv run advent submit --day 1              # verify tag + video, print the sheet comment
@@ -232,9 +235,20 @@ key, so it grades the reasoning. When its first place is wrong by the key, the
 output says so in words instead of hiding it. Its known limitation — a fixed
 A–D order, hence positional bias — is stated rather than compensated for.
 
-**stdout/stderr contract:** the model's answer goes to stdout, everything else
-(footer, warnings, REPL prompt, input echo) to stderr. This keeps
-`advent w01 chat "…" > answer.txt` honest. Do not print status to stdout.
+**stdout/stderr contract:** the command's *product* goes to stdout, everything
+else (footer, warnings, REPL prompt, input echo, the problem statement) to
+stderr. This keeps `advent w01 chat "…" > answer.txt` honest. Do not print
+status to stdout.
+
+For `chat` the product is the model's answer. For the analysis commands it is
+the analysis: `models`, `solve` (`print_comparison`), `temp`
+(`print_cell_table`, `print_conclusions`) and `bench` all print their tables,
+verdicts and links to stdout, and have since Day 01, Day 03 and Day 04
+respectively. A Day 05 review flagged `bench` for this; the finding was
+rejected and the rule reworded instead, because the alternative was either one
+day that behaves unlike the rest or a rewrite of an already-submitted day's
+output. Per-run model answers still go to stdout in those commands too — they
+are part of the product a reader compares.
 
 **Windows encoding, twice over:**
 - `console.force_utf8()` runs first thing in `main()`; without it the console
@@ -348,6 +362,62 @@ The test that was supposed to catch this compared the journal against
 `cli.DAY` — the same constant the journal is filled from — so it passed at any
 value. **A test whose expected value comes from the same source as the code
 under test cannot go red**; assert the literal.
+
+**Price per token and price per response rank models in opposite order — "which
+model is cheaper" is not a well-formed question without a length.** Measured
+2026-09-04 on the `children` task, 5 runs, t=0: `ministral-8b-latest` is
+cheaper than `ministral-14b-latest` by a third on the price list ($0.15 vs
+$0.20 per 1M output tokens), and **twice as expensive per actual response**
+($0.068 vs $0.035 per 1000 answers) — because it writes a median of 289
+output tokens where 14b writes 9. A price-list column alone answers a
+question nobody asked; the day prints both `$/1M tokens` and `$/1000
+responses` for exactly this reason (SPEC-w01d05.md §5, §10).
+
+**Latency is not a property of a model — it is a property of how much the
+model writes.** Same measurement: `ministral-8b-latest` is the **slowest**
+of the three by total response time (5.3 s median vs 2.6 s/2.9 s) and the
+**fastest by 16x** on ms-per-output-token (18 ms vs 289 ms/319 ms) — it is
+slow because it is verbose, not because it is slow. Caveat that must travel
+with the ms/token column: at a 9-token median response (3b, 14b), "ms per
+token" is almost entirely fixed overhead (network, queue, prefill), not
+generation speed — the ratio is honest, reading it as "generation speed" is
+only valid where the response is actually long.
+
+**Accuracy is measurable only together with a format instruction — without
+one, a 0/N score means "not measured", not "wrong".** `check_answer()`
+returns a `no_marker` verdict, distinct from a wrong-answer verdict, when the
+`ОТВЕТ:` marker it's told to extract from never appears. Dropping the marker
+instruction to see a "raw" accuracy number does not measure worse — it
+measures nothing, and a naive reader sees a zero and reads it as a quality
+failure of the model rather than an absence of the thing being checked for.
+
+**Format-instruction compliance does not scale monotonically with model
+size.** With the `ОТВЕТ:` marker instruction, `ministral-3b-latest` and
+`ministral-14b-latest` both comply (median 9 output tokens); the *middle*
+model, `ministral-8b-latest`, does not (483 tokens) — measured
+2026-09-04, 3 runs (SPEC-w01d05.md §6). "Bigger/smaller model" is not a
+predictor of "follows this instruction or not"; it has to be measured per
+model, not assumed to move with parameter count.
+
+**A model that answered yesterday can return a stable 429 today, and it is
+not the 403 this project already has a message for.** `mistral-small-latest`
+and `mistral-medium*` went from working on Day 02 to `x-ratelimit-limit-req-minute:
+0` on 2026-09-04 — a per-model block, distinct from the `tier_not_allowed` 403
+that `mistral-large-latest` returns. `0` is not "rate exhausted, retry later";
+four probes 30 s apart all returned `0` for the same model while
+`ministral-14b` returned 200 in the same seconds. `errors.py`'s 429 hint now
+says to try another model via `--model` — retrying the same model on a
+timer will not recover from this shape of 429; check the header, don't infer
+the cause from the status code alone.
+
+**The cold-first-call hypothesis was tested and refuted, on this project's own
+data.** "The first call to a model is cold and should be discarded" sounds
+plausible enough to design around — it was measured instead: first-run median
+vs. rest-of-cell median across 5 cells × 5 runs per model (2026-09-04) is
+2685 ms vs 2918 ms (3b), 4845 ms vs 5506 ms (8b), 2741 ms vs 2885 ms (14b).
+The first call is not slower — if anything it is marginally faster. `bench`
+ships with no warm-up call for this reason: a warm-up would have been a cost
+paid against an effect that does not exist.
 
 ## OBS recording
 
@@ -489,3 +559,40 @@ sanitised specification lives in `specs/SPEC.md`.
 - README files and chat are in Russian; this file and code comments are English.
 - Comments explain *why*, especially where the code looks odd on purpose (the
   traps above). Do not add comments that restate the code.
+
+**Rate-limit headers are reachable through the SDK's hook chain, not through
+the response object.** `mistral.chat.complete()` returns only the unmarshalled
+body, so `x-ratelimit-limit-req-minute` is genuinely absent from what the call
+hands back — and a first pass concluded from that it could not be had at all,
+and paced the Day 05 sweep off a hardcoded snapshot instead. The SDK
+(Speakeasy-generated) runs a hook chain, and `after_success` receives the raw
+`httpx.Response` with its headers. `SDKHooks.after_success()` iterates the
+registered hooks and calls `hook.after_success(ctx, response)` with no type
+check, so a plain object with that method is enough — no need to subclass the
+private `mistralai.client._hooks.types.AfterSuccessHook`. The hook **must**
+return the response: the chain assigns the return value back.
+
+Registration is still private (`client.sdk_configuration._hooks`, planted via
+`__dict__`), so it is wrapped in a broad `except` — telemetry must never take
+down the call — and when the seam disappears `CallResult.rate_limit_rpm` stays
+`None`, which reads as *unknown*, never as a default. `0` is a legitimate
+value there, not missing data: zero is exactly what Mistral returns for a
+model the tier does not allow, and no amount of pausing fixes that.
+
+**The rate limit is per model, not per key.** On 2026-09-04 the same key
+reported 750 req/min for `ministral-3b-latest`, 188 for `8b`, 30 for `14b`,
+and 0 (plus a 429) for the whole `mistral-small` family — measured within the
+same few seconds. So a limit cached per account would be wrong for every model
+but one, and a model going 429 while its neighbour returns 200 is not a
+transient blip to retry through.
+
+**A model that answered yesterday can return 429 today, and it is not a 403.**
+`mistral-small-latest` — the project's `DEFAULT_MODEL` from Day 01 through
+Day 04 — began returning 429 with `x-ratelimit-limit-req-minute: 0`, stable
+across four probes 30 seconds apart, while `ministral-14b` answered 200 in the
+same seconds. `mistral-large-latest` refuses differently, with 403
+`tier_not_allowed`, and `mistral-medium*` additionally reports **empty
+`capabilities`** in `/v1/models`, so `chat_models()` filters it out and
+`advent w01 models` never shows it. Three different shapes of "you cannot use
+this model", none of which is an outage — check the headers before diagnosing
+one.

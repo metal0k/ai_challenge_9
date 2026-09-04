@@ -23,6 +23,7 @@ from advent_core.config import DEFAULT_SYSTEM_PROMPT, LOG_DIR, Config, ConfigErr
 from advent_core.errors import AdventError, ConfigurationError
 from advent_core.journal import log_call
 from advent_core.params import (
+    BENCH_COMMAND,
     BY_NAME,
     CHAT_COMMAND,
     FORMAT_CHOICES,
@@ -32,9 +33,10 @@ from advent_core.params import (
     STRATEGY_CHOICES,
     TEMP_COMMAND,
     ParamError,
+    defaults_for,
 )
 from advent_core.telemetry import CallResult
-from week_01 import strategies, temperature
+from week_01 import models_bench, strategies, temperature
 
 WEEK = 1
 # Поднимать вместе с номером дня, который последним трогал ЭТОТ код —
@@ -56,6 +58,11 @@ WEEK = 1
 DAY = 3
 # Только для temp_command — единственной команды, написанной в день 04.
 TEMP_DAY = 4
+# Только для bench_command — единственной команды, написанной в день 05. Тест
+# сверяет этот литерал напрямую (5), а не cli.BENCH_DAY: ожидание, взятое из
+# того же источника, что и код под тестом, покраснеть не может (CLAUDE.md,
+# «A test whose expected value comes from the same source…»).
+BENCH_DAY = 5
 HISTORY_PATH = LOG_DIR / "repl_history_w01.json"
 DIALOG_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "dialog.md"
 
@@ -68,11 +75,12 @@ DIALOG_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "dialog.md"
 # LLM-судья дня 04 убран целиком (пользовательское решение), `temp` эти два
 # параметра больше не читает вовсе.
 NON_CHAT_PARAMS = {
-    "problem": "solve и temp",
-    "runs": "solve и temp",
+    "problem": "solve, temp и bench",
+    "runs": "solve, temp и bench",
     "judge": "solve",
     "judge_model": "solve",
     "temps": "temp",
+    "models": "bench",
 }
 
 REPL_COMMANDS = [
@@ -91,6 +99,21 @@ REPL_COMMANDS = [
     ("/reset", "очистить историю диалога"),
     ("/exit", "выход"),
 ]
+
+
+def _default_hint(command: str, param: str) -> str:
+    """«(по умолчанию X)» для help флага, взятое из реестра параметров.
+
+    Дефолт у каждой команды свой и живёт в Spec.defaults; напечатанный рядом
+    литералом, он становится вторым источником истины и однажды разъедется с
+    настоящим — ровно то, из-за чего в `--temperature` полгода висел
+    несуществующий потолок 2.0 (CLAUDE.md).
+    """
+    value = defaults_for(command).get(param)
+    if isinstance(value, list):
+        value = ", ".join(str(item) for item in value)
+    return f"(по умолчанию {value})"
+
 
 app = typer.Typer(help="Неделя 01: первый запрос к LLM через API.", no_args_is_help=True)
 
@@ -287,7 +310,11 @@ def solve_command(
         help=f"Способ рассуждения: {', '.join(STRATEGY_CHOICES)}. all — все четыре подряд.",
     ),
     runs: int | None = typer.Option(
-        None, "--runs", help="Прогонов на стратегию: >1 показывает разброс (по умолчанию 1)."
+        None,
+        "--runs",
+        help=(
+            f"Прогонов на стратегию: >1 показывает разброс {_default_hint(SOLVE_COMMAND, 'runs')}."
+        ),
     ),
     judge: bool | None = typer.Option(
         None, "--judge/--no-judge", help="Оценка ответов LLM-судьёй (по умолчанию включена)."
@@ -428,7 +455,9 @@ def temp_command(
         help="Температуры через запятую, потолок API 1.5 (по умолчанию 0,0.7,1.2).",
     ),
     runs: int | None = typer.Option(
-        None, "--runs", help="Прогонов на ячейку задача×температура (по умолчанию 3)."
+        None,
+        "--runs",
+        help=f"Прогонов на ячейку задача×температура {_default_hint(TEMP_COMMAND, 'runs')}.",
     ),
     model: str | None = typer.Option(None, "--model", "-m", help="Имя модели Mistral."),
     system: Path | None = typer.Option(None, "--system", help="Файл с system prompt."),
@@ -510,6 +539,147 @@ def temp_command(
         temperature.print_cell_table(sweep.problem, sweep.cells)
 
     temperature.print_conclusions(sweeps)
+
+
+def _check_bench_models(models: list[str], account_models: list[dict]) -> None:
+    """Проверяет имена --models до первого вызова, а не посреди развёртки.
+
+    Тот же принцип, что у _check_judge_model: опечатка в имени модели иначе
+    всплыла бы только после части оплаченных прогонов развёртки
+    (SPEC-w01d05.md §8). account_models пустой — значит список моделей
+    аккаунта недоступен вовсе (см. bench_command) — тогда проверять нечем, и
+    вызов молча пропускается, ошибка (если она есть) всплывёт на первом
+    запросе, как и у остальных команд при недоступном списке.
+    """
+    if not account_models:
+        return
+    available = model_names(account_models)
+    missing = [name for name in models if name not in available]
+    if missing:
+        raise ConfigError(
+            f"Модели недоступны аккаунту: {', '.join(missing)}.\nПосмотри список: advent w01 models"
+        )
+
+
+@app.command("bench")
+def bench_command(
+    problem: str | None = typer.Option(
+        None,
+        "--problem",
+        help="id задачи из банка problems/, all — обе задачи дня (по умолчанию).",
+    ),
+    models: str | None = typer.Option(
+        None,
+        "--models",
+        help=f"Модели через запятую {_default_hint(BENCH_COMMAND, 'models')}.",
+    ),
+    runs: int | None = typer.Option(
+        None,
+        "--runs",
+        help=f"Прогонов на ячейку модель×задача {_default_hint(BENCH_COMMAND, 'runs')}.",
+    ),
+    system: Path | None = typer.Option(None, "--system", help="Файл с system prompt."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Детали запуска в stderr."),
+) -> None:
+    """Одна и та же задача на разных версиях модели: точность, latency, токены, цена.
+
+    Флага `--model` здесь нет (SPEC-w01d05.md §8): команда перебирает
+    лестницу моделей, а не работает с одной — список задаёт `--models`.
+    temperature=0 фиксируется на всю развёртку безусловно (week_01/
+    models_bench._bench_hygiene) — здесь нет флага `--temperature`, как и у
+    `--model`, по той же причине: это не то, что варьирует этот день.
+    """
+    config = Config.resolve(system=system, verbose=verbose)
+    _apply_local_flags(
+        config,
+        problem=problem,
+        models=models,
+        runs=runs,
+        # "all" у --problem здесь значит «обе задачи дня» (BENCH_PROBLEMS), не
+        # id из банка — тот же приём, что и у `temp` (см. _apply_local_flags).
+        allow_all_problem=True,
+    )
+    config.params.apply_defaults(BENCH_COMMAND)
+    params = config.params
+
+    # Дешёвые точки отказа до первого сетевого вызова — тот же принцип, что у
+    # solve/temp: опечатка в id задачи или в файле цен не должна всплывать
+    # после части из уже оплаченных прогонов развёртки.
+    problems = models_bench.load_bench_problems(params.problem)
+    prices = models_bench.load_prices()
+    models_bench.warn_if_prices_stale(prices)
+
+    try:
+        account_models = list_models(config)
+    except AdventError:
+        # Список моделей — удобство (отсев параметров по capabilities, ранняя
+        # проверка имён), а не обязательное условие для самого прогона: та же
+        # снисходительность, что у Session.refresh() — ошибка тогда всплывёт
+        # на первом же запросе к API, а не здесь.
+        account_models = []
+
+    _check_bench_models(params.models, account_models)
+
+    if config.verbose:
+        console.note(
+            f"models={', '.join(params.models)} problems={', '.join(p.id for p in problems)} "
+            f"runs={params.runs}"
+        )
+
+    for task in problems:
+        temperature.print_problem_header(task)
+
+    # Ключ по модели, а не общий набор, как у solve/temp: bench перебирает
+    # НЕСКОЛЬКО моделей за один прогон, и предупреждение про параметр,
+    # срезанный у одной модели (нет нужной capability), не должно молча
+    # скрыть то же предупреждение у другой — у них разные карточки.
+    warned: dict[str, set[str]] = {}
+
+    def on_step(step: models_bench.BenchStep) -> None:
+        """Вызов состоялся — печатаем и пишем в журнал немедленно.
+
+        Тот же принцип, что у solve_command.on_step/temp_command.on_step:
+        единица и печати, и записи — вызов, а не ячейка и не задача целиком.
+        _adopt_results здесь не переиспользуется напрямую: она читает
+        capabilities и имя запрошенной модели из одного Session, а bench на
+        каждом шаге зовёт свою модель — эквивалент её двух действий (подставить
+        реальную версию, предупредить о срезанных параметрах) выписан явно.
+        """
+        resolved = resolve_alias(account_models, step.model) if account_models else None
+        if resolved:
+            step.result.model_actual = resolved
+        step_warned = warned.setdefault(step.model, set())
+        for name in step.result.skipped_params:
+            if name not in step_warned:
+                step_warned.add(name)
+                console.warn(f"{step.model} не поддерживает {name} — параметр не отправлен")
+
+        models_bench.print_bench_step(step)
+        models_bench.log_bench_step(step, week=WEEK, day=BENCH_DAY)
+
+    sweeps = models_bench.run_bench(
+        config,
+        problems,
+        params.models,
+        # Умолчание (3) приходит из реестра — Spec("runs").defaults[BENCH_COMMAND],
+        # применяется apply_defaults(BENCH_COMMAND). `or 3` здесь завело бы
+        # второй источник истины для одного и того же числа (CLAUDE.md).
+        params.runs,
+        account_models=account_models,
+        # complete передаётся явно, хотя у run_bench() ровно такой дефолт:
+        # значение по умолчанию связывается в момент импорта
+        # week_01.models_bench, и подмена chat_core.complete (так тесты убирают
+        # сеть) до него уже не достаёт — та же ловушка Day 03 (CLAUDE.md, «A
+        # default argument binds at import time»).
+        complete=chat_core.complete,
+        on_step=on_step,
+    )
+
+    for sweep in sweeps:
+        models_bench.print_bench_table(sweep.problem, sweep.cells, prices)
+
+    models_bench.print_conclusions(sweeps, prices)
+    models_bench.print_links(params.models, prices)
 
 
 class Session:
