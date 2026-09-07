@@ -113,6 +113,26 @@ def _extract_finish_reason(event: object) -> str | None:
     return getattr(choices[0], "finish_reason", None)
 
 
+def _extract_reasoning_delta(event: object) -> str:
+    """Достаёт кусок цепочки рассуждения (reasoning_content) из чанка стрима.
+
+    Отдельная функция, а не ещё один элемент кортежа _extract_delta() — та же
+    причина, что у _extract_finish_reason: тесты распаковывают _extract_delta()
+    как (text, usage, model), и менять арность там, где вызывающий код этого
+    не ждёт, — тихий способ всё сломать. reasoning_content — поле
+    reasoning-моделей (LM Studio/ornith и подобные); живьём дельты с ним
+    приходят РАНЬШЕ content в потоке одного ответа, а обычная модель Mistral
+    его не присылает вовсе — getattr, чтобы не падать на отсутствии.
+    """
+    data = getattr(event, "data", event)
+    choices = getattr(data, "choices", None) or []
+    if not choices:
+        return ""
+    delta = getattr(choices[0], "delta", None)
+    reasoning = getattr(delta, "reasoning_content", None) if delta is not None else None
+    return reasoning if isinstance(reasoning, str) else ""
+
+
 def _with_format_instruction(
     messages: list[Message], format_name: str, schema: dict | None
 ) -> list[Message]:
@@ -159,6 +179,14 @@ def complete(
     text = getattr(choice.message, "content", "") or ""
     if not isinstance(text, str):
         text = "".join(getattr(part, "text", "") or "" for part in text)
+    # Поле reasoning-моделей (LM Studio/ornith и подобные), обычная модель
+    # Mistral его не присылает вовсе — getattr вместо прямого доступа, чтобы
+    # не падать на SDK-обёртке, которая про это поле не знает. Текст ответа
+    # (text) НЕ подменяется рассуждением, даже когда content пуст: пустой
+    # content при малом max_tokens — законный результат «модель не дошла до
+    # ответа», а не ошибка транспорта, и путать его с рассуждением исказило
+    # бы метрики точности (CLAUDE.md, день 04).
+    reasoning_text = getattr(choice.message, "reasoning_content", None) or None
 
     # stop | length | model_length | error | tool_calls (SPEC-w01d02.md §2).
     # getattr, как и у usage выше: обёртка SDK меняется между версиями.
@@ -178,6 +206,7 @@ def complete(
         format_detail=verdict.detail,
         sent_messages=payload["messages"],
         rate_limit_rpm=rate_limit_rpm,
+        reasoning_text=reasoning_text,
     )
 
 
@@ -204,6 +233,11 @@ def stream(
         sent_messages=payload["messages"],
     )
     parts: list[str] = []
+    # Цепочка рассуждения копится отдельно от ответа — на reasoning-моделях
+    # (LM Studio/ornith) дельты reasoning_content приходят раньше content в
+    # том же потоке и НЕ должны попасть в on_chunk как ответ (не то, что
+    # печатается пользователю в стриме) и не должны его молча заменить.
+    reasoning_parts: list[str] = []
 
     with mistral_client(config) as mistral:
         try:
@@ -219,6 +253,8 @@ def stream(
                     finish_reason = _extract_finish_reason(event)
                     if finish_reason:
                         result.finish_reason = finish_reason
+                    if reasoning_chunk := _extract_reasoning_delta(event):
+                        reasoning_parts.append(reasoning_chunk)
                     if chunk:
                         parts.append(chunk)
                         on_chunk(chunk)
@@ -236,6 +272,7 @@ def stream(
         result.rate_limit_rpm = requests_per_minute(mistral)
 
     result.text = "".join(parts)
+    result.reasoning_text = "".join(reasoning_parts) or None
     result.latency_ms = int((time.perf_counter() - started) * 1000)
     # should_stream() исключает json/schema из стрима, но text/yaml/md сюда
     # доходят, а у них тоже есть вердикт — пусть и всегда ok=None, detail="—"

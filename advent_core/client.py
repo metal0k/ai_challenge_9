@@ -120,15 +120,24 @@ def mistral_client(config: Config) -> Iterator[Mistral]:
     общий бюджет 60s. Этого хватает, чтобы пережить всплеск лимита, и не
     настолько много, чтобы демо зависло перед камерой.
     """
+    # Локальный сервер (LM Studio) держит один запрос за раз и отвечает
+    # секундами, особенно на reasoning-моделях — дефолтный таймаут SDK этого
+    # не переживёт. 600000 мс — тот же бюджет, что и у общего retry ниже, с
+    # запасом под цепочку рассуждения на ~55 tok/s.
+    extra_kwargs: dict = {}
+    if config.base_url:
+        extra_kwargs["server_url"] = config.base_url
+        extra_kwargs["timeout_ms"] = 600_000
+
     try:
         from mistralai.client.utils import BackoffStrategy, RetryConfig
 
         retry_config = RetryConfig("backoff", BackoffStrategy(1000, 30000, 1.5, 60000), True)
-        client = Mistral(api_key=config.api_key, retry_config=retry_config)
+        client = Mistral(api_key=config.api_key, retry_config=retry_config, **extra_kwargs)
     except ImportError:
         # Утилиты retry лежат в приватном модуле и могут переехать между
         # минорными версиями SDK. Без них клиент всё равно рабочий.
-        client = Mistral(api_key=config.api_key)
+        client = Mistral(api_key=config.api_key, **extra_kwargs)
 
     _attach_rate_limit_probe(client)
 
@@ -144,10 +153,17 @@ def list_models(config: Config) -> list[dict]:
 
     Через httpx, а не через SDK: нужен сырой ответ с полями `id` и `aliases`,
     чтобы показать, во что разрешается `-latest`.
+
+    При заданном config.base_url ходим на `{base_url}/v1/models`, а не на
+    облачный MODELS_URL — LM Studio держит собственный список моделей.
+    Authorization туда не нужен (сервер его не проверяет), но заголовок всё
+    равно передаётся с тем же api_key: `config.api_key` в локальном режиме —
+    заглушка (см. Config.resolve), лишний заголовок ничего не портит.
     """
+    url = f"{config.base_url}/v1/models" if config.base_url else MODELS_URL
     try:
         response = httpx.get(
-            MODELS_URL,
+            url,
             headers={"Authorization": f"Bearer {config.api_key}"},
             timeout=30.0,
         )
@@ -179,7 +195,17 @@ def find_model(models: list[dict], name: str) -> dict | None:
 
 
 def capabilities_of(models: list[dict], name: str) -> dict | None:
-    """Capabilities модели: чем определяется, какие параметры ей слать."""
+    """Capabilities модели: чем определяется, какие параметры ей слать.
+
+    LM Studio отдаёт `/v1/models` без поля `capabilities` вовсе — не пустой
+    словарь, а отсутствующий ключ. find_model() тогда возвращает карточку без
+    "capabilities", и .get() честно вернёт None: «неизвестно», не «ничего не
+    умеет». Params.as_payload() именно так и трактует None — параметры уходят
+    БЕЗ фильтрации. НЕ подставляй здесь дефолт вида {} или выдуманный набор
+    capabilities для локальных моделей: сервер, у которого этого списка нет
+    вовсе, не даёт оснований ни разрешать, ни запрещать что-то конкретное —
+    гадать про его возможности хуже, чем отправить и узнать по ответу.
+    """
     model = find_model(models, name)
     return (model or {}).get("capabilities") if model else None
 

@@ -69,8 +69,11 @@ def test_trimming_terminates_when_single_message_exceeds_budget():
     assert dropped == 1
 
 
-def _chunk(content, *, model=None, usage=None, finish_reason=None):
-    delta = SimpleNamespace(content=content)
+def _chunk(content, *, model=None, usage=None, finish_reason=None, reasoning_content=None):
+    delta_kwargs = {"content": content}
+    if reasoning_content is not None:
+        delta_kwargs["reasoning_content"] = reasoning_content
+    delta = SimpleNamespace(**delta_kwargs)
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
     data = SimpleNamespace(choices=[choice], model=model, usage=usage)
     return SimpleNamespace(data=data)
@@ -182,8 +185,19 @@ def _patch_client(monkeypatch, fake: _FakeMistral) -> None:
     monkeypatch.setattr(chat_core, "mistral_client", _fake_client)
 
 
-def _complete_response(text: str, finish_reason: str | None, model: str = "mistral-small-2603"):
-    message = SimpleNamespace(content=text)
+def _complete_response(
+    text: str,
+    finish_reason: str | None,
+    model: str = "mistral-small-2603",
+    reasoning_content: str | None = None,
+):
+    # reasoning_content не передаётся вовсе, когда параметр не задан — так же,
+    # как SimpleNamespace обычного ответа Mistral его не несёт: getattr в
+    # chat.complete() тогда должен вернуть None, а не упасть.
+    message_kwargs = {"content": text}
+    if reasoning_content is not None:
+        message_kwargs["reasoning_content"] = reasoning_content
+    message = SimpleNamespace(**message_kwargs)
     choice = SimpleNamespace(message=message, finish_reason=finish_reason)
     usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
     return SimpleNamespace(choices=[choice], model=model, usage=usage)
@@ -406,3 +420,145 @@ def test_complete_carries_the_rate_limit_into_the_result(monkeypatch):
     result = chat_core.complete(_config(), [{"role": "user", "content": "q"}])
 
     assert result.rate_limit_rpm == 30
+
+
+# --------------------------------------------------------------------------
+# Локальный OpenAI-совместимый endpoint (LM Studio): reasoning_content
+# --------------------------------------------------------------------------
+
+
+def test_usage_reasoning_tokens_from_dict():
+    usage = Usage.from_raw({"completion_tokens_details": {"reasoning_tokens": 41}})
+    assert usage.reasoning_tokens == 41
+
+
+def test_usage_reasoning_tokens_from_object():
+    details = SimpleNamespace(reasoning_tokens=41)
+    usage = Usage.from_raw(SimpleNamespace(completion_tokens_details=details))
+    assert usage.reasoning_tokens == 41
+
+
+def test_usage_reasoning_tokens_missing_is_none():
+    """Обычная модель Mistral не присылает эту деталь вовсе — это не ошибка."""
+    usage = Usage.from_raw({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+    assert usage.reasoning_tokens is None
+
+
+def test_missing_reasoning_tokens_does_not_affect_is_empty():
+    """reasoning_tokens — опциональная деталь учёта, не признак прихода usage."""
+    usage = Usage.from_raw({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+    assert usage.is_empty() is False
+
+
+def test_complete_puts_reasoning_content_into_reasoning_text(monkeypatch):
+    fake = _FakeMistral(
+        complete_response=_complete_response("42", "stop", reasoning_content="думаю: 6*7=42")
+    )
+    _patch_client(monkeypatch, fake)
+
+    result = chat_core.complete(_config(), [{"role": "user", "content": "q"}])
+
+    assert result.text == "42"
+    assert result.reasoning_text == "думаю: 6*7=42"
+
+
+def test_complete_reasoning_text_is_none_when_field_absent(monkeypatch):
+    """Обычная модель Mistral не несёт reasoning_content — поле остаётся None, не ''."""
+    fake = _FakeMistral(complete_response=_complete_response("привет", "stop"))
+    _patch_client(monkeypatch, fake)
+
+    result = chat_core.complete(_config(), [{"role": "user", "content": "q"}])
+
+    assert result.reasoning_text is None
+
+
+def test_complete_empty_content_stays_empty_even_with_reasoning(monkeypatch):
+    """Пустой content при малом max_tokens — законный результат, а не транспортная
+    ошибка: подменять text рассуждением нельзя, иначе метрики точности (день 04)
+    начнут мерить не то, что реально ответила модель."""
+    fake = _FakeMistral(
+        complete_response=_complete_response(
+            "", "length", reasoning_content="длинная цепочка рассуждения, до ответа не дошла"
+        )
+    )
+    _patch_client(monkeypatch, fake)
+
+    result = chat_core.complete(_config(), [{"role": "user", "content": "q"}])
+
+    assert result.text == ""
+    assert result.reasoning_text == "длинная цепочка рассуждения, до ответа не дошла"
+
+
+def test_stream_accumulates_reasoning_separately_from_on_chunk(monkeypatch):
+    """Дельты reasoning_content не должны ни падать, ни попасть в on_chunk как ответ."""
+    events = [
+        _chunk(None, reasoning_content="дум"),
+        _chunk(None, reasoning_content="аю"),
+        _chunk("от"),
+        _chunk("вет"),
+        _chunk(None, finish_reason="stop"),
+    ]
+    fake = _FakeMistral(stream_events=events)
+    _patch_client(monkeypatch, fake)
+
+    seen = []
+    result = chat_core.stream(_config(), [{"role": "user", "content": "q"}], seen.append)
+
+    assert "".join(seen) == "ответ"
+    assert result.text == "ответ"
+    assert result.reasoning_text == "думаю"
+
+
+def test_stream_reasoning_text_is_none_without_reasoning_deltas(monkeypatch):
+    events = [_chunk("привет"), _chunk(None, finish_reason="stop")]
+    fake = _FakeMistral(stream_events=events)
+    _patch_client(monkeypatch, fake)
+
+    result = chat_core.stream(_config(), [{"role": "user", "content": "q"}], lambda c: None)
+
+    assert result.reasoning_text is None
+
+
+def test_list_models_uses_base_url_when_set(monkeypatch):
+    """С заданным base_url список моделей идёт на локальный сервер, не в облако."""
+    calls = []
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "ornith"}]}
+
+    def _fake_get(url, **kwargs):
+        calls.append(url)
+        return _FakeResponse()
+
+    monkeypatch.setattr(client_mod.httpx, "get", _fake_get)
+
+    config = Config(api_key="lm-studio-local", base_url="http://127.0.0.1:1234")
+    models = client_mod.list_models(config)
+
+    assert calls == ["http://127.0.0.1:1234/v1/models"]
+    assert models == [{"id": "ornith"}]
+
+
+def test_list_models_uses_cloud_url_without_base_url(monkeypatch):
+    calls = []
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": []}
+
+    def _fake_get(url, **kwargs):
+        calls.append(url)
+        return _FakeResponse()
+
+    monkeypatch.setattr(client_mod.httpx, "get", _fake_get)
+
+    client_mod.list_models(Config(api_key="k" * 32))
+
+    assert calls == [client_mod.MODELS_URL]

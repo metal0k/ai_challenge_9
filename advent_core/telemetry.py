@@ -17,31 +17,42 @@ class Usage:
     # is_empty() не участвует: отсутствие prompt_tokens_details означает
     # «кэша не было», а не «usage не пришёл».
     cached_tokens: int | None = None
+    # Из usage.completion_tokens_details.reasoning_tokens — сколько токенов
+    # completion ушло в цепочку рассуждения (reasoning-модели вроде LM
+    # Studio/ornith; на тривиальном вопросе живьём было 41 из 45). Та же
+    # логика, что у cached_tokens: опциональная деталь биллинга/учёта, а не
+    # признак прихода usage, поэтому тоже не участвует в is_empty() —
+    # обычная модель Mistral законно не пришлёт completion_tokens_details
+    # вовсе, и это не то же самое, что «usage не пришёл».
+    reasoning_tokens: int | None = None
 
     @classmethod
     def from_raw(cls, raw: object) -> Usage:
         """Собирает usage и из dict, и из pydantic-модели SDK.
 
-        prompt_tokens_details — вложенный объект той же двойной природы, что
-        и сам usage: и dict, и pydantic-модель SDK, — поэтому разбирается тем
+        *_tokens_details — вложенные объекты той же двойной природы, что и
+        сам usage: и dict, и pydantic-модель SDK, — поэтому разбираются тем
         же приёмом (get/getattr), а не напрямую raw["prompt_tokens_details"].
         """
         if raw is None:
             return cls()
         get = raw.get if isinstance(raw, dict) else lambda k: getattr(raw, k, None)
-        details = get("prompt_tokens_details")
-        if details is None:
-            cached_tokens = None
-        else:
+
+        def _detail(container_key: str, detail_key: str) -> int | None:
+            details = get(container_key)
+            if details is None:
+                return None
             get_detail = (
                 details.get if isinstance(details, dict) else lambda k: getattr(details, k, None)
             )
-            cached_tokens = get_detail("cached_tokens")
+            return get_detail(detail_key)
+
         return cls(
             prompt_tokens=get("prompt_tokens"),
             completion_tokens=get("completion_tokens"),
             total_tokens=get("total_tokens"),
-            cached_tokens=cached_tokens,
+            cached_tokens=_detail("prompt_tokens_details", "cached_tokens"),
+            reasoning_tokens=_detail("completion_tokens_details", "reasoning_tokens"),
         )
 
     def is_empty(self) -> bool:
@@ -53,10 +64,10 @@ class Usage:
         печатает «0/7» без оговорки — то есть показывает неизвестное значение
         точным нулём. Ровно эту ошибку missing_usage и заведён предотвращать.
 
-        cached_tokens сюда не входит: это опциональная деталь биллинга, а не
-        признак прихода usage — модель без промпт-кэша законно не пришлёт
-        prompt_tokens_details вовсе, и это не то же самое, что «usage не
-        пришёл».
+        cached_tokens и reasoning_tokens сюда не входят: это опциональные
+        детали биллинга/учёта, а не признак прихода usage — модель без
+        промпт-кэша или без reasoning законно не пришлёт соответствующий
+        *_tokens_details вовсе, и это не то же самое, что «usage не пришёл».
         """
         if self.total_tokens is not None:
             return False
@@ -101,6 +112,13 @@ class CallResult:
     # ноль отдаёт Mistral для модели, недоступной на тарифе, и путать его с
     # None нельзя.
     rate_limit_rpm: int | None = None
+    # Цепочка рассуждения reasoning-модели (message.reasoning_content на
+    # complete(), накопленные дельты reasoning_content на stream()) — не
+    # часть ответа, поэтому лежит отдельно от text и НЕ подменяет его, даже
+    # когда content пуст (модель "не дошла до ответа" — законный результат,
+    # см. advent_core/chat.py). None — поля не было вовсе: обычная модель
+    # Mistral его не присылает.
+    reasoning_text: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

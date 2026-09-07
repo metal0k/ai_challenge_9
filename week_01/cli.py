@@ -166,6 +166,12 @@ def chat_command(
     ),
     no_stream: bool = typer.Option(False, "--no-stream", help="Получить ответ одним куском."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Детали запроса в stderr."),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        help="Базовый URL OpenAI-совместимого endpoint "
+        "(например http://127.0.0.1:1234 для LM Studio).",
+    ),
 ) -> None:
     """Задать вопрос модели: один ответ или интерактивный диалог."""
     config = Config.resolve(
@@ -179,6 +185,7 @@ def chat_command(
         reasoning_effort=reasoning_effort,
         stream=not no_stream,
         verbose=verbose,
+        base_url=base_url,
     )
     # Config.resolve() не знает про пять локальных параметров дня 02 (вне моей
     # зоны — не трогаю config.py), поэтому кладём их той же машинерией, что и
@@ -288,9 +295,15 @@ def _check_local_param(name: str, value: object, *, allow_all_problem: bool = Fa
 def models_command(
     model: str | None = typer.Option(None, "--model", "-m", help="Подсветить эту модель."),
     all_models: bool = typer.Option(False, "--all", help="Показать и не-chat модели."),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        help="Базовый URL OpenAI-совместимого endpoint "
+        "(например http://127.0.0.1:1234 для LM Studio).",
+    ),
 ) -> None:
     """Список моделей аккаунта прямо из API."""
-    config = Config.resolve(model=model)
+    config = Config.resolve(model=model, base_url=base_url)
     models = list_models(config)
     shown = models if all_models else chat_models(models)
 
@@ -462,6 +475,12 @@ def temp_command(
     model: str | None = typer.Option(None, "--model", "-m", help="Имя модели Mistral."),
     system: Path | None = typer.Option(None, "--system", help="Файл с system prompt."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Детали запуска в stderr."),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        help="Базовый URL OpenAI-совместимого endpoint "
+        "(например http://127.0.0.1:1234 для LM Studio).",
+    ),
 ) -> None:
     """Один и тот же запрос при разных температурах: точность, формат, разнообразие.
 
@@ -471,7 +490,7 @@ def temp_command(
     (пользовательское решение); `--judge`/`--judge-model` у этой команды
     больше нет — они остаются только у `solve` (Day 03).
     """
-    config = Config.resolve(model=model, system=system, verbose=verbose)
+    config = Config.resolve(model=model, system=system, verbose=verbose, base_url=base_url)
     _apply_local_flags(
         config,
         problem=problem,
@@ -580,6 +599,12 @@ def bench_command(
     ),
     system: Path | None = typer.Option(None, "--system", help="Файл с system prompt."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Детали запуска в stderr."),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        help="Базовый URL OpenAI-совместимого endpoint "
+        "(например http://127.0.0.1:1234 для LM Studio).",
+    ),
 ) -> None:
     """Одна и та же задача на разных версиях модели: точность, latency, токены, цена.
 
@@ -589,7 +614,7 @@ def bench_command(
     models_bench._bench_hygiene) — здесь нет флага `--temperature`, как и у
     `--model`, по той же причине: это не то, что варьирует этот день.
     """
-    config = Config.resolve(system=system, verbose=verbose)
+    config = Config.resolve(system=system, verbose=verbose, base_url=base_url)
     _apply_local_flags(
         config,
         problem=problem,

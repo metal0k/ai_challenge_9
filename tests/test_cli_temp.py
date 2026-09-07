@@ -139,6 +139,9 @@ def _temp(**overrides):
         "model": None,
         "system": None,
         "verbose": False,
+        # typer подставляет None невыставленным опциям; прямой вызов функции
+        # оставил бы здесь объект OptionInfo, а он truthy и уехал бы в конфиг.
+        "base_url": None,
     }
     kwargs.update(overrides)
     return cli.temp_command(**kwargs)
@@ -163,6 +166,9 @@ def _chat(**overrides):
         "strategy": None,
         "no_stream": False,
         "verbose": False,
+        # typer подставляет None невыставленным опциям; прямой вызов функции
+        # оставил бы здесь объект OptionInfo, а он truthy и уехал бы в конфиг.
+        "base_url": None,
     }
     kwargs.update(overrides)
     return cli.chat_command(**kwargs)

@@ -133,6 +133,9 @@ def _bench(**overrides):
         "runs": None,
         "system": None,
         "verbose": False,
+        # typer подставляет None невыставленным опциям; прямой вызов функции
+        # оставил бы здесь объект OptionInfo, а он truthy и уехал бы в конфиг.
+        "base_url": None,
     }
     kwargs.update(overrides)
     return cli.bench_command(**kwargs)

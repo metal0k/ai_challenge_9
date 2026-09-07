@@ -44,6 +44,24 @@ def _env(name: str) -> str | None:
     return value.strip() if value and value.strip() else None
 
 
+def normalize_base_url(value: str | None) -> str | None:
+    """Приводит base_url к корню сервера — без хвостового `/` и без `/v1`.
+
+    SDK сам дописывает `/v1/chat/completions`, а list_models() — `/v1/models`.
+    Но документация LM Studio называет «base URL» именно
+    `http://127.0.0.1:1234/v1`, и скопированное оттуда значение молча
+    превратилось бы в `/v1/v1/chat/completions`: сервер ответит 404, а
+    сообщение будет про недоступную модель, а не про URL. Дешевле срезать
+    хвост здесь, в единственной точке разбора, чем объяснять это в help.
+    """
+    if not value:
+        return None
+    url = value.strip().rstrip("/")
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")]
+    return url or None
+
+
 def _first(*candidates: object) -> object | None:
     """Первое заданное значение — так работает приоритет CLI > env > дефолт."""
     for candidate in candidates:
@@ -76,6 +94,9 @@ class Config:
     stream: bool = True
     verbose: bool = False
     log_path: Path = field(default_factory=lambda: LOG_DIR / "calls.jsonl")
+    # Базовый URL OpenAI-совместимого endpoint (LM Studio и т.п.). None —
+    # облачный Mistral API, поведение не меняется ни в чём.
+    base_url: str | None = None
 
     @classmethod
     def resolve(
@@ -91,16 +112,26 @@ class Config:
         reasoning_effort: str | None = None,
         stream: bool = True,
         verbose: bool = False,
+        base_url: str | None = None,
     ) -> Config:
         """Собирает конфиг по приоритету: аргумент CLI > переменная .env > дефолт."""
         load_env()
 
+        base_url = normalize_base_url(base_url or _env("ADVENT_BASE_URL"))
+
         api_key = _env("MISTRAL_API_KEY")
         if not api_key:
-            raise ConfigError(
-                "Не найден MISTRAL_API_KEY.\n"
-                "Скопируй .env.example в .env и вставь ключ из https://console.mistral.ai/api-keys"
-            )
+            if base_url:
+                # Локальный OpenAI-совместимый сервер (LM Studio) не проверяет
+                # Authorization вовсе, но SDK требует непустую строку в
+                # api_key — заглушка, а не настоящий секрет. Облачный режим
+                # (base_url не задан) по-прежнему требует настоящий ключ ниже.
+                api_key = "lm-studio-local"
+            else:
+                raise ConfigError(
+                    "Не найден MISTRAL_API_KEY.\n"
+                    "Скопируй .env.example в .env и вставь ключ из https://console.mistral.ai/api-keys"
+                )
 
         system_path = system or (Path(p) if (p := _env("ADVENT_SYSTEM_PROMPT")) else None)
         if system_path is None and DEFAULT_SYSTEM_PROMPT.exists():
@@ -128,6 +159,7 @@ class Config:
             params=params,
             stream=stream,
             verbose=verbose,
+            base_url=base_url,
         )
 
     def system_prompt(self) -> str | None:
