@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Collection
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -28,6 +29,32 @@ CHAT_COMMAND = "chat"
 SOLVE_COMMAND = "solve"
 TEMP_COMMAND = "temp"
 BENCH_COMMAND = "bench"
+# Агент недели 02 — не подкоманда недели, а отдельная точка входа
+# (`adventagent`), поэтому и контекст умолчаний у него свой
+# (SPEC-w02d06.md §3, §16).
+AGENT_COMMAND = "agent"
+
+# Параметры, которые агент действительно читает. Локальные параметры недели 01
+# (problem, runs, judge, judge_model, temps, models) сюда НЕ входят: `/params`
+# у агента не должен показывать то, на что он не смотрит — выставленный
+# параметр, ни на что не влияющий, выглядит как поломка (SPEC-w02d06.md §16).
+# Реестр общий на весь проект, поэтому фильтр — это список имён, а не
+# отдельный набор Spec: второй реестр разъехался бы с первым на первой же
+# правке.
+AGENT_PARAMS: tuple[str, ...] = (
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "random_seed",
+    "stop",
+    "reasoning_effort",
+    "format",
+    "schema_file",
+    "session",
+    "mode",
+    "done",
+    "max_turns",
+)
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
 # видео читается, `--no-judge` в командной строке — тоже, и обе формы должны
@@ -104,6 +131,12 @@ SPECS: tuple[Spec, ...] = (
         "string",
         'Условие завершения диалога: "text:<строка>" или "json:<поле>".',
         local=True,
+        # У агента маркер задан по умолчанию: `/set mode dialog` обязан
+        # работать сразу, а не требовать второй командой то, без чего диалог
+        # не закончится никогда. Значение НЕ должно пересекаться со stop —
+        # API вырезает stop из ответа (CLAUDE.md), и agent.check_done() ловит
+        # это, если пользователь задаст stop сам.
+        defaults={AGENT_COMMAND: "text:ГОТОВО"},
     ),
     Spec(
         "mode",
@@ -111,6 +144,7 @@ SPECS: tuple[Spec, ...] = (
         "Режим REPL: chat (обычный) или dialog (вопросы до готовности).",
         choices=MODE_CHOICES,
         local=True,
+        defaults={AGENT_COMMAND: "chat"},
     ),
     Spec(
         "max_turns",
@@ -119,6 +153,19 @@ SPECS: tuple[Spec, ...] = (
         1,
         None,
         local=True,
+        # Дублирует дефолт поля GenerationParams.max_turns намеренно: поле
+        # держит 10 для недели 01, где Spec.defaults для него не было вовсе, а
+        # `/set max_turns default` сбрасывает поле в None — и вернуть туда
+        # десятку умеет только apply_defaults(). Без этой строки у агента
+        # «default» означало бы «неизвестно».
+        defaults={AGENT_COMMAND: 10},
+    ),
+    Spec(
+        "session",
+        "string",
+        "Имя сессии агента: logs/sessions/<имя>.json.",
+        local=True,
+        defaults={AGENT_COMMAND: "default"},
     ),
     Spec(
         "strategy",
@@ -327,6 +374,11 @@ class GenerationParams:
     mode: str | None = None
     max_turns: int | None = 10
 
+    # Параметр агента (день 06): имя сессии на диске. Тоже локальный — в
+    # payload не идёт, но живёт в общем реестре, потому что `/set session
+    # <имя>` обязан валидироваться тем же кодом, что и остальные параметры.
+    session: str | None = None
+
     # Параметры дня 03. Значения по умолчанию не проставляются здесь: они
     # разные у chat и solve, и живут в Spec.defaults — см. apply_defaults().
     strategy: str | None = None
@@ -409,10 +461,18 @@ class GenerationParams:
 
         return payload, skipped
 
-    def describe(self) -> list[tuple[str, str, str]]:
-        """Строки для `/params`: имя, значение, пояснение."""
+    def describe(self, names: Collection[str] | None = None) -> list[tuple[str, str, str]]:
+        """Строки для `/params`: имя, значение, пояснение.
+
+        `names` ограничивает вывод теми параметрами, которые команда реально
+        читает (AGENT_PARAMS у агента). None — показать все, как было в
+        неделе 01: там `/params` показывает весь реестр и предупреждает про
+        чужие параметры отдельно (NON_CHAT_PARAMS в week_01/cli.py).
+        """
         rows = []
         for spec in SPECS:
+            if names is not None and spec.name not in names:
+                continue
             value = getattr(self, spec.name)
             if value is None:
                 shown = "—"

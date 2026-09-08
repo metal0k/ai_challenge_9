@@ -250,6 +250,32 @@ day that behaves unlike the rest or a rewrite of an already-submitted day's
 output. Per-run model answers still go to stdout in those commands too — they
 are part of the product a reader compares.
 
+**Windows encoding, a third way: `stdin` from a pipe, and it depends on the
+data.** `force_utf8()` reconfigured only `stdout` and `stderr` until
+2026-09-07. When input arrives through a **pipe** rather than a console,
+Python takes the encoding from the locale and installs `surrogateescape`:
+measured here, `sys.stdin.encoding == "cp1252"` and
+`sys.stdin.errors == "surrogateescape"`. Most Cyrillic UTF-8 bytes map to
+*something* in cp1252, but byte `0x81` is **undefined** there, so
+`surrogateescape` turns it into a lone surrogate — and `0x81` is the second
+byte of `с` (U+0441). The corrupted string then goes to the model and kills
+the journal write: `json.dumps` builds it happily, the file write dies with
+`surrogates not allowed`.
+
+Two consequences. The bug **depends on the data** — `привет` passes, `число`
+crashes — which is why it survived unnoticed. And it was in week 01 as well:
+`advent w01 chat` from a pipe dies the same way, on an already-submitted,
+already-tagged day. What masked it: `advent_cli/record.py` sets
+`PYTHONIOENCODING=utf-8` on the child process, so every demo recording was
+immune, and an interactive Windows console hands Python UTF-8 stdin anyway.
+Only a plain pipe breaks — exactly what no test covered.
+
+`journal.log_call()` made this worse by promising in its own docstring never
+to kill the caller while catching only `OSError`. `UnicodeEncodeError` is not
+an `OSError`, so the traceback took down the session **along with an answer
+the model had already returned**. A guard that documents an absolute promise
+has to catch broadly enough to keep it.
+
 **Windows encoding, twice over:**
 - `console.force_utf8()` runs first thing in `main()`; without it the console
   falls back to cp1251 and Cyrillic in the answer becomes garbage on camera.
@@ -556,7 +582,11 @@ sanitised specification lives in `specs/SPEC.md`.
   Template and rationale: `specs/reports/README.md`. Whatever in it is permanent
   project knowledge also goes into "Things that will bite you" above — the report
   is the source, not the substitute.
-- README files and chat are in Russian; this file and code comments are English.
+- README files, chat, code comments and docstrings are in Russian — the whole
+  codebase is written that way, and an English comment now reads as foreign in
+  its own file. **This file (`CLAUDE.md`) stays English**, per the global rule.
+  Confirmed by the user 2026-09-07; the line previously claimed comments were
+  English and had been contradicted by every module in the repository.
 - Comments explain *why*, especially where the code looks odd on purpose (the
   traps above). Do not add comments that restate the code.
 

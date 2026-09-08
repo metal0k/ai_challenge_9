@@ -18,12 +18,32 @@ from advent_core.telemetry import CallResult
 
 
 def force_utf8() -> None:
-    """Принудительный UTF-8 на потоках.
+    """Принудительный UTF-8 на потоках, включая stdin.
 
     Консоль Windows по умолчанию отдаёт cp1251, и кириллица в ответе модели
     превращается в мусор прямо в кадре видео. Вызывается первым делом в CLI.
+
+    stdin здесь не ради симметрии. Когда ввод приходит из ПАЙПА, а не из
+    консоли, Python берёт кодировку из локали и ставит обработчик
+    surrogateescape: замерено 2026-09-07, `sys.stdin.encoding == "cp1252"`,
+    `sys.stdin.errors == "surrogateescape"`. Кириллица в UTF-8 почти вся
+    как-то отображается в cp1252, но байт 0x81 в cp1252 НЕ ОПРЕДЕЛЁН, и
+    surrogateescape превращает его в одинокий суррогат. А 0x81 — это второй
+    байт буквы «с» (U+0441). Такая строка уходит в модель испорченной и
+    роняет запись в журнал: json.dumps её собирает молча, а запись в файл
+    падает с "surrogates not allowed".
+
+    Отсюда две неочевидные вещи. Баг ЗАВИСИТ ОТ ДАННЫХ: "привет" проходит,
+    "число" падает — поэтому он и дожил незамеченным. И он есть в неделе 01
+    тоже: `advent w01 chat` из пайпа падает ровно так же. Там его маскировало
+    то, что advent_cli/record.py выставляет дочернему процессу
+    PYTHONIOENCODING=utf-8, а интерактивная консоль Windows и так отдаёт
+    stdin в UTF-8 — ломается только пайп.
+
+    Интерактивному вводу это не вредит: там Python работает через консольный
+    API уже в UTF-8, и reconfigure оказывается пустой операцией.
     """
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             with suppress(ValueError, OSError):
@@ -157,8 +177,17 @@ def fail(error: AdventError) -> None:
         err.print(f"[dim]{error.hint}[/dim]")
 
 
-def models_table(models: list[dict], highlight: str | None = None) -> None:
-    """Таблица моделей: id, контекст, возможности, рекомендованная температура."""
+def models_table(
+    models: list[dict], highlight: str | None = None, *, target: Console | None = None
+) -> None:
+    """Таблица моделей: id, контекст, возможности, рекомендованная температура.
+
+    `target` по умолчанию `out`, потому что для `advent w01 models` таблица —
+    это ПРОДУКТ команды, а продукт по контракту проекта идёт в stdout. Агент
+    недели 02 зовёт ту же функцию с `target=err`: там та же таблица показана
+    по слэш-команде посреди разговора, то есть это хром, а продукт — ответ
+    модели (SPEC-w02d06.md §14).
+    """
     table = Table(title="Модели Mistral, доступные аккаунту")
     table.add_column("id", style="cyan", no_wrap=True)
     table.add_column("ctx", justify="right")
@@ -184,7 +213,7 @@ def models_table(models: list[dict], highlight: str | None = None) -> None:
             style=row_style,
         )
 
-    out.print(table)
+    (target or out).print(table)
 
 
 # Порядок задаёт приоритет в узкой колонке: то, что важнее для выбора модели.
@@ -213,8 +242,8 @@ def _short_temp(value: object) -> str:
     return "—" if value is None else str(value)
 
 
-def model_card(model: dict, requested: str) -> None:
-    """Карточка одной модели для `/model info`."""
+def model_card(model: dict, requested: str, *, target: Console | None = None) -> None:
+    """Карточка одной модели для `/model info`. См. про `target` в models_table."""
     capabilities = model.get("capabilities") or {}
     enabled = [label for key, label in CAPABILITY_LABELS if capabilities.get(key)]
 
@@ -231,7 +260,7 @@ def model_card(model: dict, requested: str) -> None:
     table.add_row("возможности", ", ".join(enabled) or "—")
     table.add_row("алиасы", ", ".join(model.get("aliases") or []) or "—")
 
-    out.print(table)
+    (target or out).print(table)
 
     # Про снятие с поддержки нужно узнавать заранее, а не по внезапной 404.
     if deprecation := model.get("deprecation"):
@@ -239,8 +268,8 @@ def model_card(model: dict, requested: str) -> None:
         warn(f"модель снимается с поддержки {deprecation}; замена: {replacement}")
 
 
-def params_table(rows: list[tuple[str, str, str]]) -> None:
-    """Текущие параметры генерации для `/params`."""
+def params_table(rows: list[tuple[str, str, str]], *, target: Console | None = None) -> None:
+    """Текущие параметры генерации для `/params`. См. про `target` в models_table."""
     table = Table(title="Параметры генерации")
     table.add_column("параметр", style="cyan", no_wrap=True)
     table.add_column("значение", justify="right")
@@ -249,15 +278,15 @@ def params_table(rows: list[tuple[str, str, str]]) -> None:
     for name, value, help_text in rows:
         table.add_row(name, value, help_text)
 
-    out.print(table)
+    (target or out).print(table)
     note("— означает «не передаётся, сервер применит свой дефолт»")
 
 
-def commands_help(commands: list[tuple[str, str]]) -> None:
-    """Список команд REPL для `/help`."""
+def commands_help(commands: list[tuple[str, str]], *, target: Console | None = None) -> None:
+    """Список команд REPL для `/help`. См. про `target` в models_table."""
     table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
     table.add_column(style="cyan", no_wrap=True)
     table.add_column(style="dim")
     for name, description in commands:
         table.add_row(name, description)
-    out.print(table)
+    (target or out).print(table)

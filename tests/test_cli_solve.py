@@ -655,6 +655,18 @@ def test_set_of_a_solve_only_param_says_it_does_nothing_here(capsys):
     assert "читает только команда solve" in _flat(capsys.readouterr().err)
 
 
+def test_set_of_an_agent_only_param_says_it_does_nothing_here(capsys):
+    """Реестр параметров общий на проект, и запись, заведённая для агента
+    недели 02, немедленно видна `/set` уже сданной недели 01. Без оговорки
+    `/set session рецепты` печатал бы «session = рецепты» без единого
+    предупреждения, ни на что при этом не влияя."""
+    session = _session()
+
+    cli._handle_set(["session", "рецепты"], session)
+
+    assert "читает только команда adventagent" in _flat(capsys.readouterr().err)
+
+
 def test_set_problem_checks_the_bank_immediately(capsys):
     """Опечатка в id иначе всплыла бы после девяти оплаченных вызовов."""
     session = _session()

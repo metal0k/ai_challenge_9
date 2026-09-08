@@ -35,6 +35,12 @@ STEP_PAUSE = 2.0
 TITLE_PAUSE = 1.5
 REPL_TYPING_PAUSE = 1.2
 
+# Сколько ждать шаг демо, прежде чем снять его как зависший. Константа, а не
+# литерал в _run_step(): на этот порог смотрит advent_core.tokens
+# (DOWNLOAD_TIMEOUT), потому что скачка токенизатора, пережившая его, убила бы
+# дубль записи с неверно названной причиной.
+STEP_TIMEOUT = 180
+
 # Своя папка под сырую запись OBS: активный профиль пользователя может
 # писать в каталог другого проекта.
 RAW_DIR = PROJECT_ROOT / "logs" / "obs_raw"
@@ -44,6 +50,14 @@ RAW_DIR = PROJECT_ROOT / "logs" / "obs_raw"
 DEMO_WINDOW_TITLE = "AI Advent"
 
 
+# Модуль, который запускается через `python -m`, и имя команды, под которым
+# шаг показывается в кадре. Неделя 02 — отдельная точка входа `adventagent`
+# (pyproject: week_02.cli:main), а не подкоманда `advent`, поэтому запускать её
+# зашитым "advent_cli" физически нечем (SPEC-w02d06.md §17.3).
+DEFAULT_MODULE = "advent_cli"
+MODULE_COMMANDS = {DEFAULT_MODULE: "advent", "week_02.cli": "adventagent"}
+
+
 @dataclass(slots=True)
 class Step:
     title: str
@@ -51,6 +65,9 @@ class Step:
     stdin_lines: list[str] = field(default_factory=list)
     expect_failure: bool = False
     env: dict[str, str] = field(default_factory=dict)
+    # Что запускать: `python -m <module>`. Умолчание — общий CLI курса, так что
+    # шаги дней 01-05 не меняются ни на символ.
+    module: str = DEFAULT_MODULE
     # Разбор мифа про temperature=0 (день 04) не зовёт CLI повторно — он
     # комментирует колонку «различных», уже напечатанную предыдущим шагом, и
     # цифру офлайн-замера из SPEC. args пустой сигналит _play() не запускать
@@ -64,7 +81,15 @@ def demo_steps(week: int, day: int) -> list[Step]:
 
     Сценарии прошлых дней остаются в коде и выбираются по номеру —
     `advent record --day 1` обязана продолжать работать ровно как раньше.
+
+    Незнакомая пара (неделя, день) — ошибка, а не «сойдёт день 01». Раньше
+    здесь стоял безусловный fallback в _demo_steps_w01d01(week), и
+    `record --week 2 --day 6` молча строил шаги `advent w02 chat` — команды,
+    которой не существует: проверка, чей failure path продолжается, хуже
+    отсутствующей проверки, потому что читается как пройденная (CLAUDE.md).
     """
+    if week == 2 and day == 6:
+        return _demo_steps_w02d06()
     if week == 1 and day == 5:
         return _demo_steps_w01d05()
     if week == 1 and day == 4:
@@ -73,7 +98,12 @@ def demo_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w01d03()
     if week == 1 and day == 2:
         return _demo_steps_w01d02()
-    return _demo_steps_w01d01(week)
+    if week == 1 and day == 1:
+        return _demo_steps_w01d01(week)
+    raise AdventError(
+        f"Сценария демо для недели {week}, дня {day} нет.",
+        hint="Добавь _demo_steps_wNNdDD() и ветку в demo_steps() — записывать нечего.",
+    )
 
 
 def _demo_steps_w01d01(week: int) -> list[Step]:
@@ -676,13 +706,122 @@ def _demo_steps_w01d05() -> list[Step]:
     ]
 
 
+# Сессия, в которой идёт демо дня 06. Имя своё, а не `default`: сценарий
+# начинается с `/new`, то есть стирает содержимое, и стирать чужой рабочий
+# разговор ради записи нельзя. Вторая сессия — для шага «две темы не
+# смешиваются».
+_DEMO_SESSION = "demo"
+_DEMO_SESSION_OTHER = "recipes"
+# Модель для шага про смену модели внутри сессии. Не DEFAULT_MODEL проекта —
+# смысл шага именно в расхождении с моделью последнего сохранённого хода.
+_OTHER_MODEL = "ministral-3b-latest"
+
+
+def _demo_steps_w02d06() -> list[Step]:
+    """Day 06 — первый агент: память сессии, учёт токенов, режимы (SPEC §18).
+
+    Каждый шаг — отдельный запуск `adventagent` (module="week_02.cli"), и это
+    не оформление: «контекст сохраняется между запусками» доказывается только
+    тем, что процесс между шагами действительно завершился.
+
+    Шаг 1 начинается с `/new` по той же причине, по которой каждый REPL-шаг
+    дня 02 начинается с `/reset`: сессия подхватывается с диска, и без очистки
+    первый вопрос уедет вместе с разговором прошлого дубля — а второй дубль
+    обязан приводить в то же состояние, что и первый.
+
+    Порядок шагов 1-2-3 несущий: сначала ход в чистой сессии, потом ДРУГОЙ
+    запуск, который про этот ход помнит, и только потом `/tokens` — иначе
+    сверка локального счёта с фактом сервера показывается раньше, чем зритель
+    увидит, откуда взялся контекст.
+    """
+    return [
+        Step(
+            title="1. Агент отвечает на вопрос: панель токенов и заполненность контекста",
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION],
+            stdin_lines=[
+                "/new",
+                "Объясни в двух предложениях, чем агент отличается от одного вызова API",
+                "/exit",
+            ],
+        ),
+        Step(
+            title="2. Новый запуск той же сессии — агент помнит, о чём говорили",
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION],
+            stdin_lines=["О чём я спросил в прошлый раз?", "/exit"],
+        ),
+        Step(
+            title="3. /tokens — разбивка и сверка локального счёта с фактом сервера",
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION],
+            stdin_lines=["Сколько будет 17 умножить на 3? Ответь одним числом", "/tokens", "/exit"],
+        ),
+        Step(
+            title="4. Целевой диалог: агент сам уточняет и сам решает, что данных хватит",
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION],
+            # `/mode chat` здесь не нужен: по достижении цели режим возвращается
+            # сам и говорит об этом — это и есть предмет показа.
+            #
+            # Последняя реплика намеренно ссылается на выданный результат, не
+            # повторяя его: она доказывает, что итог целевого диалога остался в
+            # ОБЩЕЙ памяти сессии (SPEC-w02d06.md §9), а не исчез вместе с
+            # эпизодом, как это было в неделе 01.
+            #
+            # Число уточняющих ответов — два, и это запас, а не совпадение:
+            # модель не обязана сходиться за фиксированное число ходов (та же
+            # оговорка, что в дне 03). Сойдётся за один — последняя реплика
+            # уйдёт обычным ходом в chat; понадобится два — она станет ответом
+            # в диалоге. Оба исхода читаются на видео как осмысленные.
+            stdin_lines=[
+                "/mode dialog",
+                "Хочу приготовить салат",
+                "Греческий, без мяса, на двоих",
+                "Сколько времени займёт то, что ты предложил?",
+                "/exit",
+            ],
+        ),
+        Step(
+            title="5. Смена модели внутри сессии — предупреждение вместо молчаливой подмены",
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION, "--model", _OTHER_MODEL],
+            stdin_lines=["Одним словом: столица Франции?", "/exit"],
+        ),
+        Step(
+            title="6. /sessions и /new — вторая тема в своей памяти, разговоры не смешиваются",
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION_OTHER],
+            stdin_lines=[
+                "/new",
+                "Назови три ингредиента для греческого салата",
+                "/sessions",
+                "/exit",
+            ],
+        ),
+    ]
+
+
 def rehearsal_step(week: int) -> Step:
     """Дешёвый прогон той же машинерии, что ведёт демо.
 
     Гоняет subprocess, пайп stdin с кириллицей и коды возврата — всё, что
     ломалось, — но не тратит токены на генерацию. Кириллица в вводе здесь
     обязательна: именно на ней кодировка пайпа и падала.
+
+    Неделя 02 репетируется через `adventagent`, а не через `advent w02 chat`:
+    такой команды не существует, и репетиция «на всякий случай» уехала бы в
+    ошибку раньше, чем проверила бы то, ради чего заведена (SPEC-w02d06.md
+    §17.2). Сессия репетиции — своя: `/params` и заведомо неверная команда
+    ходов не пишут, но подставлять сюда демо-сессию всё равно нельзя.
     """
+    if week == 2:
+        return Step(
+            title="репетиция",
+            module="week_02.cli",
+            args=["--session", "rehearsal"],
+            stdin_lines=["/params", "/команды-которой-нет", "/exit"],
+        )
     return Step(
         title="репетиция",
         args=[f"w{week:02d}", "chat"],
@@ -768,7 +907,11 @@ def _play(steps: list[Step]) -> None:
         # а условие пишет человек. Квадратные скобки в нём («последовательности
         # [a, b, c]») Rich съел бы как незакрытый тег — кусок подписи пропал бы
         # прямо в кадре, без единой ошибки.
-        console.out.print(f"[dim]$ advent {rich_escape(' '.join(step.args))}[/dim]")
+        # Имя команды — по модулю шага: неделя 02 запускается как
+        # `adventagent`, и подпись «$ advent --session demo» в кадре была бы
+        # враньём про то, что зритель может повторить.
+        entry = MODULE_COMMANDS.get(step.module, step.module)
+        console.out.print(f"[dim]$ {entry} {rich_escape(' '.join(step.args))}[/dim]")
         time.sleep(TITLE_PAUSE)
         _run_step(step)
         time.sleep(STEP_PAUSE)
@@ -778,7 +921,7 @@ def _run_step(step: Step, pause: float | None = None) -> None:
     typing_pause = REPL_TYPING_PAUSE if pause is None else pause
     step_pause = STEP_PAUSE if pause is None else pause
     env = {**os.environ, **step.env, "PYTHONIOENCODING": "utf-8"}
-    command = [sys.executable, "-m", "advent_cli", *step.args]
+    command = [sys.executable, "-m", step.module, *step.args]
 
     if not step.stdin_lines:
         result = subprocess.run(command, cwd=PROJECT_ROOT, env=env)
@@ -811,7 +954,7 @@ def _run_step(step: Step, pause: float | None = None) -> None:
             process.stdin.close()
 
     try:
-        code = process.wait(timeout=180)
+        code = process.wait(timeout=STEP_TIMEOUT)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=10)

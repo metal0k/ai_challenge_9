@@ -74,6 +74,12 @@ DIALOG_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "dialog.md"
 # общие для `solve` и `temp`; `judge`/`judge_model` читает только `solve` —
 # LLM-судья дня 04 убран целиком (пользовательское решение), `temp` эти два
 # параметра больше не читает вовсе.
+# `session` — параметр агента недели 02: реестр параметров общий на проект, и
+# новая запись в нём немедленно видна в `/params` недели 01 и принимается её
+# `/set`. Без этой строки `/set session рецепты` печатал бы «session =
+# рецепты» без единого предупреждения, ни на что при этом не влияя, — ровно
+# тот отказ, ради которого NON_CHAT_PARAMS и заведён, да ещё и в уже сданном
+# дне, который виден по тегу.
 NON_CHAT_PARAMS = {
     "problem": "solve, temp и bench",
     "runs": "solve, temp и bench",
@@ -81,6 +87,7 @@ NON_CHAT_PARAMS = {
     "judge_model": "solve",
     "temps": "temp",
     "models": "bench",
+    "session": "adventagent (неделя 02)",
 }
 
 REPL_COMMANDS = [

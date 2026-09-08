@@ -62,5 +62,14 @@ def log_call(
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError:
+    except Exception:
+        # Широкий except намеренно — он держит обещание из докстринга выше:
+        # упавшая запись в лог не должна убивать уже полученный ответ на
+        # экране пользователя. Раньше здесь стоял OSError, и обещание
+        # нарушалось: строка, испорченная суррогатами при чтении из пайпа
+        # (см. console.force_utf8), роняла запись с UnicodeEncodeError — это
+        # НЕ OSError, и трассировка уносила сессию вместе с ответом, который
+        # модель уже прислала. Причина той порчи устранена в force_utf8;
+        # этот except — второй рубеж, потому что журнал есть побочный эффект
+        # демо, а не его продукт.
         pass

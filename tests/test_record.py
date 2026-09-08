@@ -217,3 +217,118 @@ def test_day_05_scenario_has_no_step_without_an_action_or_a_note():
     steps = record_mod.demo_steps(1, 5)
     assert steps, "день 05 остался без сценария"
     assert all(step.args or step.note for step in steps), "день 05: шаг без действия и без текста"
+
+
+# --------------------------------------------------------------------------
+# Week 02, Day 06 (SPEC-w02d06.md §17): три поломки машинерии записи, каждая
+# из которых сломала бы день молча. Тесты дней 01-05 выше не тронуты.
+# --------------------------------------------------------------------------
+
+
+def test_demo_steps_raises_on_an_unknown_week_and_day():
+    """Раньше здесь стоял безусловный fallback в день 01, и
+    `record --week 2 --day 6` молча строил шаги `advent w02 chat` — команды,
+    которой нет. Проверка, чей failure path продолжается, хуже отсутствующей:
+    она читается как пройденная (CLAUDE.md)."""
+    for week, day in ((2, 7), (3, 1), (1, 9)):
+        with pytest.raises(AdventError):
+            record_mod.demo_steps(week, day)
+
+
+def test_day_01_scenario_is_still_returned_for_week_1_day_1():
+    """Падение на незнакомой паре не должно было задеть день, который раньше
+    возвращался тем же fallback'ом."""
+    steps = record_mod.demo_steps(1, 1)
+    assert steps
+    assert any("models" in (step.args or []) for step in steps)
+
+
+def test_days_01_to_05_still_run_through_the_common_cli():
+    """Поле Step.module добавлено с умолчанием ровно ради этого: сценарии
+    прошлых дней не меняются ни на символ."""
+    for day in (1, 2, 3, 4, 5):
+        for step in record_mod.demo_steps(1, day):
+            assert step.module == record_mod.DEFAULT_MODULE
+
+
+def _capture_command(monkeypatch) -> list[list[str]]:
+    """Перехватывает запуск subprocess: нужен состав команды, а не запуск."""
+    seen: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(command, **kwargs):
+        seen.append(command)
+        return _Result()
+
+    monkeypatch.setattr(record_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(record_mod.time, "sleep", lambda _: None)
+    return seen
+
+
+def test_run_step_launches_the_module_named_by_the_step(monkeypatch):
+    """`_run_step()` зашивал "advent_cli", и отдельную точку входа
+    `adventagent` было физически нечем запустить (SPEC-w02d06.md §17.3)."""
+    seen = _capture_command(monkeypatch)
+
+    record_mod._run_step(record_mod.Step(title="общий CLI", args=["w01", "models"]))
+    record_mod._run_step(
+        record_mod.Step(title="агент", module="week_02.cli", args=["--session", "demo"])
+    )
+
+    assert seen[0][1:3] == ["-m", "advent_cli"]
+    assert seen[1][1:3] == ["-m", "week_02.cli"]
+    assert seen[1][3:] == ["--session", "demo"]
+
+
+def test_week_02_scenario_runs_the_agent_entry_point(monkeypatch):
+    """Ни одного `advent w02 chat`: такой команды не существует — неделя 02
+    запускается отдельной точкой входа."""
+    steps = record_mod.demo_steps(2, 6)
+
+    assert steps
+    assert all(step.module == "week_02.cli" for step in steps if step.args)
+    for step in steps:
+        assert "w02" not in (step.args or [])
+        assert "chat" not in (step.args or [])
+
+
+def test_week_02_scenario_shows_memory_tokens_dialog_model_change_and_sessions():
+    """SPEC-w02d06.md §18: сценарий обязан показать все шесть вещей дня, а не
+    оставить их зрителю в виде колонок — та же дисциплина, что закреплена для
+    дней 04 и 05 выше."""
+    titles = " ".join(step.title.lower() for step in record_mod.demo_steps(2, 6))
+
+    assert "токен" in titles
+    assert "помнит" in titles
+    assert "диалог" in titles
+    assert "смена модели" in titles
+    assert "/sessions" in titles
+
+
+def test_week_02_scenario_starts_from_an_empty_session():
+    """Сессия подхватывается с диска: без `/new` первый вопрос уедет вместе с
+    разговором прошлого дубля — то же правило, что `/reset` в дне 02."""
+    first = record_mod.demo_steps(2, 6)[0]
+
+    assert first.stdin_lines[0] == "/new"
+    assert "--session" in first.args
+
+
+def test_rehearsal_for_week_02_uses_the_agent_and_its_own_session():
+    """Репетиция недели 02 зашивала `w02 chat` и уехала бы в ошибку раньше,
+    чем проверила пайп и кодировку; демо-сессию она при этом трогать не должна."""
+    step = record_mod.rehearsal_step(2)
+
+    assert step.module == "week_02.cli"
+    assert "chat" not in step.args
+    assert step.args[:2] == ["--session", "rehearsal"]
+    assert step.args[1] != record_mod._DEMO_SESSION
+
+
+def test_rehearsal_for_week_01_is_unchanged():
+    step = record_mod.rehearsal_step(1)
+
+    assert step.module == record_mod.DEFAULT_MODULE
+    assert step.args == ["w01", "chat"]
