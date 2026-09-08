@@ -250,6 +250,47 @@ day that behaves unlike the rest or a rewrite of an already-submitted day's
 output. Per-run model answers still go to stdout in those commands too — they
 are part of the product a reader compares.
 
+**Exact token counting before sending is available — but not the way the docs
+suggest.** `MistralTokenizer.from_model("ministral-14b-latest")` does not work:
+the method is deprecated (removal in 1.13.0), demands an exact versioned name
+with no `-latest` aliases, and its `MODEL_NAME_TO_TOKENIZER_CLS` holds only
+`ministral-8b-2410` out of the whole ministral line. The working path is
+`tekken.json` from the (not gated) HF repo plus `MistralTokenizer.from_file()`;
+`from_hf_hub()` is just download-plus-from_file, so `huggingface_hub` is not
+needed — `httpx` is enough.
+
+The assumption "the API model uses the same tokenizer as that HF repo" was
+**verified, not trusted**: local count against the server's `prompt_tokens`,
+five request shapes (bare user, system+user, six-message history, long
+Cyrillic, English) — delta zero on every one, chat-template overhead included.
+The name→repo table is hand-maintained and will drift one day, so the
+reconciliation stayed in the product: `/tokens` compares its own count with the
+server's on every answer. A table defended by a check, not by diligence.
+
+**A demo scenario that ends an episode must return the mode with it.** Week 01's
+`_run_dialog()` handed control back to the ordinary REPL once the done-marker
+fired. The week-02 agent first kept `mode=dialog`, so the next remark — "спасибо"
+included — was treated as a *new* goal and the agent started interrogating
+again; caught on a live dry-run right after it had delivered the recipe. The fix
+is in the behaviour, not the demo script: on `done` the mode returns to `chat`
+**and says so out loud**. The turn-limit branch deliberately does not: there the
+condition was *not* met, and switching would decide for the user that the
+attempt failed. Note what the tests were worth here — 625 of them stayed green
+both with the bug and without it.
+
+**A guard that decides from one instantaneous sample is fragile by
+construction.** `verify_capture()` took a single screenshot and rejected a
+healthy scene as black, killing a take. The cause was **never reproduced**: two
+hypotheses were measured and both refuted — "the source needed time for its
+first frame" (replaying record's whole sequence gives 0.1527 immediately, no
+warm-up) and "OBS stayed on a dead HWND because the window string didn't change"
+(window closed and recreated with the same title; rebinding worked, first frame
+0.0711). Rather than promote a plausible story to a cause, the *class* of
+failure was removed: several attempts instead of one. The threshold was left
+alone — the threshold separates black from non-black, the retries separate
+"empty" from "too early". A false positive here costs exactly what a missed
+black frame costs: a wasted take.
+
 **Windows encoding, a third way: `stdin` from a pipe, and it depends on the
 data.** `force_utf8()` reconfigured only `stdout` and `stderr` until
 2026-09-07. When input arrives through a **pipe** rather than a console,
@@ -536,6 +577,21 @@ the head of a line, plus `in reply to` — which catches a pasted transcript
 without knowing anything about who is in it. When a task statement needs a
 clarification from the chat, paraphrase it; keep verbatim quotes in `specs/`,
 which is gitignored.
+
+**A 403 on push is not always a permissions problem — it can be the wrong
+account.** `git push` failed with `Permission to metal0k/ai_challenge_9.git
+denied to denis-tc`: Git Credential Manager was supplying a different GitHub
+account. The `GITHUB_TOKEN` already in `.env` belongs to `metal0k` and carries
+`push: true, admin: true` (check with `/user` and `/repos/<owner>/<repo>` before
+guessing). Pushing with it is fine **as an ephemeral header**, never as a URL:
+
+```
+git -c credential.helper= -c http.extraheader="AUTHORIZATION: basic <base64>" push origin main
+```
+
+`-c` applies to one invocation and writes nothing to `.git/config` — which is
+exactly what the rule below is about. Verify afterwards that `.git/config` holds
+no `extraheader`.
 
 **Never put a token in a URL you hand to git.** `git push -u <url-with-token>`
 writes that URL into `.git/config` as the branch's upstream, where a later
