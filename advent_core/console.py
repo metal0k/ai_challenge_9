@@ -10,6 +10,7 @@ import json
 import sys
 from contextlib import suppress
 
+import typer
 from rich.console import Console
 from rich.table import Table
 
@@ -175,6 +176,143 @@ def fail(error: AdventError) -> None:
     err.print(f"[bold red]Ошибка:[/bold red] {error.message}")
     if error.hint:
         err.print(f"[dim]{error.hint}[/dim]")
+
+
+# --------------------------------------------------------------------------
+# Выбор модели при старте
+# --------------------------------------------------------------------------
+
+
+def _unavailable_head(model: str, *, base_url: str | None) -> str:
+    """Первая строка сообщения: причина зависит от того, облако это или свой сервер.
+
+    Без base_url модель «недоступна аккаунту». С base_url — «не найдена на
+    сервере <url>»: LM Studio отдаёт свой список моделей, и совет «посмотри
+    список» без --base-url показал бы ОБЛАЧНЫЙ список, то есть увёл бы от
+    разгадки — живой пример: запуск против http://127.0.0.1:1234 падал с
+    текстом про аккаунт и про `advent w01 models`.
+    """
+    if base_url is None:
+        return f"Модель {model!r} недоступна аккаунту."
+    return f"Модель {model!r} не найдена на сервере {base_url}."
+
+
+def model_unavailable_text(model: str, names: list[str], *, base_url: str | None) -> str:
+    """Полный текст ошибки для неинтерактивного случая (не-tty: пайп, CI, демо).
+
+    Одна функция на все точки отказа — старт агента недели 02, старт REPL
+    недели 01, проверка модели судьи: три копии одного текста — источник
+    рассинхронизации, тут это названо прямо (CLAUDE.md).
+    """
+    if base_url is None:
+        hint = "Посмотри список: advent w01 models"
+    else:
+        hint = "Укажи модель флагом --model."
+    available = ", ".join(names) if names else "—"
+    return f"{_unavailable_head(model, base_url=base_url)}\nДоступно: {available}\n{hint}"
+
+
+def choose_model(models: list[dict], *, current: str, base_url: str | None) -> str | None:
+    """Интерактивный выбор модели из списка сервера. None — отказ (Enter/EOF/Ctrl+C).
+
+    Список передаётся уже отфильтрованным (chat_models): этот модуль не
+    импортирует client.py — console владеет только контрактом вывода и вводом.
+    Спрашивать, а не молча брать первую из списка, обязательно при любом числе
+    кандидатов: ответ придёт от модели, которую пользователь не заказывал.
+
+    Весь вывод и приглашение — в stderr (контракт stdout/stderr, CLAUDE.md):
+    выбор модели это служебный эпизод старта, а не продукт команды. Прочитанный
+    при не-tty stdin ввод эхом в stderr — как у _read_line() в week_02/cli.py.
+    """
+    if not models:
+        return None
+    choices = [model.get("id", "") for model in models]
+    # Точное имя принимает и id, и алиас: конфиг живёт алиасами (-latest), и
+    # заставлять пользователя угадывать каноническое имя было бы лишним.
+    by_name: dict[str, str] = {}
+    for model, model_id in zip(models, choices, strict=True):
+        if model_id:
+            by_name.setdefault(model_id, model_id)
+        for alias in model.get("aliases") or []:
+            by_name.setdefault(alias, model_id)
+
+    err.print(_unavailable_head(current, base_url=base_url))
+    for number, name in enumerate(choices, 1):
+        err.print(f"  {number}. {name}")
+
+    while True:
+        try:
+            raw = typer.prompt(
+                "выбери номер или имя модели (Enter — выход)",
+                default="",
+                show_default=False,
+                err=True,
+            )
+        except (EOFError, typer.Abort, KeyboardInterrupt):
+            return None
+        line = raw.strip()
+        if line and not sys.stdin.isatty():
+            echo_input(line)
+        if not line:
+            return None
+        if line.isdigit() and 1 <= int(line) <= len(choices):
+            chosen = choices[int(line) - 1]
+            note(f"модель выбрана: {chosen}")
+            return chosen
+        if line in by_name:
+            chosen = by_name[line]
+            note(f"модель выбрана: {chosen}")
+            return chosen
+        warn(f"нет варианта {line!r} — введи номер из списка или точное имя")
+
+
+def choose(prompt: str, options: list[str]) -> int | None:
+    """Интерактивный выбор из нумерованного списка. None — отказ (Enter/EOF/Ctrl+C).
+
+    Образец — choose_model() чуть выше: тот же вывод в stderr и тот же контракт
+    «Enter = оставить как есть». Отдельная функция, а не обобщение choose_model:
+    та знает про alias'ы и карточки моделей, и свести обе к одному коду можно
+    было бы только опциональными параметрами ради одного вызова — преждевременное
+    обобщение. Если появится третий пикер — тогда и смотреть.
+
+    Возвращает индекс выбранного варианта: строка опции здесь — только подпись,
+    а что делать с выбором (имя параметра, значение) решает вызывающий код.
+    """
+    if not options:
+        return None
+    err.print(prompt)
+    for number, option in enumerate(options, 1):
+        # markup=False: подписи приходят извне (значения параметров могут
+        # содержать квадратные скобки — Rich съел бы их как незакрытый тег).
+        err.print(f"  {number}. {option}", markup=False)
+    # Точное имя принимаем без учёта регистра: пункты выбора — литеральные
+    # значения параметров, и «Dialog» для mode=dialog — это не другой вариант.
+    by_name = {option.lower(): index for index, option in enumerate(options)}
+
+    while True:
+        try:
+            raw = typer.prompt(
+                f"выбери номер или имя ({prompt}; Enter — выход)",
+                default="",
+                show_default=False,
+                err=True,
+            )
+        except (EOFError, typer.Abort, KeyboardInterrupt):
+            return None
+        line = raw.strip()
+        if line and not sys.stdin.isatty():
+            echo_input(line)
+        if not line:
+            return None
+        if line.isdigit() and 1 <= int(line) <= len(options):
+            index = int(line) - 1
+            note(f"выбрано: {options[index]}")
+            return index
+        if line.lower() in by_name:
+            index = by_name[line.lower()]
+            note(f"выбрано: {options[index]}")
+            return index
+        warn(f"нет варианта {line!r} — введи номер из списка или точное имя")
 
 
 def models_table(

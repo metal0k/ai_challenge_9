@@ -278,6 +278,23 @@ condition was *not* met, and switching would decide for the user that the
 attempt failed. Note what the tests were worth here — 625 of them stayed green
 both with the bug and without it.
 
+**An additive optional key beats a version bump when tagged days must keep
+reading newer session files.** The `state` key (mode, done marker, dialog turn
+count) was added to the session JSON on Day 07 **without** bumping
+`SESSION_VERSION`: the tagged `w02d06` build ignores a key it never reads, and
+the new code reads old files as "no state — take defaults". A bump would have
+worked against both directions: the version check in `load()` fires before any
+field parsing, so the old tagged build would declare every new file a foreign
+version and quarantine it to `.bak` — one run from an older tag, and the
+session is gone.
+
+**REPL pickers must be tty-gated.** The interactive choices behind bare
+`/model` and `/set` (and the model picker at startup) run only when
+`sys.stdin.isatty()`: the demo harness drives stdin through a pipe, and an
+ungated prompt eats the next scripted line as its answer — mid-take, with no
+error anywhere. The gated non-tty path is the pre-picker behaviour — print the
+current value, or warn about missing arguments.
+
 **A guard that decides from one instantaneous sample is fragile by
 construction.** `verify_capture()` took a single screenshot and rejected a
 healthy scene as black, killing a take. The cause was **never reproduced**: two

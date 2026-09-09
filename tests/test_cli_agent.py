@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import inspect
 import re
+import sys
 
 import pytest
 
 import week_02.cli as cli
+from advent_core import console
 from advent_core.agent import INTERRUPT_NOTE
-from advent_core.config import Config
+from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError
 from advent_core.params import AGENT_COMMAND, defaults_for
 from advent_core.session import Session
@@ -412,8 +414,8 @@ def test_params_shows_only_what_the_agent_reads(monkeypatch, tmp_path, capsys):
 # --- журнал -----------------------------------------------------------------
 
 
-def test_journal_is_written_with_week_2_and_day_6(monkeypatch, tmp_path):
-    """Литералы 2 и 6, а не cli.WEEK/cli.DAY: ожидание, взятое из того же
+def test_journal_is_written_with_week_2_and_day_7(monkeypatch, tmp_path):
+    """Литералы 2 и 7, а не cli.WEEK/cli.DAY: ожидание, взятое из того же
     источника, что и код под тестом, покраснеть не может (CLAUDE.md)."""
     logged: dict = {}
     monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: logged.update(kwargs))
@@ -422,7 +424,7 @@ def test_journal_is_written_with_week_2_and_day_6(monkeypatch, tmp_path):
     cli._turn(shell, "вопрос")
 
     assert logged["week"] == 2
-    assert logged["day"] == 6
+    assert logged["day"] == 7
 
 
 def test_journal_logs_what_actually_went_to_the_api(monkeypatch, tmp_path):
@@ -802,3 +804,497 @@ def test_again_repeats_without_history_and_without_touching_the_session(monkeypa
 
     assert [m["role"] for m in seen[1]] == ["user"]
     assert len(shell.session.turns) == turns_before
+
+
+# --- персистентность состояния диалога (день 07) -----------------------------
+#
+# «Продолжать как будто агент не выключался» из задания дня обязано покрывать
+# не только ходы, но и режим: выход посреди dialog раньше терял mode, done и
+# счётчик, и перезапуск начинал всё заново.
+
+
+def test_restart_keeps_the_history_and_resends_it(monkeypatch, tmp_path, capsys):
+    """Основное требование дня: перезапуск на том же каталоге продолжает разговор.
+
+    Проверяются обе половины: история второго shell'а равна истории первого, и
+    ПЕРВЫЙ же запрос после перезапуска несёт прошлые user/assistant сообщения —
+    иначе агент «помнит», но модели об этом не говорит.
+    """
+    seen: list[list[dict]] = []
+    first = _shell(monkeypatch, tmp_path, complete=_complete(["первый ответ"], seen=seen))
+    cli._turn(first, "вопрос")
+
+    second = _shell(monkeypatch, tmp_path, complete=_complete(seen=seen))
+    assert second.history == first.history
+
+    cli._turn(second, "продолжаем")
+    exchanged = [m for m in seen[1] if m["role"] != "system"]
+    assert [m["role"] for m in exchanged] == ["user", "assistant", "user"]
+    assert [m["content"] for m in exchanged] == ["вопрос", "первый ответ", "продолжаем"]
+
+
+def test_dialog_state_survives_a_restart(monkeypatch, tmp_path, capsys):
+    """Выход посреди dialog и запуск заново: режим, счётчик и маркер на месте.
+
+    Раньше всё это жило только в памяти запуска, и «как будто не выключался»
+    нарушалось ровно на середине целевого диалога. Подхват анонсируется —
+    без анонса в кадре не видно, что диалог продолжен, а не начат.
+    """
+    first = _shell(
+        monkeypatch,
+        tmp_path,
+        complete=_complete(["уточняющий вопрос?"]),
+        mode="dialog",
+        done="text:ГОТОВО",
+    )
+    cli._turn(first, "хочу салат")
+    assert first.dialog_turns == 1
+    capsys.readouterr()
+
+    second = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+
+    assert second.agent.mode == "dialog"
+    assert second.dialog_turns == 1
+    assert second.config.params.done == "text:ГОТОВО"
+    assert "подхвачен целевой диалог: ход 1 из" in _flat(capsys.readouterr().err)
+
+
+def test_explicit_flag_beats_the_mode_from_the_file(monkeypatch, tmp_path, capsys):
+    """Приоритет «флаг > файл > дефолт»: явный --mode chat при старте не даёт
+    файлу сессии вернуть dialog — явный выбор пользователя не наш, чтобы его
+    игнорировать (то же правило, что у --system против персоны проекта)."""
+    first = _shell(monkeypatch, tmp_path, complete=_complete(["уточняющий?"]), mode="dialog")
+    cli._turn(first, "цель")
+    assert Session.load("default", directory=tmp_path).state["mode"] == "dialog"
+    capsys.readouterr()
+
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+    second = cli.AgentShell(_config(mode="chat"), directory=tmp_path, explicit=frozenset({"mode"}))
+
+    assert second.agent.mode == "chat"
+    assert second.config.params.mode == "chat"
+    assert "подхвачен целевой диалог" not in _flat(capsys.readouterr().err)
+
+
+def test_done_flip_is_persisted_to_the_session_file(monkeypatch, tmp_path):
+    """Завершённый эпизод не воскресает: save в _dialog_progress стоит ПОСЛЕ
+    flip'а mode→chat, иначе файл при выходе сразу после done хранил бы
+    протухший dialog, и перезапуск начинал бы допрос заново."""
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        complete=_complete(["салат готов, ГОТОВО"]),
+        mode="dialog",
+        done="text:ГОТОВО",
+    )
+
+    cli._turn(shell, "хочу салат")
+    assert shell.config.params.mode == "chat"
+
+    saved = Session.load("default", directory=tmp_path)
+    assert saved.state["mode"] == "chat"
+    assert saved.state["dialog_turns"] == 0
+
+
+def test_mode_change_is_saved_even_without_a_turn(monkeypatch, tmp_path, capsys):
+    """`/mode dialog` → `/exit` без единого хода: режим обязан уже быть в файле.
+
+    Save после хода здесь не случится никогда — единственная точка записи это
+    сама смена режима."""
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/mode dialog", shell)
+    assert "mode = dialog" in _flat(capsys.readouterr().err)
+
+    saved = Session.load("default", directory=tmp_path)
+    assert saved.state["mode"] == "dialog"
+    assert saved.state["dialog_turns"] == 0
+
+
+def test_reset_zeroes_the_dialog_counter_on_disk_too(monkeypatch, tmp_path, capsys):
+    """`/reset` обнуляет счётчик и в памяти, и в слепке: иначе перезапуск
+    воскресил бы ходы диалога из протухшего state."""
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["уточняющий?"]), mode="dialog")
+    cli._turn(shell, "хочу салат")
+    assert Session.load("default", directory=tmp_path).state["dialog_turns"] == 1
+    capsys.readouterr()
+
+    cli._dispatch("/reset", shell)
+
+    assert shell.dialog_turns == 0
+    assert Session.load("default", directory=tmp_path).state["dialog_turns"] == 0
+
+
+def test_state_that_is_not_a_dict_warns_and_is_ignored(monkeypatch, tmp_path, capsys):
+    """Файлу не доверяем вслепую: state — dict или его нет. Чужая запись —
+    предупреждение и дефолты, а не падение и не молчаливая подмена."""
+    session = Session.new("default", directory=tmp_path)
+    session.state = "dialog"  # намеренно не dict — чужая или битая запись
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.mode == "chat"
+    stderr = _flat(capsys.readouterr().err)
+    assert "state не похож на объект" in stderr
+
+
+def test_unknown_mode_in_the_file_warns_and_falls_back_to_default(monkeypatch, tmp_path, capsys):
+    """Невалидное значение из файла предупреждает и пропускается: mode
+    остаётся дефолтом реестра, а сессия грузится дальше — это разговор, а не
+    конфиг, из-за одной опечатки его не выбрасываем."""
+    session = Session.new("default", directory=tmp_path)
+    session.state = {"mode": "неттакого"}
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.mode == "chat"
+    stderr = _flat(capsys.readouterr().err)
+    assert "негодное mode='неттакого'" in stderr
+    assert "default" in stderr, "сессия загрузилась, несмотря на битый state"
+
+
+# --- пикеры голых /model и /set (день 07) ------------------------------------
+#
+# Только при isatty: запись демо гоняет REPL через pipe, и промпт пикера съел
+# бы следующую строку сценария как «ответ». Поэтому у каждого теста есть и
+# не-tty двойник, ловящий регрессию «пикер звался без tty».
+
+
+def test_bare_model_command_picks_interactively_and_retargets(monkeypatch, tmp_path, capsys):
+    """Голая /model на tty: выбор из списка переключает модель вместе со всем,
+    что от неё зависит (карточка, окно контекста) — тот же путь, что у
+    `/model <имя>`, а не параллельная реализация."""
+    _patch_tty(monkeypatch)
+    asked_current: list[str] = []
+
+    def fake_choose_model(models, *, current, base_url):
+        asked_current.append(current)
+        return "ministral-3b-latest"
+
+    monkeypatch.setattr(console, "choose_model", fake_choose_model)
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/model", shell)
+
+    assert shell.config.model == "ministral-3b-latest"
+    assert shell.card and shell.card["id"] == "ministral-3b-2512"
+    assert shell.agent.context_limit == 32_000
+    assert asked_current == ["ministral-14b-latest"], "пикеру показана текущая модель"
+    assert "модель переключена на ministral-3b-latest" in _flat(capsys.readouterr().err)
+
+
+def test_bare_model_command_refusal_keeps_the_current_model(monkeypatch, tmp_path, capsys):
+    """Enter на приглашении пикера — «оставить как есть»: модель и её окно не
+    тронуты."""
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(console, "choose_model", lambda models, **kwargs: None)
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/model", shell)
+
+    assert shell.config.model == "ministral-14b-latest"
+    assert shell.agent.context_limit == 128_000
+    assert "не изменена" in _flat(capsys.readouterr().err)
+
+
+def test_bare_model_command_without_a_tty_prints_and_never_prompts(monkeypatch, tmp_path, capsys):
+    """Пайп (запись демо, CI): прежнее поведение — печать текущей модели, и
+    пикер не звался вовсе, иначе промпт съел бы строку сценария."""
+
+    def boom(*args, **kwargs):
+        raise AssertionError("пикер зваться не должен без tty")
+
+    monkeypatch.setattr(console, "choose_model", boom)
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/model", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "текущая модель: ministral-14b-latest" in stderr
+
+
+def test_bare_set_picks_param_then_value_through_two_menus(monkeypatch, tmp_path, capsys):
+    """Голая /set на tty: два choose — параметр, затем значение из choices.
+    Дальше тот же хвост, что у `/set mode dialog`: значение применилось и
+    слепок state ушёл в файл."""
+    _patch_tty(monkeypatch)
+    menus: list[tuple[str, list[str]]] = []
+
+    def fake_choose(prompt, options):
+        menus.append((prompt, list(options)))
+        return 9 if len(menus) == 1 else 1  # индекс mode, затем индекс dialog
+
+    monkeypatch.setattr(console, "choose", fake_choose)
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/set", shell)
+
+    assert shell.config.params.mode == "dialog"
+    assert menus[0][0] == "параметр"
+    assert any(option.startswith("mode =") for option in menus[0][1]), (
+        "в меню параметра показано текущее значение"
+    )
+    assert menus[1][0] == "mode"
+    assert menus[1][1] == ["chat", "dialog", "default"]
+    assert Session.load("default", directory=tmp_path).state["mode"] == "dialog"
+    assert "mode = dialog" in _flat(capsys.readouterr().err)
+
+
+def test_bare_set_cancel_at_the_value_step_changes_nothing(monkeypatch, tmp_path, capsys):
+    """Отмена на шаге значения (Enter) — выход без изменений: ни параметр, ни
+    файл сессии не тронуты."""
+    _patch_tty(monkeypatch)
+    answers = iter([9, None])  # параметр выбрали, значение отменили
+    monkeypatch.setattr(console, "choose", lambda prompt, options: next(answers))
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/set", shell)
+
+    assert shell.config.params.mode == "chat"
+    assert not (tmp_path / "default.json").exists(), "отмена записала файл сессии"
+    assert "отменено" in _flat(capsys.readouterr().err)
+
+
+def test_bare_set_without_a_tty_warns_as_before(monkeypatch, tmp_path, capsys):
+    """Пайп: прежнее предупреждение про форму команды, пикер не звался."""
+
+    def boom(prompt, options):
+        raise AssertionError("пикер зваться не должен без tty")
+
+    monkeypatch.setattr(console, "choose", boom)
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/set", shell)
+
+    assert "нужно: /set <параметр> <значение>" in _flat(capsys.readouterr().err)
+    assert shell.config.params.mode == "chat"
+
+
+# --- старт с моделью, которой нет на сервере --------------------------------
+#
+# Живой пример: LM Studio на 127.0.0.1:1234 отдаёт две ornith-модели, а конфиг
+# просит ministral. Раньше это было фатально С НЕВЕРНЫМ текстом («недоступна
+# аккаунту» и совет без --base-url показал бы облачный список). Теперь: не-tty
+# — ConfigError с честным текстом; tty — интерактивный выбор на старте.
+
+LOCAL_MODELS = [
+    {
+        "id": "ornith-1.5-35b-a3b",
+        "capabilities": {"completion_chat": True},
+        "max_context_length": 40_000,
+    },
+    {
+        "id": "ornith-1.5-9b",
+        "capabilities": {"completion_chat": True},
+        "max_context_length": 32_000,
+    },
+]
+
+
+def _patch_tty(monkeypatch):
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+
+def test_choose_model_accepts_a_number(monkeypatch, capsys):
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(console.typer, "prompt", lambda *a, **k: "2")
+
+    chosen = console.choose_model(LOCAL_MODELS, current="ministral-14b-latest", base_url=None)
+
+    assert chosen == "ornith-1.5-9b"
+    # Весь выбор — в stderr (контракт stdout/stderr): продукт команды не стартует.
+    # Rich подсвечивает цифры в именах моделей — сравнивается текст без ANSI.
+    written = capsys.readouterr()
+    assert written.out == ""
+    assert "ornith-1.5-9b" in _flat(written.err)
+    assert "1. ornith-1.5-35b-a3b" in _flat(written.err)
+
+
+def test_choose_model_accepts_an_exact_name(monkeypatch):
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(console.typer, "prompt", lambda *a, **k: "ornith-1.5-35b-a3b")
+
+    chosen = console.choose_model(LOCAL_MODELS, current="x", base_url=None)
+
+    assert chosen == "ornith-1.5-35b-a3b"
+
+
+def test_choose_model_accepts_an_alias_and_returns_the_canonical_id(monkeypatch):
+    """Конфиг живёт алиасами (-latest): принять их и вернуть канонический id,
+    чтобы find_model()/capabilities дальше по __post_init__ сошлись."""
+    nine_b = dict(LOCAL_MODELS[1], aliases=["ornith-9b-latest"])
+    models = [LOCAL_MODELS[0], nine_b]
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(console.typer, "prompt", lambda *a, **k: "ornith-9b-latest")
+
+    chosen = console.choose_model(models, current="x", base_url=None)
+
+    assert chosen == "ornith-1.5-9b"
+
+
+def test_choose_model_repeats_the_question_on_garbage_input(monkeypatch, capsys):
+    """Неверный ввод не выходит: вопрос повторяется, пока не придёт вариант."""
+    answers = iter(["99", "нет-такой-модели", "1"])
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(console.typer, "prompt", lambda *a, **k: next(answers))
+
+    chosen = console.choose_model(LOCAL_MODELS, current="x", base_url=None)
+
+    assert chosen == "ornith-1.5-35b-a3b"
+    assert "нет варианта" in _flat(capsys.readouterr().err)
+
+
+def test_choose_model_empty_input_is_a_refusal(monkeypatch):
+    """Enter на приглашении — отказ, а не первая модель из списка."""
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(console.typer, "prompt", lambda *a, **k: "")
+
+    assert console.choose_model(LOCAL_MODELS, current="x", base_url=None) is None
+
+
+def test_choose_model_eof_is_a_refusal(monkeypatch):
+    def eof(*args, **kwargs):
+        raise EOFError
+
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(console.typer, "prompt", eof)
+
+    assert console.choose_model(LOCAL_MODELS, current="x", base_url=None) is None
+
+
+def test_choose_model_with_no_candidates_is_a_refusal_without_asking(monkeypatch):
+    def boom(*args, **kwargs):
+        raise AssertionError("спрашивать не о чем — prompt зваться не должен")
+
+    monkeypatch.setattr(console.typer, "prompt", boom)
+
+    assert console.choose_model([], current="x", base_url=None) is None
+
+
+def test_start_with_an_unknown_model_and_no_tty_raises_with_the_server_text(monkeypatch, tmp_path):
+    """Не-tty (пайп, запись демо, CI): падаем по-прежнему, но текст обязан
+    называть СЕРВЕР и доступные модели — «аккаунту» тут ни при чём, а совет
+    `advent w01 models` без --base-url показал бы облачный список."""
+    monkeypatch.setattr(cli, "list_models", lambda config: LOCAL_MODELS)
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+    config = _config()
+    config.model = "ministral-14b-latest"  # в списке сервера такого нет
+    config.base_url = "http://127.0.0.1:1234"
+
+    with pytest.raises(ConfigError) as excinfo:
+        cli.AgentShell(config, directory=tmp_path)
+
+    message = str(excinfo.value)
+    assert "не найдена на сервере http://127.0.0.1:1234" in message
+    assert "ornith-1.5-35b-a3b" in message
+    assert "ornith-1.5-9b" in message
+    assert "аккаунту" not in message
+    assert "advent w01 models" not in message
+
+
+def test_start_with_an_unknown_model_cloud_text_still_names_the_account(monkeypatch, tmp_path):
+    """Обратная сторона: облачный случай по-прежнему про аккаунт и про
+    `advent w01 models` — там этот совет верен."""
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+    config = _config()
+    config.model = "magistral-medium-latest"  # нет в списке фикстуры
+
+    with pytest.raises(ConfigError) as excinfo:
+        cli.AgentShell(config, directory=tmp_path)
+
+    message = str(excinfo.value)
+    assert "недоступна аккаунту" in message
+    assert "advent w01 models" in message
+    assert "ministral-3b-2512" in message, "доступные модели перечислены"
+
+
+def test_start_offers_a_choice_and_retargets_everything(monkeypatch, tmp_path, capsys):
+    """tty: агент спрашивает, и выбранное имя пересчитывает ВСЁ, что от него
+    зависит — card, окно контекста, capabilities и счётчик токенов. Счётчик
+    создаётся ниже refresh() по __post_init__, поэтому достаточно, чтобы
+    config.model был новым к моменту его вызова; тест ловит именно это:
+    counter_for обязан получить ВЫБРАННУЮ модель, а не ту, что упала."""
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(cli, "list_models", lambda config: LOCAL_MODELS)
+    counter_models: list[str] = []
+
+    def fake_counter_for(model, **kwargs):
+        counter_models.append(model)
+        return EstimateCounter(), None
+
+    monkeypatch.setattr(cli, "counter_for", fake_counter_for)
+    answers = iter(["2"])  # ornith-1.5-9b
+    monkeypatch.setattr(console.typer, "prompt", lambda *a, **k: next(answers))
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+
+    config = _config()
+    config.model = "ministral-14b-latest"
+    config.base_url = "http://127.0.0.1:1234"
+    shell = cli.AgentShell(config, directory=tmp_path)
+
+    assert config.model == "ornith-1.5-9b"
+    assert shell.card and shell.card["id"] == "ornith-1.5-9b"
+    assert shell.capabilities == {"completion_chat": True}
+    assert shell.agent.context_limit == 32_000
+    assert counter_models == ["ornith-1.5-9b"], "счётчик создан для выбранной модели"
+    assert "модель выбрана: ornith-1.5-9b" in _flat(capsys.readouterr().err)
+
+
+def test_start_offers_models_when_the_server_has_no_capabilities(monkeypatch, tmp_path):
+    """LM Studio отдаёт карточки без `capabilities` вообще: chat_models()
+    фильтрует всё, и старый вариант предложил бы пусто — то есть по факту не
+    предложил бы ничего. Fallback: предлагаем всё, что сервер отдал."""
+    _patch_tty(monkeypatch)
+    bare = [{"id": "ornith-1.5-9b"}, {"id": "text-embedding-nomic-embed-text-v1.5"}]
+    monkeypatch.setattr(cli, "list_models", lambda config: bare)
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+    answers = iter(["1"])
+    monkeypatch.setattr(console.typer, "prompt", lambda *a, **k: next(answers))
+
+    config = _config()
+    config.model = "ministral-14b-latest"
+    config.base_url = "http://127.0.0.1:1234"
+    shell = cli.AgentShell(config, directory=tmp_path)
+
+    assert config.model == "ornith-1.5-9b"
+    assert shell.card == {"id": "ornith-1.5-9b"}
+
+
+def test_start_refusal_does_not_continue_the_startup(monkeypatch, tmp_path):
+    """Enter на приглашении — отказ: запуск не продолжается, ConfigError."""
+    _patch_tty(monkeypatch)
+    monkeypatch.setattr(cli, "list_models", lambda config: LOCAL_MODELS)
+    monkeypatch.setattr(console.typer, "prompt", lambda *a, **k: "")
+    config = _config()
+    config.model = "ministral-14b-latest"
+
+    with pytest.raises(ConfigError):
+        cli.AgentShell(config, directory=tmp_path)
+
+
+def test_model_command_with_a_typo_rolls_back_and_never_prompts(monkeypatch, tmp_path, capsys):
+    """`/model <опечатка>` внутри сессии — НЕ место для интерактивного выбора:
+    откат к прежней модели и warning, даже на tty. Спрашивать можно только на
+    старте; регрессия ловится дублем prompt'а, который обязан не зваться."""
+    _patch_tty(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("выбор предлагается только на старте, не посреди /model")
+
+    monkeypatch.setattr(console.typer, "prompt", boom)
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/model нет-такой-модели", shell)
+
+    assert shell.config.model == "ministral-14b-latest"
+    assert shell.card and shell.card["id"] == "ministral-14b-2512"
+    assert "недоступна аккаунту" in _flat(capsys.readouterr().err)

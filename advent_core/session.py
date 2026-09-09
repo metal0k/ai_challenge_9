@@ -163,6 +163,14 @@ class Session:
     # предупреждение бывает и у целого файла (пропущенные записи), а этот флаг
     # означает «ходов не видно вовсе», и списку сессий надо их различать.
     broken: bool = False
+    # Служебное состояние запуска (режим, маркер done, счётчик диалога) —
+    # opaque blob: Session остаётся хранилищем и не знает, что означают ключи,
+    # интерпретирует их только CLI. Пишется в файл БЕЗ bump SESSION_VERSION:
+    # ключ необязательный и аддитивный — код по тегу w02d06 такой файл читает
+    # (ключ игнорируется), новый код читает старые файлы (ключа нет — дефолты).
+    # Bump объявил бы новые файлы «чужой версией» для старого кода и уводил бы
+    # их в .bak-карантин — потеря сессии при переключении между тегами.
+    state: dict[str, object] = field(default_factory=dict)
 
     @staticmethod
     def path_for(name: str, directory: Path | None = None) -> Path:
@@ -238,6 +246,17 @@ class Session:
         if isinstance(created, str) and created:
             session.created = created
 
+        # Файлу не доверяем вслепую: state — dict или его нет. Иное (строка,
+        # число) — это чужая или битая запись, и молча подставлять её как
+        # «пусто» значило бы стереть настоящие значения дефолтами.
+        raw_state = raw.get("state")
+        if isinstance(raw_state, dict):
+            session.state = raw_state
+        elif raw_state is not None:
+            session.warnings.append(
+                f"в сессии {session.name} ключ state не похож на объект — игнорирован"
+            )
+
         skipped = 0
         for item in raw["turns"]:
             turn = Turn.from_json(item)
@@ -290,6 +309,9 @@ class Session:
             "name": self.name,
             "created": self.created,
             "turns": [turn.to_json() for turn in self.turns],
+            # Аддитивный ключ без bump версии — совместимость с тегом w02d06
+            # в обе стороны, подробности у поля state выше.
+            "state": self.state,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
@@ -359,7 +381,12 @@ class Session:
         return None
 
     def clear(self) -> None:
-        """`/new`: забыть ходы, оставить имя. Дата начала — новая."""
+        """`/new`: забыть ходы, оставить имя. Дата начала — новая.
+
+        state НЕ стирается: mode/done — настройки текущего запуска, а не
+        содержимое разговора; счётчик ходов диалога сбрасывает CLI, и в файл
+        он попадает уже нулевым.
+        """
         self.turns.clear()
         self.created = _now()
 

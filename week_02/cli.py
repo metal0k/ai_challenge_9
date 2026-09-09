@@ -56,11 +56,11 @@ from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCheck, counter_for
 
 WEEK = 2
-# Номер дня, который последним трогал ЭТОТ код. Тест сверяет литерал 6, а не
+# Номер дня, который последним трогал ЭТОТ код. Тест сверяет литерал 7, а не
 # эту константу: ожидание, взятое из того же источника, что и код под тестом,
 # покраснеть не может (CLAUDE.md, «A test whose expected value comes from the
 # same source as the code under test»).
-DAY = 6
+DAY = 7
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -151,6 +151,11 @@ class AgentShell:
     # Каталог сессий. None — штатный logs/sessions; тесты подставляют свой,
     # чтобы прогон suite'а не писал в настоящую память агента.
     directory: Path | None = None
+    # Имена local-параметров, заданных флагами запуска явно. Явный флаг бьёт
+    # файл сессии (приоритет «флаг > файл > дефолт реестра»): явный выбор
+    # пользователя не наш, чтобы его игнорировать — то же правило, по которому
+    # --system перекрывает персону проекта.
+    explicit: frozenset[str] = frozenset()
 
     models: list[dict] = field(default_factory=list)
     card: dict | None = None
@@ -168,9 +173,39 @@ class AgentShell:
     dialog_turns: int = 0
 
     def __post_init__(self) -> None:
-        self.refresh()
+        try:
+            self.refresh()
+        except ConfigError:
+            # Модели из конфига нет на сервере. Фатально это только когда чинить
+            # не на месте: не-tty (пайп, запись демо, CI) — спрашивать некого,
+            # и по-прежнему падаем ConfigError'ом с текстом из console. Спрашивать
+            # можно ТОЛЬКО здесь, на старте: retarget() из /model <опечатка>
+            # продолжает откатываться к прежней модели с warning'ом.
+            if not sys.stdin.isatty():
+                raise
+            # Сервер без capabilities (LM Studio): chat_models() вернёт
+            # пусто, и выбор не предложат вовсе — тогда предлагаем всё, что
+            # сервер отдал. Отфильтрованный список предпочтительнее: облачный
+            # список содержит и эмбеддинги.
+            candidates = chat_models(self.models) or self.models
+            chosen = console.choose_model(
+                candidates,
+                current=self.config.model,
+                base_url=self.config.base_url,
+            )
+            if chosen is None:
+                raise
+            self.config.model = chosen
+            # counter_for(), capabilities и context_limit ниже по __post_init__
+            # читают config.model уже новый — пересчитывать ничего не надо, было
+            # бы надо, зови выбор ПОСЛЕ счётчика.
+            self.refresh()
         self.session = self.open_session(self.config.params.session or DEFAULT_SESSION)
         self.history = self.session.history()
+        # Подхватываем служебное состояние сессии ДО сборки агента: его
+        # property mode читает config.params, поэтому порядок безопасен, а
+        # анонс — после создания agent, где уже есть max_turns.
+        resumed_dialog = self._apply_session_state(self.session, check_explicit=True)
         # on_notice: скачка токенизатора идёт минуты, и молчащий процесс между
         # строкой про сессию и приглашением читается как зависший — в том
         # числе машинерией записи демо, которая снимает шаг по таймауту и
@@ -193,6 +228,13 @@ class AgentShell:
             # Агент не печатает — он отдаёт текст сюда (SPEC §5).
             on_warning=console.warn,
         )
+        if resumed_dialog:
+            console.note(
+                f"подхвачен целевой диалог: ход {self.dialog_turns} из {self.agent.max_turns}"
+            )
+        # check_done() зовётся и на применённом из файла маркере: негодный done,
+        # оставшийся в сессии с прошлого запуска, ловим сейчас, а не тогда,
+        # когда диалог не закончится ни разу.
         _warn_text(self.agent.check_done())
 
     # --- модель ------------------------------------------------------------
@@ -212,8 +254,9 @@ class AgentShell:
         names = model_names(self.models)
         if names and self.config.model not in names:
             raise ConfigError(
-                f"Модель {self.config.model!r} недоступна аккаунту.\n"
-                f"Посмотри список: advent w01 models"
+                console.model_unavailable_text(
+                    self.config.model, sorted(names), base_url=self.config.base_url
+                )
             )
         self.card = find_model(self.models, self.config.model)
 
@@ -272,6 +315,43 @@ class AgentShell:
                 f"{self.config.model} — контекст остаётся валидным, но окно "
                 "контекста и счёт токенов теперь другие"
             )
+
+    def _apply_session_state(self, session: Session, *, check_explicit: bool) -> bool:
+        """Применяет служебное состояние сессии: mode/done и счётчик диалога.
+
+        Возвращает True, если из файла подхвачен режим dialog (вызывающий код
+        анонсирует это после создания агента). Файлу не доверяем: каждое
+        значение идёт через params.set() — валидация choices достаётся бесплатно,
+        — а не подходящее значение предупреждает и пропускается, а не падает.
+
+        `check_explicit` — только для старта: явный флаг --mode/--done бьёт
+        файл. При переключении в существующую сессию (`/session`, `/new`)
+        explicit не проверяется: это «продолжить тот разговор как оставили»,
+        а флаг был про старт этого запуска.
+        """
+        resumed_dialog = False
+        for name in ("mode", "done"):
+            if check_explicit and name in self.explicit:
+                continue
+            value = session.state.get(name)
+            if not isinstance(value, str):
+                continue
+            try:
+                self.config.params.set(name, value)
+            except ParamError as error:
+                console.warn(
+                    f"в файле сессии {session.name} негодное {name}={value!r} — игнор: {error}"
+                )
+                continue
+            if name == "mode" and value == "dialog":
+                resumed_dialog = True
+        turns = session.state.get("dialog_turns")
+        # bool в Python — это int: True прошёл бы проверку и напечатался как
+        # «ход True из 10», поэтому исключаем его явно.
+        self.dialog_turns = (
+            turns if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0 else 0
+        )
+        return resumed_dialog
 
     def save(self) -> None:
         """Сохраняет сессию; ошибку записи показывает, а не глотает.
@@ -441,6 +521,19 @@ def _remember(shell: AgentShell, question: str, reply: AgentReply) -> None:
     shell.save()
 
 
+def _save_state(shell: AgentShell) -> None:
+    """Снимок режима и счётчика диалога — в файл сессии.
+
+    Save при КАЖДОМ изменении, а не только после хода: иначе `/mode dialog` →
+    `/exit` без единого хода терял бы режим — в файле остался бы прежний
+    слепок, и перезапуск не продолжил бы диалог «как будто не выключался».
+    """
+    shell.session.state["mode"] = shell.agent.mode
+    shell.session.state["done"] = shell.config.params.done
+    shell.session.state["dialog_turns"] = shell.dialog_turns
+    shell.save()
+
+
 def _dialog_progress(shell: AgentShell, reply: AgentReply) -> None:
     """Учёт ходов целевого диалога: сработал маркер или упёрлись в потолок."""
     shell.dialog_turns += 1
@@ -464,6 +557,11 @@ def _dialog_progress(shell: AgentShell, reply: AgentReply) -> None:
         # исчерпал результат.
         shell.config.params.mode = "chat"
         console.note("режим вернулся в chat; /mode dialog начнёт новый диалог")
+        # Слепок пишем ПОСЛЕ flip'а: save уже случился в _remember ДО этой
+        # функции, и без отдельного save файл при выходе сразу после done
+        # хранил бы протухший режим dialog — перезапуск воскресил бы
+        # законченный эпизод.
+        _save_state(shell)
         return
     if shell.agent.turn_limit_reached(shell.dialog_turns):
         # Не ошибка и не выход из сессии: счётчик обнуляется, режим остаётся
@@ -474,6 +572,7 @@ def _dialog_progress(shell: AgentShell, reply: AgentReply) -> None:
             "выполнено — счётчик сброшен; /mode chat вернёт обычный режим"
         )
         shell.dialog_turns = 0
+    _save_state(shell)
 
 
 # --------------------------------------------------------------------------
@@ -565,7 +664,8 @@ def _cmd_exit(shell: AgentShell, args: list[str]) -> bool:
 
 @command(
     "/model",
-    "текущая модель; с именем — переключить, list all — вообще все модели",
+    "текущая модель; без имени — выбор из списка (интерактивно), "
+    "с именем — переключить, list all — вообще все модели",
     # Без квадратных скобок: console.commands_help кладёт строку в таблицу
     # Rich, а Rich-markup молча съедает «[all]» как незакрытый тег — ровно
     # этот кусок подписи и пропал бы с экрана.
@@ -573,6 +673,21 @@ def _cmd_exit(shell: AgentShell, args: list[str]) -> bool:
 )
 def _cmd_model(shell: AgentShell, args: list[str]) -> bool:
     if not args:
+        # Пикер — только при интерактивном stdin: запись демо гоняет REPL через
+        # pipe, и typer.prompt пикера съел бы следующую строку сценария как
+        # «ответ» и порвал бы кадр (та же причина, по которой /set пикерный
+        # только при isatty). Не-tty и пустой список — прежняя печать.
+        if sys.stdin.isatty() and shell.models:
+            candidates = chat_models(shell.models) or shell.models
+            chosen = console.choose_model(
+                candidates,
+                current=shell.config.model,
+                base_url=shell.config.base_url,
+            )
+            if chosen is None:
+                console.note("модель не изменена")
+                return False
+            return _switch_model(shell, chosen)
         console.note(f"текущая модель: {shell.config.model}")
         return False
 
@@ -594,8 +709,17 @@ def _cmd_model(shell: AgentShell, args: list[str]) -> bool:
         console.model_card(shell.card, shell.config.model, target=console.err)
         return False
 
+    return _switch_model(shell, sub)
+
+
+def _switch_model(shell: AgentShell, name: str) -> bool:
+    """Общий хвост `/model <имя>` и пикерной голой `/model`.
+
+    Одно место для retarget/rollback и предупреждения о skipped-параметрах —
+    иначе голая /model и /model с именем разошлись бы на первой же правке.
+    """
     previous = shell.config.model
-    shell.config.model = sub
+    shell.config.model = name
     try:
         shell.retarget()
     except (ConfigError, AdventError) as error:
@@ -607,10 +731,10 @@ def _cmd_model(shell: AgentShell, args: list[str]) -> bool:
         return False
 
     resolved = shell.resolved
-    console.note(f"модель переключена на {sub}" + (f" → {resolved}" if resolved else ""))
+    console.note(f"модель переключена на {name}" + (f" → {resolved}" if resolved else ""))
     _, skipped = shell.config.params.as_payload(shell.capabilities)
     if skipped:
-        console.warn(f"{sub} не поддерживает: {', '.join(skipped)} — параметры не отправляются")
+        console.warn(f"{name} не поддерживает: {', '.join(skipped)} — параметры не отправляются")
     return False
 
 
@@ -659,15 +783,72 @@ def _final_system_prompt(shell: AgentShell) -> str | None:
 
 @command(
     "/set",
-    "изменить параметр (default — вернуть умолчание команды)",
+    "изменить параметр (без аргументов — выбор из списка, интерактивно; "
+    "default — вернуть умолчание команды)",
     usage="/set <параметр> <значение>",
 )
 def _cmd_set(shell: AgentShell, args: list[str]) -> bool:
+    # Пикер — только при интерактивном stdin и голой команде: запись демо
+    # гоняет REPL через pipe, и промпт пикера съел бы следующую строку
+    # сценария как «ответ». Не-tty или неполная команда — прежнее предупреждение.
+    if not args and sys.stdin.isatty():
+        picked = _pick_param(shell)
+        if picked is None:
+            console.note("отменено — параметры не изменены")
+            return False
+        return _apply_set(shell, *picked)
     if len(args) < 2:
         console.warn("нужно: /set <параметр> <значение>. /params — что есть")
         return False
+    return _apply_set(shell, args[0], " ".join(args[1:]))
 
-    name, raw = args[0], " ".join(args[1:])
+
+def _pick_param(shell: AgentShell) -> tuple[str, str] | None:
+    """Двухшаговый пикер для голой /set: сначала параметр, потом значение.
+
+    Подписи берём из params.describe(AGENT_PARAMS) — тот же источник, что у
+    /params: пикер не должен показывать параметры, которых агент не читает.
+    None на любом шаге — отмена без изменений.
+    """
+    described = shell.config.params.describe(AGENT_PARAMS)
+    options = [f"{name} = {value} — {help_text}" for name, value, help_text in described]
+    index = console.choose("параметр", options)
+    if index is None:
+        return None
+    name, current, _ = described[index]
+
+    spec = BY_NAME[name]
+    if spec.choices:
+        # Выбор из фиксированного списка — тоже пикером: свободным вводом
+        # сюда нечего вводить, кроме опечатки. «default» передаётся как есть —
+        # реестр сам вернёт умолчание команды.
+        choice_options = [*spec.choices, "default"]
+        choice_index = console.choose(name, choice_options)
+        if choice_index is None:
+            return None
+        return name, choice_options[choice_index]
+
+    try:
+        raw = typer.prompt(
+            f"{name} (сейчас: {current}; default — вернуть умолчание)",
+            default="",
+            show_default=False,
+            err=True,
+        )
+    except (EOFError, typer.Abort, KeyboardInterrupt):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    return name, value
+
+
+def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
+    """Общий хвост `/set <name> <value>` и двухшагового пикера.
+
+    Одно место для валидации, apply_defaults и веток session/mode/done — иначе
+    пикерная и аргументная формы /set разошлись бы на первой же правке.
+    """
     if name not in AGENT_PARAMS:
         console.warn(
             f"агент не читает параметр {name!r} — /params показывает те, что читает. "
@@ -705,6 +886,10 @@ def _cmd_set(shell: AgentShell, args: list[str]) -> bool:
         # Негодный или съедаемый stop'ом маркер надо поймать сейчас, а не
         # тогда, когда диалог не закончится ни разу.
         _warn_text(shell.agent.check_done())
+    if name in ("mode", "done"):
+        # Значение применилось — сразу в файл: `/mode dialog` → `/exit` без
+        # хода иначе терял бы режим (save после хода тут не случится).
+        _save_state(shell)
 
     _, skipped = shell.config.params.as_payload(shell.capabilities)
     if name in skipped:
@@ -762,6 +947,9 @@ def _cmd_again(shell: AgentShell, args: list[str]) -> bool:
 def _cmd_reset(shell: AgentShell, args: list[str]) -> bool:
     shell.history = []
     shell.dialog_turns = 0
+    # Счётчик обнулился — сразу и в файл: иначе перезапуск воскресил бы его
+    # из протухшего слепка state.
+    _save_state(shell)
     console.note(
         "рабочий контекст очищен — модель забыла разговор; файл сессии не тронут, стирает его /new"
     )
@@ -917,10 +1105,20 @@ def _switch_session(shell: AgentShell, name: str, *, fresh: bool = False) -> Non
         session.clear()
         if dropped:
             console.warn(f"сессия {session.name}: удалено ходов {dropped}")
+        # Разговор стёрт — счётчик диалога обнуляем вместе с ним: «ход 2 из 10»
+        # без истории врал бы. mode/done не трогаем: это настройка запуска,
+        # а не содержимое разговора (clear() state не стирает).
+        session.state["dialog_turns"] = 0
     shell.session = session
     shell.history = session.history()
     shell.config.params.session = session.name
-    shell.dialog_turns = 0
+    # Это состояние ТОГО разговора: применяем оптом, explicit-флаги не чекая —
+    # они были про старт запуска, а переключение = «продолжить как оставили».
+    resumed_dialog = shell._apply_session_state(session, check_explicit=False)
+    if resumed_dialog:
+        console.note(
+            f"подхвачен целевой диалог: ход {shell.dialog_turns} из {shell.agent.max_turns}"
+        )
     shell.last_question = None
     shell.last_check = None
     if fresh:
@@ -1146,7 +1344,12 @@ def agent(
     # одно правило записано в двух местах и разъедется при первой правке.
     config.params.apply_defaults(AGENT_COMMAND)
 
-    shell = AgentShell(config)
+    # Какие local-параметры заданы флагами явно — они бьют файл сессии при
+    # подхвате state (приоритет «флаг > файл > дефолт реестра»).
+    explicit = frozenset(
+        name for name, value in (("mode", mode), ("done", done)) if value is not None
+    )
+    shell = AgentShell(config, explicit=explicit)
     if config.verbose:
         counter_name = shell.counter.name if shell.counter else "нет"
         console.note(
