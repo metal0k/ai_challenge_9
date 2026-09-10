@@ -707,6 +707,22 @@ sanitised specification lives in `specs/SPEC.md`.
 
 ## Working conventions
 
+- **Every day's first implementation is followed by a code-review/fixes cycle
+  before the recording — this is a step of the day, not an optional extra.**
+  Green tests are not the gate: Day 08 shipped 713 passing tests, a clean
+  `ruff`, and a successful dry-run, and a review then found 15 distinct
+  defects — three of them visible on camera (a doubled table header, a
+  literal `None` in the footer, two numbers on screen that could not be
+  reconciled), plus one real bug where a session's window override leaked
+  into another session's file and survived a restart. None of them could have
+  gone red: the tests around the table flattened whitespace and searched for
+  substrings instead of counting, and the `no_network` fixture replaced the
+  only exact tokenizer with a double that counts anything. Run the review
+  against the day's diff on more than one axis (product code · tests ·
+  conformance to the spec and the task statement), then have the findings
+  adversarially verified before fixing — of 25 raw findings, 2 were refuted
+  by reading the code. The cycle costs under an hour and the alternative is
+  submitting the defect on video.
 - `specs/SPEC.md` is the agreed specification; `specs/TODO.md` is the live queue.
   Keep both current — the queue must survive a session restart.
 - **Every finished day gets a short report in `specs/reports/wNNdDD.md`**, written
