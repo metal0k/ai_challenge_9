@@ -114,6 +114,22 @@ def print_answer(result: CallResult, format_name: str | None) -> None:
     finish_answer()
 
 
+def _token_cell(value: int | None, estimate: int | None = None) -> str:
+    """Одно число в тройке tokens p/c/t: значение, оценка с тильдой или прочерк.
+
+    is_empty() пускает в эту ветку и usage вида {"total_tokens": N} без
+    prompt/completion (так отвечают локальные серверы) — тогда value is None
+    без оценки, и раньше сюда попадал буквальный None из f-строки: «tokens
+    None/None/51». Прочерк — то же правило проекта, что и у «tokens ?» строкой
+    ниже: неизвестно — не значит «ноль» и не значит слово None.
+    """
+    if value is not None:
+        return str(value)
+    if estimate is not None:
+        return f"~{estimate}"
+    return "—"
+
+
 def footer(result: CallResult, completion_estimate: int | None = None) -> None:
     """Телеметрия после ответа: модель, latency, токены, finish_reason, формат.
 
@@ -130,10 +146,10 @@ def footer(result: CallResult, completion_estimate: int | None = None) -> None:
     parts = [f"model {model}", f"{result.latency_ms} ms"]
     usage = result.usage
     if not usage.is_empty():
-        completion = usage.completion_tokens
-        if completion is None and completion_estimate is not None:
-            completion = f"~{completion_estimate}"
-        parts.append(f"tokens {usage.prompt_tokens}/{completion}/{usage.total_tokens}")
+        prompt = _token_cell(usage.prompt_tokens)
+        completion = _token_cell(usage.completion_tokens, completion_estimate)
+        total = _token_cell(usage.total_tokens)
+        parts.append(f"tokens {prompt}/{completion}/{total}")
     elif completion_estimate is not None:
         parts.append(f"tokens ~{completion_estimate} (оценка)")
     else:
@@ -181,7 +197,10 @@ def echo_input(text: str) -> None:
     stderr» держит редирект в файл чистым.
     """
     if len(text) > ECHO_LIMIT:
-        text = f"{text[:ECHO_LIMIT]}… (+{len(text) - ECHO_LIMIT} символов)"
+        # Полная длина ввода, а не длина отрезанного хвоста: в кадре важно
+        # знать, насколько огромен ввод целиком (CLAUDE.md: echo_input
+        # «называет вслух реальную длину»), а не сколько символов не влезло.
+        text = f"{text[:ECHO_LIMIT]}… (всего {len(text)} символов)"
     err.print(text, markup=False, highlight=False)
 
 

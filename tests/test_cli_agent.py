@@ -876,6 +876,22 @@ def test_explicit_flag_beats_the_mode_from_the_file(monkeypatch, tmp_path, capsy
     assert "подхвачен целевой диалог" not in _flat(capsys.readouterr().err)
 
 
+def test_explicit_local_flags_names_only_the_flags_actually_passed():
+    """Приоритет «флаг > файл > дефолт» решает это множество. До отдельной
+    функции его строил блок кода прямо внутри agent() — typer-команды, прямой
+    вызов которой в обход Typer оставляет непереданные параметры объектами
+    typer.Option(), а не их значениями, и проверить построение множества
+    можно было только через CliRunner (ревью w02d08, НАХОДКА 7)."""
+    assert cli._explicit_local_flags(mode=None, done=None, context_limit=None) == frozenset()
+    assert cli._explicit_local_flags(mode="dialog", done=None, context_limit=None) == {"mode"}
+    assert cli._explicit_local_flags(mode=None, done=None, context_limit=2500) == {"context_limit"}
+    assert cli._explicit_local_flags(mode="chat", done="text:X", context_limit=1) == {
+        "mode",
+        "done",
+        "context_limit",
+    }
+
+
 def test_done_flip_is_persisted_to_the_session_file(monkeypatch, tmp_path):
     """Завершённый эпизод не воскресает: save в _dialog_progress стоит ПОСЛЕ
     flip'а mode→chat, иначе файл при выходе сразу после done хранил бы
@@ -1387,6 +1403,58 @@ def test_explicit_context_limit_flag_beats_the_session_file(monkeypatch, tmp_pat
     assert second.agent.context_limit == 99
 
 
+def test_session_switch_lifts_an_override_when_the_target_file_says_none(monkeypatch, tmp_path):
+    """Переключение в сессию, где context_limit явно `null` в файле, обязано
+    снять override — иначе он переживает переключение (ревью w02d08, НАХОДКА
+    1: _apply_session_state раньше реагировала только на int, и явный None
+    (ровно то, что пишет _save_state для сессии без override) молча
+    пропускала, оставляя override чужой сессии в силе)."""
+    work = Session.new("work", directory=tmp_path)
+    work.state["context_limit"] = None
+    work.save()
+    shell = _shell(monkeypatch, tmp_path, context_limit=2500)
+
+    cli._dispatch("/set session work", shell)
+
+    assert shell.config.params.context_limit is None
+    assert shell.agent.context_limit == CARD_LIMIT
+
+
+def test_session_switch_applies_the_target_files_override(monkeypatch, tmp_path):
+    """Обратная сторона: собственный override целевой сессии применяется при
+    переключении — без этого теста удаление пересчёта
+    `shell.agent.context_limit = shell.effective_context_limit()` в
+    _switch_session не ловилось ни одним тестом (ревью w02d08, НАХОДКА 1)."""
+    work = Session.new("work", directory=tmp_path)
+    work.state["context_limit"] = 9000
+    work.save()
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/set session work", shell)
+
+    assert shell.config.params.context_limit == 9000
+    assert shell.agent.context_limit == 9000
+
+
+@pytest.mark.parametrize("bad_value", [0, True])
+def test_session_file_with_a_bad_context_limit_warns_and_keeps_the_card_window(
+    monkeypatch, tmp_path, capsys, bad_value
+):
+    """Негодное значение в файле не роняет старт: warn в stderr, лимит остаётся
+    из карточки — та же дисциплина, что уже проверена для mode (ревью w02d08,
+    НАХОДКА 1). `True` отдельно от `0`: `isinstance(x, int)` пропускает bool
+    молча, если его не исключить явно — та же ловушка, что у dialog_turns."""
+    session = Session.new("default", directory=tmp_path)
+    session.state = {"context_limit": bad_value}
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.context_limit == CARD_LIMIT
+    stderr = _flat(capsys.readouterr().err)
+    assert f"негодное context_limit={bad_value!r}" in stderr
+
+
 def test_new_keeps_the_context_limit_state(monkeypatch, tmp_path):
     """`/new` стирает содержимое разговора, а не настройки: override — часть
     state, как mode/done, и clear() его не трогает (SPEC-w02d08.md §4)."""
@@ -1468,6 +1536,19 @@ def test_tokens_growth_table_shows_cumulative_totals(monkeypatch, tmp_path, caps
     assert "2 521 130 1149" in table
 
 
+def test_tokens_growth_table_header_prints_once(monkeypatch, tmp_path, capsys):
+    """`Table` печатает именованные колонки сама (show_header=True по
+    умолчанию); поверх этого стоял ручной add_row тем же текстом — шапка
+    рисовалась дважды, и это был главный визуальный артефакт дня, в кадре
+    шагов 1-3 демо (ревью w02d08, НАХОДКА 3)."""
+    _seed_turns(tmp_path, [Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15)])
+    shell = _shell(monkeypatch, tmp_path)
+
+    table = _tokens_table(shell, capsys)
+
+    assert table.count("накопительно") == 1
+
+
 def test_tokens_growth_table_derives_total_from_parts(monkeypatch, tmp_path, capsys):
     """Сервер может не прислать total — тогда он складывается из prompt+completion,
     а строка не превращается в прочерки."""
@@ -1493,6 +1574,34 @@ def test_tokens_growth_table_dashes_a_turn_without_usage(monkeypatch, tmp_path, 
     assert "2 — — —" in table
     # Первый ход при этом посчитан: прочерки не заразны для соседней строки.
     assert "1 10 5 15" in table
+
+
+def test_tokens_growth_table_notes_turns_missing_from_the_cumulative_total(
+    monkeypatch, tmp_path, capsys
+):
+    """Ход без usage выпадает из «накопительно» молча — без отдельной строки
+    последняя видимая сумма выглядит точным итогом сессии, хотя минимум
+    одного хода в ней нет (ревью w02d08, НАХОДКА 4)."""
+    _seed_turns(
+        tmp_path,
+        [Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15), None],
+    )
+    shell = _shell(monkeypatch, tmp_path)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "в накопительном итоге не учтено ходов: 1" in table
+
+
+def test_tokens_growth_table_says_there_are_no_turns_yet(monkeypatch, tmp_path, capsys):
+    """Ветка исполнялась старыми тестами (сессия без ходов), но её сообщение
+    не утверждал ни один — пропажа прошла бы незамеченной (ревью w02d08,
+    НАХОДКА 6)."""
+    shell = _shell(monkeypatch, tmp_path)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "ходов с ответами в сессии ещё нет" in table
 
 
 def test_tokens_growth_table_trims_to_the_last_30_turns(monkeypatch, tmp_path, capsys):
@@ -1535,6 +1644,39 @@ def test_footer_estimates_completion_when_usage_is_missing(monkeypatch, tmp_path
     stderr = _flat(capsys.readouterr().err)
     assert "tokens ~" in stderr
     assert "(оценка)" in stderr
+
+
+def test_completion_estimate_works_with_a_counter_that_refuses_assistant_role(
+    monkeypatch, tmp_path, capsys
+):
+    """MistralCounter отказывается кодировать сообщение с role=assistant вовсе
+    (count() возвращает None, замер 2026-09-07) — на точном токенизаторе
+    оценка ответа формой role=assistant молча деградировала бы в «tokens ?»
+    ровно там, где SPEC §6 обещает «~N» (ревью w02d08, НАХОДКА 2). Текст
+    ответа обязан кодироваться формой role=user."""
+
+    class _RefusesAssistantRole:
+        exact = True
+        name = "точный-двойник"
+
+        def count(self, messages):
+            if any(m["role"] == "assistant" for m in messages):
+                return None
+            return sum(len(m["content"]) for m in messages)
+
+        def calibrate(self, messages, prompt_tokens):
+            return None
+
+    monkeypatch.setattr(cli, "counter_for", lambda model, **kwargs: (_RefusesAssistantRole(), None))
+    shell = _shell(
+        monkeypatch, tmp_path, complete=_complete(["ответ подлиннее нуля"], usage=Usage())
+    )
+
+    cli._turn(shell, "вопрос")
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "tokens ~" in stderr
+    assert "tokens ?" not in stderr
 
 
 def test_footer_keeps_the_question_mark_without_a_counter(monkeypatch, tmp_path, capsys):

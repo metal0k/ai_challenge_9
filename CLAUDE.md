@@ -306,6 +306,48 @@ target must be varied, e.g. numbered phrases), and a piped input line of
 why `console.echo_input()` truncates at `ECHO_LIMIT` and says the real
 length aloud.
 
+**A Rich `Table` with named columns already prints its header — adding the
+same words as a row prints it twice.** `_print_growth_table()` did both, so
+the day's headline artefact carried a doubled header through a dry-run and
+into the demo plan unnoticed. Every test around it flattened whitespace and
+searched for substrings (`"1 412 86 498"`), which a duplicated header does
+not disturb — the assertion that catches this is a *count*
+(`table.count("накопительно") == 1`), not a membership check. Rich's
+`show_header` defaults to `True`; a manual header row is right only together
+with `show_header=False`, which is what the summary table two screens up was
+already doing.
+
+**In a session file, "key present and `null`" and "key absent" are different
+facts, and reading only `isinstance(int)` collapses them.** Day 08's
+`_save_state` writes `"context_limit": null` for a session with no override —
+an explicit statement that the override is off. `_apply_session_state`
+applied the value only when it was an `int`, so switching from a session with
+`--context-limit 2500` into a clean one kept the 2500, recomputed the agent's
+limit from it, and the next `_save_state` wrote 2500 into the *other*
+session's file, where it survived a restart. Three outcomes, not two: absent
+→ leave what is loaded (the w02d06/w02d07 files predate the key), `null` →
+lift the override, `int` → apply it. Anything else (`True` included, since
+`bool` is an `int`) now warns instead of passing silently.
+
+**A test fixture that replaces the only real implementation with a permissive
+double cannot fail on the real one's refusals.** `_completion_estimate()`
+counted the reply as `[{"role": "assistant", …}]`; the exact tokenizer
+refuses that shape and returns `None` — the same refusal already documented
+next to `_next_context_tokens()` — so the "~N" estimate SPEC §6 promises was
+dead on every model with an exact counter. No test could see it: the
+`no_network` fixture swaps `counter_for` for an `EstimateCounter` that counts
+any shape. The estimate now counts the text as a user message minus the empty
+user message's template overhead, and the test drives a double that
+reproduces the refusal rather than one that tolerates everything.
+
+**`logs/record_last.log` is not proof that a take is complete.** On the
+w02d08 recording the PowerShell transcript held only the last demo step,
+while the video had all four — the transcript is written by the host and
+loses output a child process sends straight to the console. What settles it
+is the file itself: `ffmpeg -ss <t> -i <mp4> -frames:v 1 out.png` at a few
+timestamps, read as images. PNG frames read fine here, unlike the JPG
+screenshots of Day 07 that resolved to CDN links.
+
 **REPL pickers must be tty-gated.** The interactive choices behind bare
 `/model` and `/set` (and the model picker at startup) run only when
 `sys.stdin.isatty()`: the demo harness drives stdin through a pipe, and an

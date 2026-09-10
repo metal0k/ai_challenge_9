@@ -88,6 +88,10 @@ NON_CHAT_PARAMS = {
     "temps": "temp",
     "models": "bench",
     "session": "adventagent (неделя 02)",
+    # Override лимита окна (день 08, SPEC-w02d08.md §4): решает только trim
+    # у агента, REPL недели 01 его вообще не читает — без этой строки /set
+    # context_limit молча «принимался» бы, как раньше молчал session.
+    "context_limit": "adventagent (неделя 02)",
 }
 
 REPL_COMMANDS = [

@@ -453,6 +453,30 @@ def test_run_step_writes_stdin_file_after_stdin_lines_as_one_line(monkeypatch, t
     assert written == ["/set context_limit default\n", "ГИГАНТСКАЯ-СТРОКА-БЕЗ-ПЕРЕВОДОВ\n"]
 
 
+def test_run_step_writes_stdin_file_when_there_are_no_stdin_lines(monkeypatch, tmp_path):
+    """Условие в _run_step — `not step.stdin_lines and not step.stdin_file` —
+    зовёт subprocess.run() только когда ОБА пусты. Оба теста stdin_file выше
+    задают ещё и stdin_lines, так что вторая половина условия («и нет
+    stdin_file») ни разу не проверялась с пустыми stdin_lines: Step с одним
+    только stdin_file обязан всё равно попасть в REPL-ветку (Popen с пайпом),
+    а не в subprocess.run() без stdin вовсе."""
+    (tmp_path / "biginput.txt").write_text("ТОЛЬКО-ФАЙЛ-БЕЗ-СТРОК", encoding="utf-8")
+    written: list[str] = []
+    _fake_popen(monkeypatch, written)
+    monkeypatch.setattr(record_mod, "PROJECT_ROOT", tmp_path)
+
+    record_mod._run_step(
+        record_mod.Step(
+            title="только файл",
+            module="week_02.cli",
+            args=["--session", "demo08"],
+            stdin_file="biginput.txt",
+        )
+    )
+
+    assert written == ["ТОЛЬКО-ФАЙЛ-БЕЗ-СТРОК\n"]
+
+
 def test_run_step_refuses_a_missing_stdin_file(monkeypatch, tmp_path):
     """Файл пишет шаг-генератор: его отсутствие — поломка сценария, и читать
     её надо по имени, а не traceback'ом FileNotFoundError."""

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from advent_core.client import capabilities_of, chat_models, find_model
@@ -10,12 +13,14 @@ from advent_core.params import (
     BENCH_COMMAND,
     CHAT_COMMAND,
     SOLVE_COMMAND,
+    SPECS,
     STRATEGIES,
     STRATEGY_CHOICES,
     GenerationParams,
     ParamError,
     defaults_for,
 )
+from week_01 import cli as w01_cli
 
 REASONING = {"completion_chat": True, "reasoning": True, "vision": True}
 NO_REASONING = {"completion_chat": True, "reasoning": False, "completion_fim": True}
@@ -390,3 +395,44 @@ def test_bench_default_ladder_is_copied_not_shared():
     second.apply_defaults(BENCH_COMMAND)
 
     assert "codestral-latest" not in second.models
+
+
+# --------------------------------------------------------------------------
+# NON_CHAT_PARAMS (week_01/cli.py) — параметр реестра, который REPL недели 01
+# молча принимает и ни на что не тратит, должен либо реально читаться кодом
+# недели 01, либо быть в этом списке (находка ревью, повторившаяся трижды:
+# problem/runs, потом session, потом context_limit).
+# --------------------------------------------------------------------------
+
+
+def test_non_chat_params_names_are_known_local_specs():
+    """Запись в NON_CHAT_PARAMS про несуществующее или НЕ-локальное имя —
+    мёртвый груз: API-параметры (temperature и т.п.) уходят в payload целиком
+    и не нуждаются в этом предупреждении вовсе."""
+    local_names = {spec.name for spec in SPECS if spec.local}
+    unknown = set(w01_cli.NON_CHAT_PARAMS) - local_names
+    assert unknown == set()
+
+
+def test_every_local_param_is_read_by_week01_or_listed_in_non_chat_params():
+    """Замыкает дыру, из-за которой context_limit (день 08) тихо принимался
+    REPL'ом недели 01 без предупреждения — та же дыра, что раньше была у
+    session и до него у problem/runs.
+
+    «Читается» проверяется не по второй ручной копии NON_CHAT_PARAMS (тогда
+    тест был бы тавтологией и не мог покраснеть), а по исходнику
+    week_01/cli.py: ищем обращение вида `params.<имя>`, которым REPL реально
+    трогает session.config.params.<имя>. Не покрывает не-локальные параметры
+    (temperature, top_p, …) — они уходят в payload целиком через
+    GenerationParams.as_payload(), а не по отдельному имени, так что для них
+    этой проверки не нужно и NON_CHAT_PARAMS про них не заводится.
+    """
+    source = Path(w01_cli.__file__).read_text(encoding="utf-8")
+    missing = [
+        spec.name
+        for spec in SPECS
+        if spec.local
+        and spec.name not in w01_cli.NON_CHAT_PARAMS
+        and re.search(rf"\bparams\.{re.escape(spec.name)}\b", source) is None
+    ]
+    assert missing == []

@@ -8,11 +8,25 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    """Снимает ANSI-подсветку Rich.
+
+    Rich красит числа своим highlighter'ом, и при FORCE_COLOR в окружении
+    (его выставляют CI и часть терминалов) цвет доезжает даже до capsys:
+    сравнение полей рвётся на покрашенном числе вместо голого. Проверяется
+    содержимое строки, а не то, покрашена ли она.
+    """
+    return _ANSI.sub("", text)
 
 
 def _load_module():
@@ -83,11 +97,47 @@ def test_build_text_surfaces_uncountable_text():
         make_biginput.build_text(_broken, 100)
 
 
+def _fragments_in(phrase: str) -> tuple[str, ...]:
+    """Фрагменты пула, реально обнаруженные в теле фразы (после «n) »).
+
+    Не переигрывает формулу индексов _phrase() — просто ищет, какие строки
+    пула входят в текст. Так тест ловит именно то, ради чего заведён пул:
+    лексическое разнообразие тела фразы, а не различие числового префикса,
+    которое делает строки разными само по себе безо всякого разнообразия
+    (прежняя версия теста сравнивала строки целиком и не заметила бы, стань
+    все три фрагмента одинаковыми).
+    """
+    remainder = phrase.split(") ", 1)[1]
+    return tuple(f for f in make_biginput.FRAGMENTS if f in remainder)
+
+
 def test_phrase_pool_is_large_and_compositions_differ():
     # Монотонный повтор BPE сожмёт в горсть токенов (PROBE, факт 4): пул фраз
-    # обязан быть большим, а соседние фразы — не повторять друг друга.
+    # обязан быть большим, а композиция из трёх фрагментов — реально меняться
+    # от фразы к фразе, а не только номер в начале строки.
     assert len(make_biginput.FRAGMENTS) >= 30
-    assert len({make_biginput._phrase(n) for n in range(1, 50)}) == 49
+
+    compositions = [_fragments_in(make_biginput._phrase(n)) for n in range(1, 50)]
+    distinct = {frozenset(c) for c in compositions}
+    used = {fragment for c in compositions for fragment in c}
+
+    # Хвост от 49 — модульная арифметика _phrase() изредка выбирает один и тот
+    # же фрагмент дважды в одной фразе, и это ожидаемо; порог существенно
+    # ниже 49, но существенно выше «все композиции совпали».
+    assert len(distinct) >= 30, "композиции фрагментов почти не меняются от фразы к фразе"
+    # Пул должен реально быть в деле, а не наполовину простаивать.
+    assert len(used) >= len(make_biginput.FRAGMENTS) - 2, "пул фрагментов задействован не весь"
+
+
+def test_biginput_file_path_agrees_with_the_generators_default_out():
+    """record._BIGINPUT_FILE (шаг 4б) и make_biginput.DEFAULT_OUT (шаг 4а,
+    записывает файл) обязаны указывать на один и тот же путь — иначе 4б подаст
+    в агента не тот файл, который написал 4а. Ничего это раньше не сверяло:
+    оба места жили каждое своей константой."""
+    from advent_cli import record as record_mod
+
+    expected = (record_mod.PROJECT_ROOT / record_mod._BIGINPUT_FILE).resolve()
+    assert make_biginput.DEFAULT_OUT.resolve() == expected
 
 
 # --- проводка main(): stderr/stdout, файл, код возврата ---------------------
@@ -128,14 +178,14 @@ def test_main_writes_single_line_file_and_prints_three_numbers(monkeypatch, tmp_
     assert "\n" not in text
     assert len(text) // 4 >= 1000 + 3000  # окно + дефолтный margin
 
-    captured = capsys.readouterr()
+    printed = _plain(capsys.readouterr().out)
     # Три числа — в stdout, при точном счётчике без тильды.
-    fields = captured.out.split()
+    fields = printed.split()
     assert fields[1] == str(len(text))  # символов
     assert fields[3] == str(len(text) // 4)  # токенов
     assert fields[6] == "1000"  # лимит окна
-    assert "~" not in captured.out
-    assert captured.out.count("\n") == 1  # одна строка, без хвоста
+    assert "~" not in printed
+    assert printed.count("\n") == 1  # одна строка, без хвоста
 
 
 def test_main_marks_estimate_with_tilde_but_still_writes(monkeypatch, tmp_path, capsys):
@@ -143,7 +193,7 @@ def test_main_marks_estimate_with_tilde_but_still_writes(monkeypatch, tmp_path, 
     assert code == 0
     assert out.exists()
     captured = capsys.readouterr()
-    assert "~" in captured.out
+    assert "~" in _plain(captured.out)
     # Предупреждение об оценке — в stderr, продукт (числа) не замусорен.
     assert "нет точного токенизатора" in captured.err
 
@@ -160,3 +210,74 @@ def test_main_rejects_non_positive_margin(monkeypatch, tmp_path):
     monkeypatch.setattr(make_biginput, "window_for", lambda model: 1000)
     with pytest.raises(SystemExit):
         make_biginput.main(["--margin", "0"])
+
+
+# main() отказывает четырьмя путями; выше проверены успех, отсутствие окна и
+# argparse-ошибка margin. Ниже — оставшиеся три: счётчик, который не считает,
+# и оба исключения из window_for(). Сети в них нет: window_for и counter_for
+# подставные, как и во всех тестах main() выше.
+
+
+def test_main_reports_uncountable_text_as_exit_code_1(monkeypatch, tmp_path, capsys):
+    """RuntimeError из build_text (счётчик молчит вместо числа) должна дойти
+    до кода 1 — эта ветка main() раньше не проверялась ни одним тестом."""
+    monkeypatch.setattr(make_biginput, "window_for", lambda model: 1000)
+
+    class _BrokenCounter:
+        exact = True
+        name = "broken"
+
+        def count(self, messages):
+            return None
+
+    monkeypatch.setattr(
+        make_biginput.tokens,
+        "counter_for",
+        lambda model, on_notice=None: (_BrokenCounter(), None),
+    )
+    out = tmp_path / "x.txt"
+
+    code = make_biginput.main(["--model", "fake-model", "--out", str(out)])
+
+    assert code == 1
+    assert not out.exists()
+    assert "не смог посчитать" in capsys.readouterr().err
+
+
+def test_main_reports_config_error_as_exit_code_2(monkeypatch, tmp_path, capsys):
+    """window_for() читает Config.resolve() — конфигурационная ошибка (ключ,
+    .env) обязана давать код 2 и человеческий текст, не traceback."""
+
+    def _broken_window_for(model: str) -> int | None:
+        raise make_biginput.ConfigError("нет ключа API — читается из .env")
+
+    monkeypatch.setattr(make_biginput, "window_for", _broken_window_for)
+    out = tmp_path / "x.txt"
+
+    code = make_biginput.main(["--out", str(out)])
+
+    assert code == 2
+    assert not out.exists()
+    assert "нет ключа API" in capsys.readouterr().err
+
+
+def test_main_propagates_the_exit_code_of_an_advent_error(monkeypatch, tmp_path, capsys):
+    """window_for() ходит в живой API (list_models) — сетевая/серверная
+    ошибка приходит как AdventError с СВОИМ exit_code (errors.py: 3 auth, 4
+    rate limit, 5 server, 6 network), и main() обязан отдать именно его, а не
+    захардкоженную единицу."""
+
+    class _KnownExitError(make_biginput.AdventError):
+        exit_code = 6
+
+    def _broken_window_for(model: str) -> int | None:
+        raise _KnownExitError("сеть недоступна")
+
+    monkeypatch.setattr(make_biginput, "window_for", _broken_window_for)
+    out = tmp_path / "x.txt"
+
+    code = make_biginput.main(["--out", str(out)])
+
+    assert code == 6
+    assert not out.exists()
+    assert "сеть недоступна" in capsys.readouterr().err

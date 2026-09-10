@@ -353,17 +353,17 @@ class AgentShell:
             )
 
     def _apply_session_state(self, session: Session, *, check_explicit: bool) -> bool:
-        """Применяет служебное состояние сессии: mode/done и счётчик диалога.
+        """Применяет служебное состояние сессии: mode/done, счётчик диалога, override окна.
 
         Возвращает True, если из файла подхвачен режим dialog (вызывающий код
         анонсирует это после создания агента). Файлу не доверяем: каждое
         значение идёт через params.set() — валидация choices достаётся бесплатно,
         — а не подходящее значение предупреждает и пропускается, а не падает.
 
-        `check_explicit` — только для старта: явный флаг --mode/--done бьёт
-        файл. При переключении в существующую сессию (`/session`, `/new`)
-        explicit не проверяется: это «продолжить тот разговор как оставили»,
-        а флаг был про старт этого запуска.
+        `check_explicit` — только для старта: явный флаг --mode/--done/
+        --context-limit бьёт файл. При переключении в существующую сессию
+        (`/session`, `/new`) explicit не проверяется: это «продолжить тот
+        разговор как оставили», а флаг был про старт этого запуска.
         """
         resumed_dialog = False
         for name in ("mode", "done"):
@@ -387,10 +387,23 @@ class AgentShell:
         self.dialog_turns = (
             turns if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0 else 0
         )
-        if not (check_explicit and "context_limit" in self.explicit):
-            raw_limit = session.state.get("context_limit")
-            # bool исключён той же причиной, что выше: True — не лимит окна.
-            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool):
+        # Три исхода, не два. Ключа нет вовсе — файлы сессий тегов w02d06/
+        # w02d07, где context_limit никогда не писался: молчим и оставляем
+        # текущее значение, та же дисциплина, что у mode/done выше. Ключ есть
+        # и None — это ЧЕСТНЫЙ «override снят» (именно так его пишет
+        # _save_state), и не различать это с «ключа нет» значило бы, что
+        # override одной сессии переживает переключение на сессию, где
+        # override явно снят.
+        if (
+            not (check_explicit and "context_limit" in self.explicit)
+            and "context_limit" in session.state
+        ):
+            raw_limit = session.state["context_limit"]
+            # None и int-не-bool идут через ту же set(): "none"/значение
+            # разбирает один код, а не два параллельных пути.
+            if raw_limit is None or (
+                isinstance(raw_limit, int) and not isinstance(raw_limit, bool)
+            ):
                 try:
                     self.config.params.set("context_limit", raw_limit)
                 except ParamError as error:
@@ -398,6 +411,13 @@ class AgentShell:
                         f"в файле сессии {session.name} негодное "
                         f"context_limit={raw_limit!r} — игнор: {error}"
                     )
+            else:
+                # bool (True/False) и прочий мусор — не лимит окна и не
+                # «снято»: isinstance(int) молча пропускал бы True без
+                # единого слова (bool — подкласс int в Python).
+                console.warn(
+                    f"в файле сессии {session.name} негодное context_limit={raw_limit!r} — игнор"
+                )
         return resumed_dialog
 
     def save(self) -> None:
@@ -686,12 +706,25 @@ def _completion_estimate(shell: AgentShell, reply: AgentReply) -> int | None:
     LM Studio в стриме usage не присылает вовсе (TODO №2), и футер деградировал
     бы в «?». Оценка всегда с тильдой — её ставит footer (SPEC-w02d08.md §6);
     счётчика нет — честный «?», притворяться нечем.
+
+    Текст ответа кодируется формой role=user, а не role=assistant: точный
+    токенизатор (MistralCounter) отказывается считать сообщение с
+    role=assistant вовсе — count() возвращает None (тот же отказ, что уже
+    задокументирован у _next_context_tokens), и на модели с точным счётом
+    оценка ответа молча деградировала бы в «?» ровно там, где SPEC §6 обещает
+    «~N». Оверхед шаблона чата (system-токены, спецсимволы) вычитается тем же
+    приёмом, что и в _next_context_tokens, — иначе он считался бы частью
+    длины ответа.
     """
     if reply.result.usage.completion_tokens is not None:
         return None
     if shell.counter is None:
         return None
-    return shell.counter.count([{"role": "assistant", "content": reply.text}])
+    with_text = shell.counter.count([{"role": "user", "content": reply.text}])
+    overhead = shell.counter.count([{"role": "user", "content": ""}])
+    if with_text is None or overhead is None:
+        return None
+    return max(0, with_text - overhead)
 
 
 def _token_panel(shell: AgentShell, reply: AgentReply) -> None:
@@ -1188,7 +1221,10 @@ def _print_growth_table(shell: AgentShell) -> None:
     total_tokens (или prompt+completion, когда total сервер не прислал): история
     пересылается целиком, и именно эта колонка показывает, как «стоимость
     диалога в токенах» растёт квадратично его длине. Ход без usage — прочерки:
-    «неизвестно» не становится нулём ни в одной колонке.
+    «неизвестно» не становится нулём ни в одной колонке — и, раз хоть один
+    такой ход пропущен, накопительная сумма после него уже не полная, о чём
+    отдельная строка говорит после таблицы: молчание превратило бы неполный
+    итог в мнимо точный.
     """
     turns = [turn for turn in shell.session.turns if turn.role == ROLE_ASSISTANT]
     if not turns:
@@ -1197,33 +1233,50 @@ def _print_growth_table(shell: AgentShell) -> None:
 
     rows: list[tuple[int, str, str, str]] = []
     cumulative = 0
+    # Ходов, не вошедших в «накопительно», — считаем отдельно: их отсутствие
+    # называется вслух после таблицы, а не молчаливо теряется в последней
+    # видимой сумме (НАХОДКА 4 ревью w02d08).
+    missing = 0
     for number, turn in enumerate(turns, start=1):
         usage = turn.usage
         if usage is None or usage.is_empty():
+            missing += 1
             rows.append((number, "—", "—", "—"))
             continue
         prompt = usage.prompt_tokens
         completion = usage.completion_tokens
         total = usage.total_tokens
-        if total is None and prompt is not None and completion is not None:
+        if total is None:
+            # Ветки «total не пришёл, а prompt или completion тоже нет» здесь
+            # нет — она недостижима. Usage.is_empty() (проверка выше) ложна
+            # только когда total_tokens пришёл, ИЛИ пришли prompt И
+            # completion оба сразу; раз total пуст, значит пришли оба —
+            # сложение всегда безопасно. Мёртвая ветка на этом месте молчала
+            # бы о невозможном случае вместо того, чтобы объяснить, почему
+            # его нет (НАХОДКА 5 ревью w02d08).
             total = prompt + completion
-        if total is not None:
-            cumulative += total
-            rows.append((number, _num(prompt), _num(completion), str(cumulative)))
-        else:
-            rows.append((number, _num(prompt), _num(completion), "—"))
+        cumulative += total
+        rows.append((number, _num(prompt), _num(completion), str(cumulative)))
 
-    table = Table(box=None, padding=(0, 2, 0, 0))
+    # header_style, а не ручной add_row поверх именованных колонок: у Rich
+    # show_header=True по умолчанию, и колонки уже печатают шапку сами —
+    # add_row тем же текстом рисовал вторую строку заголовка под первой
+    # (проверено рендером, артефакт в кадре шагов 1-3 демо).
+    table = Table(box=None, padding=(0, 2, 0, 0), header_style="dim")
     table.add_column("ход", justify="right", style="cyan", no_wrap=True)
     table.add_column("prompt", justify="right")
     table.add_column("completion", justify="right")
     table.add_column("накопительно", justify="right")
-    table.add_row("ход", "prompt", "completion", "накопительно", style="dim")
     for number, prompt, completion, total in rows[-GROWTH_TABLE_LIMIT:]:
         table.add_row(str(number), prompt, completion, total)
     console.err.print(table)
     if len(rows) > GROWTH_TABLE_LIMIT:
         console.note(f"… показаны последние {GROWTH_TABLE_LIMIT} из {len(rows)}")
+    if missing:
+        # Без этой строки последнее видимое «накопительно» выглядит точным
+        # итогом сессии, хотя не включает вклад ходов без usage — то же
+        # правило, что у «(без usage: N)» в /tokens и /sessions.
+        console.note(f"в накопительном итоге не учтено ходов: {missing}")
 
 
 def _switch_session(shell: AgentShell, name: str, *, fresh: bool = False) -> None:
@@ -1386,6 +1439,30 @@ def _check_local_param(name: str, value: object) -> None:
         validate_name(str(value))
 
 
+def _explicit_local_flags(
+    *, mode: str | None, done: str | None, context_limit: int | None
+) -> frozenset[str]:
+    """Имена local-параметров, заданных флагом запуска явно, а не файлом сессии.
+
+    Отдельная функция, а не блок кода внутри agent(): agent() — typer-команда,
+    прямой вызов которой в обход Typer оставляет непереданные параметры
+    объектами typer.Option(), а не их значениями, — и тестировать построение
+    приоритета «флаг > файл > дефолт» пришлось бы через CliRunner. Здесь же
+    сигнатура берёт только то, что реально решает исход (mode/done/
+    context_limit), и проверяется прямым вызовом (ревью w02d08, НАХОДКА 7: до
+    этой правки победу флага над файлом сессии не ловил ни один тест).
+    """
+    return frozenset(
+        name
+        for name, value in (
+            ("mode", mode),
+            ("done", done),
+            ("context_limit", context_limit),
+        )
+        if value is not None
+    )
+
+
 def _apply_local_flags(config: Config, **flags: object) -> None:
     """Кладёт локальные флаги в config.params той же машинерией, что и /set."""
     try:
@@ -1491,15 +1568,7 @@ def agent(
 
     # Какие local-параметры заданы флагами явно — они бьют файл сессии при
     # подхвате state (приоритет «флаг > файл > дефолт реестра»).
-    explicit = frozenset(
-        name
-        for name, value in (
-            ("mode", mode),
-            ("done", done),
-            ("context_limit", context_limit),
-        )
-        if value is not None
-    )
+    explicit = _explicit_local_flags(mode=mode, done=done, context_limit=context_limit)
     shell = AgentShell(config, explicit=explicit)
     if config.verbose:
         counter_name = shell.counter.name if shell.counter else "нет"
