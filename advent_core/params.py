@@ -54,6 +54,9 @@ AGENT_PARAMS: tuple[str, ...] = (
     "mode",
     "done",
     "max_turns",
+    # Override лимита окна (день 08): агент читает его при trim — без имени
+    # в этом списке /set context_limit в агенте отвергся бы как «не читается».
+    "context_limit",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -159,6 +162,18 @@ SPECS: tuple[Spec, ...] = (
         # десятку умеет только apply_defaults(). Без этой строки у агента
         # «default» означало бы «неизвестно».
         defaults={AGENT_COMMAND: 10},
+    ),
+    # День 08 (SPEC-w02d08.md §4): override лимита окна для trim. None —
+    # «из карточки модели». Локальный, потому что сервер знает только своё
+    # окно: клиентский override физически не может дать серверный 400
+    # (PROBE-w02d08-overflow.md §5), его читает один лишь агент.
+    Spec(
+        "context_limit",
+        "int",
+        "Лимит окна контекста в токенах (override карточки модели). Не задан — из карточки.",
+        1,
+        None,
+        local=True,
     ),
     Spec(
         "session",
@@ -373,6 +388,13 @@ class GenerationParams:
     done: str | None = None
     mode: str | None = None
     max_turns: int | None = 10
+
+    # Override лимита окна (день 08, SPEC-w02d08.md §4). None — «из карточки
+    # модели»: у агента свой контракт на None, чем у max_turns выше — там
+    # потребитель трактует None как 10, а здесь None означает «карточка».
+    # Умолчание команды не заводим: `/set context_limit default` обязан
+    # вернуть именно None, а не подменить его дефолтом через apply_defaults().
+    context_limit: int | None = None
 
     # Параметр агента (день 06): имя сессии на диске. Тоже локальный — в
     # payload не идёт, но живёт в общем реестре, потому что `/set session

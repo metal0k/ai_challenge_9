@@ -114,8 +114,15 @@ def print_answer(result: CallResult, format_name: str | None) -> None:
     finish_answer()
 
 
-def footer(result: CallResult) -> None:
-    """Телеметрия после ответа: модель, latency, токены, finish_reason, формат."""
+def footer(result: CallResult, completion_estimate: int | None = None) -> None:
+    """Телеметрия после ответа: модель, latency, токены, finish_reason, формат.
+
+    `completion_estimate` — локальная оценка ответа на случай, когда сервер
+    не прислал completion_tokens (LM Studio в стриме не присылает usage
+    вовсе, SPEC-w02d08.md §6). Оценка печатается с тильдой; нет и её —
+    честный «?» вместо молчания про токены: usage не пришёл — не значит
+    «нечего считать», ответ есть всегда.
+    """
     model = result.model_actual or result.model_requested
     if result.model_actual and result.model_actual != result.model_requested:
         model = f"{result.model_requested} → {result.model_actual}"
@@ -123,7 +130,14 @@ def footer(result: CallResult) -> None:
     parts = [f"model {model}", f"{result.latency_ms} ms"]
     usage = result.usage
     if not usage.is_empty():
-        parts.append(f"tokens {usage.prompt_tokens}/{usage.completion_tokens}/{usage.total_tokens}")
+        completion = usage.completion_tokens
+        if completion is None and completion_estimate is not None:
+            completion = f"~{completion_estimate}"
+        parts.append(f"tokens {usage.prompt_tokens}/{completion}/{usage.total_tokens}")
+    elif completion_estimate is not None:
+        parts.append(f"tokens ~{completion_estimate} (оценка)")
+    else:
+        parts.append("tokens ?")
     if result.truncated:
         parts.append("[yellow]ответ оборван[/yellow]")
 
@@ -154,12 +168,20 @@ def footer(result: CallResult) -> None:
         err.print(f"[dim] {'  ·  '.join(detail_bits)}[/dim]")
 
 
+# Потолок эха одной строки: гигантский ввод дня 08 (~700 КБ одной строкой)
+# при выводе целиком прокручивал бы терминал на тысячи строк шума — в кадре
+# важно, что ввод огромен, а не его текст. Реальная длина называется вслух.
+ECHO_LIMIT = 200
+
+
 def echo_input(text: str) -> None:
     """Эхо строки, поданной в stdin из скрипта записи.
 
     В stderr, а не в stdout: контракт «ответ модели — в stdout, служебное — в
     stderr» держит редирект в файл чистым.
     """
+    if len(text) > ECHO_LIMIT:
+        text = f"{text[:ECHO_LIMIT]}… (+{len(text) - ECHO_LIMIT} символов)"
     err.print(text, markup=False, highlight=False)
 
 

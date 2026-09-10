@@ -288,6 +288,24 @@ field parsing, so the old tagged build would declare every new file a foreign
 version and quarantine it to `.bak` — one run from an older tag, and the
 session is gone.
 
+**A client-side limit override cannot produce a server error — "show what
+breaks" needs a failure mode that actually fires.** Day 08's demo plan first
+had "disable trim, show the API's 400": but the overridden `context_limit`
+lives only in the agent, the API knows only its real window (262144 tokens
+for `ministral-14b-latest` — not 128k, checked against `/v1/models`), so the
+"broken" request would have returned 200. The shipped pair is honest:
+override shows *client-side* breakage (trim drops the codeword turn,
+`dropped_tokens` says so), and the server-side 400 comes from one genuinely
+over-window message. That 400 is fast and cheap (2.1 s, rejected before
+generation) and self-describing: `type: invalid_request_prompt_too_long`,
+message `"Prompt 267060 > 262144 maximum context length"` — `errors.py`
+parses both numbers out of it. Two probe corollaries: BPE compresses
+monotone text (`"а" * 700_000` is a handful of tokens — bulk text for a size
+target must be varied, e.g. numbered phrases), and a piped input line of
+~700 KB gets echoed into the terminal by the REPL's non-tty echo — which is
+why `console.echo_input()` truncates at `ECHO_LIMIT` and says the real
+length aloud.
+
 **REPL pickers must be tty-gated.** The interactive choices behind bare
 `/model` and `/set` (and the model picker at startup) run only when
 `sys.stdin.isatty()`: the demo harness drives stdin through a pipe, and an

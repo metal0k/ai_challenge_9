@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
+import re
+
 from advent_core.config import redact
+
+# Дискриминаторы серверного переполнения окна — живой замер 2026-09-09
+# (specs/PROBE-w02d08-overflow.md): тело 400 несёт type
+# "invalid_request_prompt_too_long" и message вида
+# "Prompt 267060 > 262144 maximum context length". Проверяем оба, потому что
+# формат тела не задокументирован и любой из двух маркеров может исчезнуть.
+_OVERFLOW_TYPE = "invalid_request_prompt_too_long"
+_OVERFLOW_MARKER = "maximum context length"
+_OVERFLOW_NUMBERS = re.compile(r"(\d+)\s*>\s*(\d+)")
 
 
 class AdventError(Exception):
@@ -54,6 +65,21 @@ class ConfigurationError(AdventError):
     exit_code = 2
 
 
+def _overflow_of(detail: str) -> tuple[int | None, int | None] | None:
+    """Вытаскивает из текста ошибки факт переполнения окна и его числа.
+
+    Возвращает (прислано, лимит) — любое из чисел может быть None, если
+    маркеры нашлись, а разобрать их не вышло. None на всю кортеж-обёртку
+    значит «это не переполнение», и 400 разбирается по обычной ветке.
+    """
+    if _OVERFLOW_TYPE not in detail and _OVERFLOW_MARKER not in detail:
+        return None
+    match = _OVERFLOW_NUMBERS.search(detail)
+    if match is None:
+        return (None, None)
+    return (int(match.group(1)), int(match.group(2)))
+
+
 def _status_of(exc: Exception) -> int | None:
     """Достаёт HTTP-статус из исключения SDK, не завязываясь на его класс.
 
@@ -92,6 +118,23 @@ def translate(exc: Exception) -> AdventError:
             hint="Посмотри доступные модели: advent w01 models",
         )
     if status == 400:
+        overflow = _overflow_of(detail)
+        if overflow is not None:
+            sent, limit = overflow
+            if sent is not None and limit is not None:
+                numbers = f": прислано {sent}, лимит {limit}"
+            else:
+                # Числа не разобрались — показываем сырой текст сервера,
+                # чтобы диагностика не превратилась в «что-то с окном».
+                numbers = f": {detail}"
+            return AdventError(
+                f"Запрос не влезает в окно модели{numbers}.",
+                hint=(
+                    "История пересылается целиком, поэтому повтор той же сессии "
+                    "снова не влезет: начни новую командой /new или уменьши "
+                    "ввод — например, сократи вставленный текст."
+                ),
+            )
         # Самая частая причина здесь — отказ модели от response_format
         # (format=json/schema): такой capability-флаг не отдаётся списком
         # моделей ни у одной из них (SPEC-w01d02.md §2, §6.4), поэтому

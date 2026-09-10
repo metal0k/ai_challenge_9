@@ -6,6 +6,7 @@ import pytest
 
 from advent_core.client import capabilities_of, chat_models, find_model
 from advent_core.params import (
+    AGENT_PARAMS,
     BENCH_COMMAND,
     CHAT_COMMAND,
     SOLVE_COMMAND,
@@ -335,6 +336,47 @@ def test_bench_default_ladder_comes_from_the_registry_not_from_the_cli():
         "ministral-14b-latest",
     ]
     assert defaults["runs"] == 3
+
+
+# --------------------------------------------------------------------------
+# kind="int" context_limit — override лимита окна (Day 08, SPEC-w02d08.md §4)
+# --------------------------------------------------------------------------
+
+
+def test_context_limit_parses_and_validates():
+    params = GenerationParams.build(context_limit="2500")
+    assert params.context_limit == 2500
+
+
+@pytest.mark.parametrize("raw", [0, -5, "0", "-5"])
+def test_context_limit_out_of_range_is_rejected(raw):
+    """Окно меньше одного токена — опечатка, а не «окно ноль»."""
+    with pytest.raises(ParamError):
+        GenerationParams.build(context_limit=raw)
+
+
+def test_context_limit_defaults_to_none_and_set_default_restores_none():
+    """None — «из карточки модели»: дефолт команды не подменяет его."""
+    params = GenerationParams()
+    assert params.context_limit is None
+    params.set("context_limit", "2500")
+    assert params.context_limit == 2500
+    assert params.set("context_limit", "default") is None
+    assert params.context_limit is None
+
+
+def test_context_limit_is_local_and_never_reaches_payload():
+    """Клиентский override окна серверу не нужен: сервер знает только своё."""
+    params = GenerationParams.build(context_limit=2500, temperature=0.5)
+    payload, skipped = params.as_payload(REASONING)
+    assert payload == {"temperature": 0.5}
+    assert skipped == []
+
+
+def test_context_limit_is_among_agent_params():
+    """Без имени в AGENT_PARAMS /set context_limit в агенте отвергся бы
+    как «не читается» — а агент читает его при trim."""
+    assert "context_limit" in AGENT_PARAMS
 
 
 def test_bench_default_ladder_is_copied_not_shared():

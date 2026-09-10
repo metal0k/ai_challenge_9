@@ -414,8 +414,8 @@ def test_params_shows_only_what_the_agent_reads(monkeypatch, tmp_path, capsys):
 # --- журнал -----------------------------------------------------------------
 
 
-def test_journal_is_written_with_week_2_and_day_7(monkeypatch, tmp_path):
-    """Литералы 2 и 7, а не cli.WEEK/cli.DAY: ожидание, взятое из того же
+def test_journal_is_written_with_week_2_and_day_8(monkeypatch, tmp_path):
+    """Литералы 2 и 8, а не cli.WEEK/cli.DAY: ожидание, взятое из того же
     источника, что и код под тестом, покраснеть не может (CLAUDE.md)."""
     logged: dict = {}
     monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: logged.update(kwargs))
@@ -424,7 +424,7 @@ def test_journal_is_written_with_week_2_and_day_7(monkeypatch, tmp_path):
     cli._turn(shell, "вопрос")
 
     assert logged["week"] == 2
-    assert logged["day"] == 7
+    assert logged["day"] == 8
 
 
 def test_journal_logs_what_actually_went_to_the_api(monkeypatch, tmp_path):
@@ -519,7 +519,7 @@ def test_defaults_come_from_the_registry_not_from_the_typer_signature():
     }
 
     signature = inspect.signature(cli.agent)
-    for name in ("session", "mode", "done", "max_turns"):
+    for name in ("session", "mode", "done", "max_turns", "context_limit"):
         assert signature.parameters[name].default.default is None, (
             f"{name}: умолчание записано литералом в сигнатуре typer"
         )
@@ -1298,3 +1298,251 @@ def test_model_command_with_a_typo_rolls_back_and_never_prompts(monkeypatch, tmp
     assert shell.config.model == "ministral-14b-latest"
     assert shell.card and shell.card["id"] == "ministral-14b-2512"
     assert "недоступна аккаунту" in _flat(capsys.readouterr().err)
+
+
+# --- день 08: override лимита окна, таблица роста, оценка ответа --------------
+#
+# Override (SPEC-w02d08.md §4) — инструмент демо про переполнение: лимит ниже
+# карточки заставляет trim сработать на десятке ходов, а не за окно 262144.
+# Приоритет «явный флаг > state сессии > карточка» — тот же порядок, что у
+# mode/done в дне 07.
+
+CARD_LIMIT = 128_000
+
+
+def test_startup_with_an_override_names_both_numbers(monkeypatch, tmp_path, capsys):
+    """Молча живущий заниженный лимит после перезапуска — ловушка, поэтому
+    старт с override называет оба числа: override и карточку."""
+    _shell(monkeypatch, tmp_path, context_limit=2500)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "лимит окна переопределён: 2500 (карточка: 128000)" in stderr
+
+
+def test_set_context_limit_applies_immediately_and_persists(monkeypatch, tmp_path, capsys):
+    """`/set context_limit` обязан вступить со следующего хода (trim идёт по
+    лимиту агента) и попасть в state сразу — save только после хода здесь не
+    случится никогда."""
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/set context_limit 2500", shell)
+
+    assert shell.agent.context_limit == 2500
+    assert "context_limit = 2500" in _flat(capsys.readouterr().err)
+    assert Session.load("default", directory=tmp_path).state["context_limit"] == 2500
+
+
+def test_set_context_limit_default_returns_the_card_window(monkeypatch, tmp_path):
+    """`default` — вернуть окно из карточки: в state честный None, а не ноль."""
+    shell = _shell(monkeypatch, tmp_path, context_limit=2500)
+
+    cli._dispatch("/set context_limit default", shell)
+
+    assert shell.agent.context_limit == CARD_LIMIT
+    assert Session.load("default", directory=tmp_path).state["context_limit"] is None
+
+
+def test_set_context_limit_rejects_non_positive_values(monkeypatch, tmp_path, capsys):
+    """Границы валидирует реестр (минимум 1): опечатка предупреждает, а не
+    ставит лимиту ноль — нулевое окно читалось бы как «обрезать всегда»."""
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/set context_limit 0", shell)
+    cli._dispatch("/set context_limit -5", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert stderr.count("не может быть меньше 1") == 2
+    assert shell.agent.context_limit == CARD_LIMIT
+    assert "context_limit" not in Session.load("default", directory=tmp_path).state
+
+
+def test_context_limit_survives_a_restart_with_a_note(monkeypatch, tmp_path, capsys):
+    """state переживает перезапуск (SPEC-w02d07 §4), и override подхватывается
+    с тем же note, что и при явном флаге: заниженное окно не должно жить
+    молча ни в одном из путей его появления."""
+    first = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/set context_limit 2500", first)
+    capsys.readouterr()
+
+    second = _shell(monkeypatch, tmp_path)
+
+    assert second.agent.context_limit == 2500
+    assert "лимит окна переопределён: 2500 (карточка: 128000)" in _flat(capsys.readouterr().err)
+
+
+def test_explicit_context_limit_flag_beats_the_session_file(monkeypatch, tmp_path):
+    """Приоритет «флаг > файл > карточка»: явный --context-limit на старте не
+    даёт override из сессии его перекрыть — явный выбор пользователя не наш,
+    чтобы его игнорировать (то же правило, что у --mode в дне 07)."""
+    first = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/set context_limit 2500", first)
+    assert Session.load("default", directory=tmp_path).state["context_limit"] == 2500
+
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+    second = cli.AgentShell(
+        _config(context_limit=99), directory=tmp_path, explicit=frozenset({"context_limit"})
+    )
+
+    assert second.config.params.context_limit == 99
+    assert second.agent.context_limit == 99
+
+
+def test_new_keeps_the_context_limit_state(monkeypatch, tmp_path):
+    """`/new` стирает содержимое разговора, а не настройки: override — часть
+    state, как mode/done, и clear() его не трогает (SPEC-w02d08.md §4)."""
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/set context_limit 2500", shell)
+
+    cli._dispatch("/new", shell)
+
+    assert shell.agent.context_limit == 2500
+    assert Session.load("default", directory=tmp_path).state["context_limit"] == 2500
+
+
+def test_model_switch_keeps_the_override_and_warns(monkeypatch, tmp_path, capsys):
+    """Override — явный выбор: смена модели его НЕ переопределяет, но молча
+    показывать лимит от чужой карточки нельзя — предупреждение называет оба
+    окна и путь назад."""
+    shell = _shell(monkeypatch, tmp_path, context_limit=2500)
+    capsys.readouterr()
+
+    cli._dispatch("/model ministral-3b-latest", shell)
+
+    assert shell.agent.context_limit == 2500
+    stderr = _flat(capsys.readouterr().err)
+    assert "не окно новой модели" in stderr
+    assert "32000" in stderr
+
+
+def test_context_label_marks_the_override_in_the_panel(monkeypatch, tmp_path, capsys):
+    """Футер при override показывает само слово, а не процент: «450/2500» после
+    недель жизни с честным окном читалось бы как поломка карточки."""
+    shell = _shell(monkeypatch, tmp_path, context_limit=2500)
+
+    cli._turn(shell, "вопрос")
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "контекст ~" in stderr
+    assert "/2500 (override)" in stderr
+
+
+def test_tokens_shows_both_window_numbers_under_override(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, context_limit=2500)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "2500 (override; карточка: 128000)" in table
+
+
+# --- /tokens: таблица роста (SPEC-w02d08.md §3) -------------------------------
+
+
+def _seed_turns(tmp_path, usages: list[Usage | None]) -> None:
+    """Сессия с готовыми usage — таблице роста нужна история, а не один ход."""
+    session = Session.new("default", directory=tmp_path)
+    for index, usage in enumerate(usages):
+        session.record(
+            f"вопрос {index}",
+            f"ответ {index}",
+            model="ministral-14b-latest",
+            usage=usage,
+        )
+    session.save()
+
+
+def test_tokens_growth_table_shows_cumulative_totals(monkeypatch, tmp_path, capsys):
+    """«накопительно» — сумма total_tokens по ходам: это и есть видимый рост
+    стоимости диалога, история пересылается целиком."""
+    _seed_turns(
+        tmp_path,
+        [
+            Usage(prompt_tokens=412, completion_tokens=86, total_tokens=498),
+            Usage(prompt_tokens=521, completion_tokens=130, total_tokens=651),
+        ],
+    )
+    shell = _shell(monkeypatch, tmp_path)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "1 412 86 498" in table
+    assert "2 521 130 1149" in table
+
+
+def test_tokens_growth_table_derives_total_from_parts(monkeypatch, tmp_path, capsys):
+    """Сервер может не прислать total — тогда он складывается из prompt+completion,
+    а строка не превращается в прочерки."""
+    _seed_turns(tmp_path, [Usage(prompt_tokens=100, completion_tokens=50)])
+    shell = _shell(monkeypatch, tmp_path)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "1 100 50 150" in table
+
+
+def test_tokens_growth_table_dashes_a_turn_without_usage(monkeypatch, tmp_path, capsys):
+    """Ход без usage — прочерки во всех трёх колонках: «неизвестно» не становится
+    нулём ни в одной из них (правило tokens.py)."""
+    _seed_turns(
+        tmp_path,
+        [Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15), None],
+    )
+    shell = _shell(monkeypatch, tmp_path)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "2 — — —" in table
+    # Первый ход при этом посчитан: прочерки не заразны для соседней строки.
+    assert "1 10 5 15" in table
+
+
+def test_tokens_growth_table_trims_to_the_last_30_turns(monkeypatch, tmp_path, capsys):
+    """Длинные сессии режутся, иначе таблица уезжает за экран: видны последние
+    30 ходов, а остаток называется строкой с общим числом."""
+    _seed_turns(
+        tmp_path,
+        [Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2)] * 31,
+    )
+    shell = _shell(monkeypatch, tmp_path)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "показаны последние 30 из 31" in table
+    # Видны ходы 2..31 (первый обрезан), накопительно у тридцать первого = 62.
+    # Регион после заголовка «накопительно» — чтобы цифры сводки выше таблицы
+    # не попали в разбор строк.
+    growth = table.split("накопительно", 1)[1]
+    rows = re.findall(r"(\d+) 1 1 (\d+)", growth)
+    assert rows[0] == ("2", "4")
+    assert rows[-1] == ("31", "62")
+    assert len(rows) == 30
+
+
+# --- футер: локальная оценка ответа при отсутствии usage (SPEC-w02d08.md §6) ---
+
+
+def test_footer_estimates_completion_when_usage_is_missing(monkeypatch, tmp_path, capsys):
+    """LM Studio в стриме usage не присылает: футер считает ответ локальным
+    счётчиком и помечает оценку тильдой — выдать её за точный счёт хуже, чем
+    не показать вовсе."""
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        complete=_complete(["ответ подлиннее, чтобы оценка была отличима от нуля"], usage=Usage()),
+    )
+
+    cli._turn(shell, "вопрос")
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "tokens ~" in stderr
+    assert "(оценка)" in stderr
+
+
+def test_footer_keeps_the_question_mark_without_a_counter(monkeypatch, tmp_path, capsys):
+    """Счётчика нет — притворяться нечем: честный «?», как и до дня 08."""
+    monkeypatch.setattr(cli, "counter_for", lambda model, **kwargs: (None, None))
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ок"], usage=Usage()))
+
+    cli._turn(shell, "вопрос")
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "tokens ?" in stderr

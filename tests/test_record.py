@@ -234,7 +234,7 @@ def test_demo_steps_raises_on_an_unknown_week_and_day():
     Пары держим всегда за пределами реализованных сценариев: (2, 7) стоял
     здесь как «несуществующий», и день 7, получив свой сценарий, сломал тест —
     сам по себе он ничего не проверял о дне 7."""
-    for week, day in ((2, 8), (3, 1), (1, 9)):
+    for week, day in ((2, 9), (3, 1), (1, 9)):
         with pytest.raises(AdventError):
             record_mod.demo_steps(week, day)
 
@@ -336,3 +336,136 @@ def test_rehearsal_for_week_01_is_unchanged():
 
     assert step.module == record_mod.DEFAULT_MODULE
     assert step.args == ["w01", "chat"]
+
+
+# --------------------------------------------------------------------------
+# Week 02, Day 08 (SPEC-w02d08.md §7): рост по ходам, override лимита,
+# серверное переполнение. Подача гигантского ввода — новое поле Step.stdin_file.
+# --------------------------------------------------------------------------
+
+
+def test_day_08_scenario_starts_from_a_new_demo08_session():
+    """Та же дисциплина, что test_week_02_scenario_starts_from_an_empty_session:
+    сессия подхватывается с диска, и без /new второй дубль уехал бы в историю
+    первого."""
+    first = record_mod.demo_steps(2, 8)[0]
+
+    assert first.stdin_lines[0] == "/new"
+    assert "--session" in first.args
+    assert "demo08" in first.args
+
+
+def test_day_08_scenario_covers_growth_override_and_server_overflow():
+    """SPEC-w02d08.md §7: сценарий обязан показать все три вещи дня — рост
+    токенов по ходам, переполнение через клиентский override и серверный 400
+    на гигантском вводе — и назвать их вслух (та же дисциплина, что у дней
+    04-06: метрика, посчитанная, но не названная, задание не закрывает)."""
+    titles = " ".join(step.title.lower() for step in record_mod.demo_steps(2, 8))
+
+    assert "/tokens" in titles
+    assert "рост" in titles
+    assert "context_limit" in titles
+    assert "trim" in titles
+    assert "400" in titles
+
+
+def test_day_08_giant_input_is_a_generator_step_plus_a_stdin_file_step():
+    """§7, шаг 4: сначала шаг-генератор пишет файл и печатает точный счёт,
+    потом шаг агента подаёт этот файл в stdin. Порядок несущий — 400 без
+    показанных чисел читался бы как магия, а не как следствие."""
+    steps = record_mod.demo_steps(2, 8)
+
+    generator = next(step for step in steps if step.module == "tools.make_biginput")
+    assert generator.stdin_file is None
+
+    last = steps[-1]
+    assert last.module == "week_02.cli"
+    assert last.stdin_file == record_mod._BIGINPUT_FILE
+    assert "/set context_limit default" in last.stdin_lines
+    # Гигантская строка — последнее, что уходит в stdin: закрытие за ней и
+    # есть выход (EOF), /exit после неё доехать бы не успел.
+    assert last.stdin_lines[-1].startswith("/set")
+
+
+def test_day_08_scenario_has_no_step_without_an_action():
+    steps = record_mod.demo_steps(2, 8)
+    assert steps, "день 08 остался без сценария"
+    # Действие шага — args, подаваемый ввод или сам запуск не дефолтного
+    # модуля (шаг-генератор идёт без аргументов: у make_biginput их нет).
+    assert all(
+        step.args or step.note or step.stdin_file or step.module != record_mod.DEFAULT_MODULE
+        for step in steps
+    ), "день 08: шаг без действия и без текста"
+
+
+class _FakeStdin:
+    """Принимает записи в список вместо настоящего пайпа."""
+
+    def __init__(self, written: list[str]):
+        self._written = written
+
+    def write(self, text: str) -> None:
+        self._written.append(text)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeProcess:
+    """Завершается сразу с кодом 0 — тесту нужен состав stdin, не запуск."""
+
+    def __init__(self, written: list[str]):
+        self.stdin = _FakeStdin(written)
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+def _fake_popen(monkeypatch, written: list[str]):
+    monkeypatch.setattr(
+        record_mod.subprocess, "Popen", lambda *args, **kwargs: _FakeProcess(written)
+    )
+    monkeypatch.setattr(record_mod.time, "sleep", lambda _: None)
+
+
+def test_run_step_writes_stdin_file_after_stdin_lines_as_one_line(monkeypatch, tmp_path):
+    """Поле Step.stdin_file (день 08): файл подаётся одной строкой ПОСЛЕ всех
+    stdin_lines — порядок важен, ибо в строке нет переводов: \n обрезал бы
+    реплику REPL до первой фразы, и переполнение не получилось бы вовсе."""
+    (tmp_path / "biginput.txt").write_text("ГИГАНТСКАЯ-СТРОКА-БЕЗ-ПЕРЕВОДОВ", encoding="utf-8")
+    written: list[str] = []
+    _fake_popen(monkeypatch, written)
+    monkeypatch.setattr(record_mod, "PROJECT_ROOT", tmp_path)
+
+    record_mod._run_step(
+        record_mod.Step(
+            title="гигантский ввод",
+            module="week_02.cli",
+            args=["--session", "demo08"],
+            stdin_lines=["/set context_limit default"],
+            stdin_file="biginput.txt",
+        )
+    )
+
+    assert written == ["/set context_limit default\n", "ГИГАНТСКАЯ-СТРОКА-БЕЗ-ПЕРЕВОДОВ\n"]
+
+
+def test_run_step_refuses_a_missing_stdin_file(monkeypatch, tmp_path):
+    """Файл пишет шаг-генератор: его отсутствие — поломка сценария, и читать
+    её надо по имени, а не traceback'ом FileNotFoundError."""
+    written: list[str] = []
+    _fake_popen(monkeypatch, written)
+    monkeypatch.setattr(record_mod, "PROJECT_ROOT", tmp_path)
+
+    with pytest.raises(AdventError, match="biginput.txt"):
+        record_mod._run_step(
+            record_mod.Step(
+                title="гигантский ввод",
+                module="week_02.cli",
+                stdin_lines=["/set context_limit default"],
+                stdin_file="biginput.txt",
+            )
+        )

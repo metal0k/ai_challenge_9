@@ -51,16 +51,23 @@ from advent_core.params import (
     ParamError,
     defaults_for,
 )
-from advent_core.session import DEFAULT_SESSION, Session, Turn, list_sessions, validate_name
+from advent_core.session import (
+    DEFAULT_SESSION,
+    ROLE_ASSISTANT,
+    Session,
+    Turn,
+    list_sessions,
+    validate_name,
+)
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCheck, counter_for
 
 WEEK = 2
-# Номер дня, который последним трогал ЭТОТ код. Тест сверяет литерал 7, а не
+# Номер дня, который последним трогал ЭТОТ код. Тест сверяет литерал 8, а не
 # эту константу: ожидание, взятое из того же источника, что и код под тестом,
 # покраснеть не может (CLAUDE.md, «A test whose expected value comes from the
 # same source as the code under test»).
-DAY = 7
+DAY = 8
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -222,12 +229,20 @@ class AgentShell:
             stream=chat_core.stream,
             counter=self.counter,
             capabilities=self.capabilities,
-            context_limit=tokens.context_limit(self.card),
+            context_limit=self.effective_context_limit(),
             persona=_persona(self.config),
             dialog_preset=_dialog_preset(),
             # Агент не печатает — он отдаёт текст сюда (SPEC §5).
             on_warning=console.warn,
         )
+        if self.config.params.context_limit is not None:
+            # Override — инструмент демо, и молча живущий заниженный лимит
+            # после перезапуска — ловушка: на старте его называют вслух,
+            # с обоими числами (SPEC-w02d08.md §4).
+            console.note(
+                f"лимит окна переопределён: {self.config.params.context_limit} "
+                f"(карточка: {_num(tokens.context_limit(self.card))})"
+            )
         if resumed_dialog:
             console.note(
                 f"подхвачен целевой диалог: ход {self.dialog_turns} из {self.agent.max_turns}"
@@ -264,6 +279,16 @@ class AgentShell:
     def capabilities(self) -> dict | None:
         return capabilities_of(self.models, self.config.model) if self.models else None
 
+    def effective_context_limit(self) -> int | None:
+        """Лимит окна с учётом override: заданный вручную бьёт карточку модели.
+
+        Приоритет «параметр > карточка» — тот же порядок, что у mode/done
+        (SPEC-w02d07 §3, SPEC-w02d08.md §4). Минимум реестра — 1, поэтому
+        `or` безопасен: нулевое значение сюда не доходит, а None означает
+        «карточка».
+        """
+        return self.config.params.context_limit or tokens.context_limit(self.card)
+
     @property
     def resolved(self) -> str | None:
         return resolve_alias(self.models, self.config.model) if self.models else None
@@ -283,7 +308,18 @@ class AgentShell:
             console.warn(warning)
         self.agent.counter = self.counter
         self.agent.capabilities = self.capabilities
-        self.agent.context_limit = tokens.context_limit(self.card)
+        self.agent.context_limit = self.effective_context_limit()
+        if self.config.params.context_limit is not None:
+            # Override — явный выбор пользователя: смена модели его НЕ
+            # переопределяет, но молча показывать лимит от чужой карточки
+            # нельзя — предупреждаем, что окно не из карточки новой модели
+            # (SPEC-w02d08.md §4).
+            console.warn(
+                f"лимит окна переопределён: {self.config.params.context_limit} — "
+                "это не окно новой модели "
+                f"(карточка: {_num(tokens.context_limit(self.card))}); "
+                "/set context_limit default вернёт лимит из карточки"
+            )
         self.warn_model_drift()
 
     # --- сессия ------------------------------------------------------------
@@ -351,6 +387,17 @@ class AgentShell:
         self.dialog_turns = (
             turns if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0 else 0
         )
+        if not (check_explicit and "context_limit" in self.explicit):
+            raw_limit = session.state.get("context_limit")
+            # bool исключён той же причиной, что выше: True — не лимит окна.
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool):
+                try:
+                    self.config.params.set("context_limit", raw_limit)
+                except ParamError as error:
+                    console.warn(
+                        f"в файле сессии {session.name} негодное "
+                        f"context_limit={raw_limit!r} — игнор: {error}"
+                    )
         return resumed_dialog
 
     def save(self) -> None:
@@ -482,7 +529,7 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             "модель их больше не видит, файл сессии не тронут"
         )
 
-    console.footer(reply.result)
+    console.footer(reply.result, completion_estimate=_completion_estimate(shell, reply))
     # reconcile() — чистая функция: калибровку счётчика уже сделал агент, здесь
     # только показ. Сверять надо с тем, что РЕАЛЬНО ушло в API (sent_messages):
     # слой формата дописывает инструкцию внутри chat._payload(), и сверка «до
@@ -531,6 +578,9 @@ def _save_state(shell: AgentShell) -> None:
     shell.session.state["mode"] = shell.agent.mode
     shell.session.state["done"] = shell.config.params.done
     shell.session.state["dialog_turns"] = shell.dialog_turns
+    # None — честное «карточка»: перечитывание файла вернёт лимит из карточки,
+    # и ключ не нужно удалять, достаточно пустого значения.
+    shell.session.state["context_limit"] = shell.config.params.context_limit
     shell.save()
 
 
@@ -612,6 +662,11 @@ def _context_label(shell: AgentShell) -> str:
     limit = shell.agent.context_limit
     if not limit:
         return f"контекст {mark}{used}/— (окно модели неизвестно)"
+    if shell.config.params.context_limit is not None:
+        # Override (SPEC-w02d08.md §4): процент заполнения при заниженном
+        # лимите вторичен, важно само слово — иначе «450/2500» после недель
+        # жизни с честным окном читается как поломка карточки.
+        return f"контекст {mark}{used}/{limit} (override)"
     return f"контекст {mark}{used}/{limit} ({used * 100 // limit}%)"
 
 
@@ -623,6 +678,20 @@ def _session_tokens_label(shell: AgentShell) -> str:
         # Без этой пометки неполная сумма выглядит полной.
         label += f" (без usage: {missing})"
     return label
+
+
+def _completion_estimate(shell: AgentShell, reply: AgentReply) -> int | None:
+    """Локальная оценка ответа, когда сервер не прислал completion_tokens.
+
+    LM Studio в стриме usage не присылает вовсе (TODO №2), и футер деградировал
+    бы в «?». Оценка всегда с тильдой — её ставит footer (SPEC-w02d08.md §6);
+    счётчика нет — честный «?», притворяться нечем.
+    """
+    if reply.result.usage.completion_tokens is not None:
+        return None
+    if shell.counter is None:
+        return None
+    return shell.counter.count([{"role": "assistant", "content": reply.text}])
 
 
 def _token_panel(shell: AgentShell, reply: AgentReply) -> None:
@@ -882,13 +951,19 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
         return False
     if name == "mode":
         shell.dialog_turns = 0
+    if name == "context_limit":
+        # Значение применилось — сразу пересчитываем лимит агента: trim идёт
+        # по нему уже со следующего хода, а «вступит после перезапуска»
+        # читалось бы как поломка.
+        shell.agent.context_limit = shell.effective_context_limit()
     if name in ("mode", "done", "stop"):
         # Негодный или съедаемый stop'ом маркер надо поймать сейчас, а не
         # тогда, когда диалог не закончится ни разу.
         _warn_text(shell.agent.check_done())
-    if name in ("mode", "done"):
+    if name in ("mode", "done", "context_limit"):
         # Значение применилось — сразу в файл: `/mode dialog` → `/exit` без
-        # хода иначе терял бы режим (save после хода тут не случится).
+        # хода иначе терял бы режим (save после хода тут не случится). Точка
+        # записи context_limit — та же (SPEC-w02d08.md §4).
         _save_state(shell)
 
     _, skipped = shell.config.params.as_payload(shell.capabilities)
@@ -1055,7 +1130,18 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
     table.add_row("prompt/completion", f"{prompt_label}/{completion_label}")
     table.add_row("всего за сессию", _session_tokens_label(shell))
     table.add_row("следующий запрос", _context_label(shell))
-    table.add_row("окно модели", _num(shell.agent.context_limit))
+    override = shell.config.params.context_limit
+    if override is not None:
+        # Override обязан быть виден и здесь: «окно 2500» без второго числа
+        # после недель жизни с честным окном читалось бы как поломка карточки
+        # (SPEC-w02d08.md §4).
+        table.add_row(
+            "окно модели",
+            f"{shell.agent.context_limit} (override; карточка: "
+            f"{_num(tokens.context_limit(shell.card))})",
+        )
+    else:
+        table.add_row("окно модели", _num(shell.agent.context_limit))
 
     check = shell.last_check
     if check is None:
@@ -1086,7 +1172,58 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
             "в том числе по этому же ходу",
         )
     console.err.print(table)
+    _print_growth_table(shell)
     return False
+
+
+# Сколько ходов показывает таблица роста: длинные сессии режутся, иначе таблица
+# уезжает за экран — на видео видны были бы только последние строки и так.
+GROWTH_TABLE_LIMIT = 30
+
+
+def _print_growth_table(shell: AgentShell) -> None:
+    """Таблица роста по ходам (SPEC-w02d08.md §3) — история, а не только итоги.
+
+    Источник — usage ходов сессии, факт сервера. «накопительно» — сумма
+    total_tokens (или prompt+completion, когда total сервер не прислал): история
+    пересылается целиком, и именно эта колонка показывает, как «стоимость
+    диалога в токенах» растёт квадратично его длине. Ход без usage — прочерки:
+    «неизвестно» не становится нулём ни в одной колонке.
+    """
+    turns = [turn for turn in shell.session.turns if turn.role == ROLE_ASSISTANT]
+    if not turns:
+        console.note("ходов с ответами в сессии ещё нет — расти пока нечему")
+        return
+
+    rows: list[tuple[int, str, str, str]] = []
+    cumulative = 0
+    for number, turn in enumerate(turns, start=1):
+        usage = turn.usage
+        if usage is None or usage.is_empty():
+            rows.append((number, "—", "—", "—"))
+            continue
+        prompt = usage.prompt_tokens
+        completion = usage.completion_tokens
+        total = usage.total_tokens
+        if total is None and prompt is not None and completion is not None:
+            total = prompt + completion
+        if total is not None:
+            cumulative += total
+            rows.append((number, _num(prompt), _num(completion), str(cumulative)))
+        else:
+            rows.append((number, _num(prompt), _num(completion), "—"))
+
+    table = Table(box=None, padding=(0, 2, 0, 0))
+    table.add_column("ход", justify="right", style="cyan", no_wrap=True)
+    table.add_column("prompt", justify="right")
+    table.add_column("completion", justify="right")
+    table.add_column("накопительно", justify="right")
+    table.add_row("ход", "prompt", "completion", "накопительно", style="dim")
+    for number, prompt, completion, total in rows[-GROWTH_TABLE_LIMIT:]:
+        table.add_row(str(number), prompt, completion, total)
+    console.err.print(table)
+    if len(rows) > GROWTH_TABLE_LIMIT:
+        console.note(f"… показаны последние {GROWTH_TABLE_LIMIT} из {len(rows)}")
 
 
 def _switch_session(shell: AgentShell, name: str, *, fresh: bool = False) -> None:
@@ -1115,6 +1252,10 @@ def _switch_session(shell: AgentShell, name: str, *, fresh: bool = False) -> Non
     # Это состояние ТОГО разговора: применяем оптом, explicit-флаги не чекая —
     # они были про старт запуска, а переключение = «продолжить как оставили».
     resumed_dialog = shell._apply_session_state(session, check_explicit=False)
+    # state подхвачен — и лимит пересчитываем: у сессии, на которую переключились,
+    # override в файле может отличаться от текущего (или отсутствовать), а trim
+    # со следующего хода идёт по тому, что в агенте.
+    shell.agent.context_limit = shell.effective_context_limit()
     if resumed_dialog:
         console.note(
             f"подхвачен целевой диалог: ход {shell.dialog_turns} из {shell.agent.max_turns}"
@@ -1290,6 +1431,9 @@ def agent(
     max_turns: int | None = typer.Option(
         None, "--max-turns", help=f"Потолок ходов диалога {_default_hint('max_turns')}."
     ),
+    context_limit: int | None = typer.Option(
+        None, "--context-limit", help=BY_NAME["context_limit"].help
+    ),
     # help берётся из реестра, а не пишется здесь второй раз: тот же текст
     # печатает /params, и «0..2» однажды уже разошлось с потолком API 1.5.
     temperature: float | None = typer.Option(
@@ -1337,6 +1481,7 @@ def agent(
         mode=mode,
         done=done,
         max_turns=max_turns,
+        context_limit=context_limit,
         format=format_,
         schema_file=schema_file,
     )
@@ -1347,7 +1492,13 @@ def agent(
     # Какие local-параметры заданы флагами явно — они бьют файл сессии при
     # подхвате state (приоритет «флаг > файл > дефолт реестра»).
     explicit = frozenset(
-        name for name, value in (("mode", mode), ("done", done)) if value is not None
+        name
+        for name, value in (
+            ("mode", mode),
+            ("done", done),
+            ("context_limit", context_limit),
+        )
+        if value is not None
     )
     shell = AgentShell(config, explicit=explicit)
     if config.verbose:
