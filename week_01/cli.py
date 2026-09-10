@@ -92,6 +92,13 @@ NON_CHAT_PARAMS = {
     # у агента, REPL недели 01 его вообще не читает — без этой строки /set
     # context_limit молча «принимался» бы, как раньше молчал session.
     "context_limit": "adventagent (неделя 02)",
+    # History compaction (day 09, SPEC-w02d09.md §9): decided by the agent
+    # before building the request. Week 01's REPL has no token-based history
+    # at all — it's trimmed by chat_core.trim_history()'s character budget,
+    # nothing there to summarize. Same reason as the three lines above.
+    "compact": "adventagent (неделя 02)",
+    "keep_last": "adventagent (неделя 02)",
+    "compact_every": "adventagent (неделя 02)",
 }
 
 REPL_COMMANDS = [

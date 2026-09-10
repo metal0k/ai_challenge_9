@@ -11,15 +11,20 @@ import pytest
 
 from advent_core import chat as chat_core
 from advent_core.agent import (
+    DEFAULT_COMPACT_EVERY,
+    DEFAULT_KEEP_LAST,
     DEFAULT_MAX_TURNS,
     INTERRUPT_NOTE,
+    SUMMARY_MAX_TOKENS,
     Agent,
     AgentReply,
     done_conflicts_with_stop,
     marker_instruction,
 )
+from advent_core.compact import SUMMARY_ACK, SUMMARY_PREFIX
 from advent_core.config import Config
-from advent_core.params import GenerationParams
+from advent_core.errors import AdventError
+from advent_core.params import AGENT_COMMAND, GenerationParams, defaults_for
 from advent_core.telemetry import CallResult, Usage
 
 
@@ -494,3 +499,335 @@ def test_mode_property_defaults_to_chat(mode):
     agent = build_agent(_Recorder(), make_config(mode=mode, done="text:ГОТОВО"))
     assert agent.mode == mode
     assert build_agent(_Recorder(), make_config()).mode == "chat"
+
+
+# --- history compaction (day 09) -------------------------------------------
+
+HISTORY_6 = [
+    {"role": "user", "content": "в1"},
+    {"role": "assistant", "content": "о1"},
+    {"role": "user", "content": "в2"},
+    {"role": "assistant", "content": "о2"},
+    {"role": "user", "content": "в3"},
+    {"role": "assistant", "content": "о3"},
+]
+
+
+def compact_config(**params) -> Config:
+    """A config with compaction and small thresholds: six messages already trigger it.
+
+    The registry defaults (keep_last=6, compact_every=10) need sixteen
+    messages, which would read as a fixture wall instead of a rule.
+    """
+    params.setdefault("compact", True)
+    params.setdefault("keep_last", 2)
+    params.setdefault("compact_every", 4)
+    return make_config(**params)
+
+
+class _ConfigRecorder(_Recorder):
+    """The same double, but also records each call's config."""
+
+    def __init__(self, *results: CallResult) -> None:
+        super().__init__(*results)
+        self.configs: list[Config] = []
+
+    def complete(self, config, messages, capabilities=None) -> CallResult:
+        self.configs.append(config)
+        return super().complete(config, messages, capabilities)
+
+
+def test_compaction_replaces_old_messages_with_the_pseudo_pair():
+    recorder = _Recorder(CallResult(text="пересказ"), CallResult(text="ответ"))
+    agent = build_agent(recorder, compact_config(), summary_prompt="сожми")
+
+    agent.ask("вопрос", list(HISTORY_6))
+
+    # First call is the summarizer: its own system, old turns in the body.
+    summarizer = recorder.calls[0]
+    assert summarizer[0] == {"role": "system", "content": "сожми"}
+    assert "в1" in summarizer[1]["content"]
+
+    # Second is the actual turn: pseudo-pair up front, no old turns at all.
+    request = recorder.calls[1]
+    assert [m["content"] for m in request] == [
+        f"{SUMMARY_PREFIX}\n\nпересказ",
+        SUMMARY_ACK,
+        "в3",
+        "о3",
+        "вопрос",
+    ]
+    assert [m["role"] for m in request] == ["user", "assistant", "user", "assistant", "user"]
+
+
+def test_summary_travels_in_the_reply_and_the_compaction_call_is_not_a_turn():
+    recorder = _Recorder(CallResult(text="пересказ"), CallResult(text="ответ"))
+    agent = build_agent(recorder, compact_config(), summary_prompt="сожми")
+
+    reply = agent.ask("вопрос", list(HISTORY_6))
+
+    assert reply.summary == "пересказ"
+    assert reply.compaction is not None
+    assert reply.compaction.covered == 4
+    assert reply.compaction.tail == HISTORY_6[4:]
+    # The turn's product is the model's answer, not the summary: mixing them
+    # up would print internal text to the user instead of the answer.
+    assert reply.text == "ответ"
+    # The compaction call does not become a conversation turn — only actual turns are in history.
+    assert reply.history == [
+        *HISTORY_6[4:],
+        {"role": "user", "content": "вопрос"},
+        {"role": "assistant", "content": "ответ"},
+    ]
+
+
+def test_compact_off_leaves_the_request_exactly_as_it_was_before_day_09():
+    """Days 06-08 are tagged and must keep behaving as before (SPEC §6)."""
+    off = _Recorder(CallResult(text="ответ"))
+    build_agent(off, compact_config(compact=False), summary_prompt="сожми").ask(
+        "вопрос", list(HISTORY_6)
+    )
+    before = _Recorder(CallResult(text="ответ"))
+    build_agent(before, make_config()).ask("вопрос", list(HISTORY_6))
+
+    assert len(off.calls) == 1
+    assert off.calls[0] == before.calls[0]
+
+
+def test_compact_without_a_summarizer_prompt_falls_back_to_trim_with_a_warning():
+    """Silent "compaction" that's actually trimming is worse than compaction turned off."""
+    recorder = _Recorder(CallResult(text="ответ"))
+    agent = build_agent(recorder, compact_config())
+
+    reply = agent.ask("вопрос", list(HISTORY_6))
+
+    assert len(recorder.calls) == 1
+    assert reply.summary is None
+    assert reply.compaction is None
+    assert any("промпт суммаризатора" in text for text in agent.warnings)
+
+
+def test_empty_summary_is_not_substituted():
+    """An empty summary is not a summary: substituting it would erase the conversation."""
+    recorder = _Recorder(CallResult(text="   "), CallResult(text="ответ"))
+    agent = build_agent(recorder, compact_config(), summary_prompt="сожми")
+
+    reply = agent.ask("вопрос", list(HISTORY_6))
+
+    assert reply.summary is None
+    assert reply.compaction is None
+    # The whole history went through untouched: compaction didn't happen, nothing to lose.
+    assert [m["content"] for m in recorder.calls[1]][:2] == ["в1", "о1"]
+    assert any("пустой пересказ" in text for text in agent.warnings)
+
+
+def test_trim_after_compaction_never_drops_the_summary_pair():
+    """The pseudo-pair IS the compacted form of everything dropped (SPEC §6)."""
+    history = [
+        *HISTORY_6[:4],
+        {"role": "user", "content": "в3" * 60},
+        {"role": "assistant", "content": "о3" * 60},
+    ]
+    recorder = _Recorder(CallResult(text="пересказ"), CallResult(text="ответ"))
+    agent = build_agent(
+        recorder,
+        compact_config(max_tokens=20),
+        summary_prompt="сожми",
+        counter=_CharCounter(),
+        context_limit=140,
+    )
+
+    reply = agent.ask("вопрос", history)
+
+    assert reply.dropped == 2
+    assert [m["content"] for m in recorder.calls[1]] == [
+        f"{SUMMARY_PREFIX}\n\nпересказ",
+        SUMMARY_ACK,
+        "вопрос",
+    ]
+
+
+def test_budget_trigger_fires_before_the_message_threshold():
+    """One long message overflows the window without reaching ten turns."""
+    recorder = _Recorder(CallResult(text="пересказ"), CallResult(text="ответ"))
+    agent = build_agent(
+        recorder,
+        compact_config(compact_every=100, max_tokens=10),
+        summary_prompt="сожми",
+        counter=_CharCounter(),
+        context_limit=60,
+    )
+    history = [
+        {"role": "user", "content": "в" * 40},
+        {"role": "assistant", "content": "о" * 40},
+        {"role": "user", "content": "в2"},
+        {"role": "assistant", "content": "о2"},
+    ]
+
+    reply = agent.ask("вопрос", history)
+
+    assert reply.compaction is not None
+    assert reply.compaction.covered == 2
+
+
+def test_summarizer_gets_its_own_params_and_the_session_config_is_untouched():
+    recorder = _ConfigRecorder(CallResult(text="пересказ"), CallResult(text="ответ"))
+    config = compact_config(format="json", stop=["СТОП"], max_tokens=50)
+    agent = build_agent(recorder, config, summary_prompt="сожми")
+
+    agent.ask("вопрос", list(HISTORY_6))
+
+    summarizer = recorder.configs[0].params
+    assert summarizer.max_tokens == SUMMARY_MAX_TOKENS
+    # format would force the summary to be an object, stop would cut it off
+    # mid-word — session params don't fit a service call.
+    assert summarizer.format is None
+    assert summarizer.stop is None
+    # The actual turn runs with the user's params: a copy, not an in-place edit.
+    assert recorder.configs[1].params.max_tokens == 50
+    assert recorder.configs[1].params.format == "json"
+    assert agent.config.params.max_tokens == 50
+
+
+def test_previous_summary_is_folded_into_the_next_one():
+    """A second compaction round must inherit the facts of the first (SPEC §3)."""
+    recorder = _Recorder(CallResult(text="новый пересказ"), CallResult(text="ответ"))
+    agent = build_agent(recorder, compact_config(), summary_prompt="сожми")
+
+    reply = agent.ask("вопрос", list(HISTORY_6), summary="кодовое слово КАРАКУМЫ")
+
+    assert "КАРАКУМЫ" in recorder.calls[0][1]["content"]
+    assert reply.summary == "новый пересказ"
+
+
+def test_summary_goes_into_the_request_even_when_nothing_is_compacted():
+    """A summary from a previous turn keeps applying afterward."""
+    recorder = _Recorder(CallResult(text="ответ"))
+    agent = build_agent(recorder, compact_config(compact_every=100), summary_prompt="сожми")
+
+    reply = agent.ask("вопрос", list(HISTORY_6[:2]), summary="было условлено X")
+
+    assert len(recorder.calls) == 1
+    assert recorder.calls[0][0]["content"] == f"{SUMMARY_PREFIX}\n\nбыло условлено X"
+    assert reply.summary == "было условлено X"
+    assert reply.compaction is None
+
+
+def test_compact_now_compresses_without_waiting_for_a_trigger():
+    recorder = _Recorder(CallResult(text="пересказ"))
+    agent = build_agent(recorder, compact_config(compact_every=100), summary_prompt="сожми")
+
+    compaction = agent.compact_now(None, HISTORY_6)
+
+    assert compaction is not None
+    assert compaction.summary == "пересказ"
+    assert compaction.covered == 4
+    assert compaction.tail == HISTORY_6[4:]
+    assert len(recorder.calls) == 1
+
+
+def test_summarizer_failure_falls_back_to_trim_and_does_not_lose_the_turn():
+    """Compaction is an optimization, not a precondition: the turn must still happen."""
+
+    class _FailingSummarizer(_Recorder):
+        def complete(self, config, messages, capabilities=None) -> CallResult:
+            if not self.calls:
+                self.calls.append(messages)
+                raise AdventError("сеть отвалилась")
+            return super().complete(config, messages, capabilities)
+
+    recorder = _FailingSummarizer(CallResult(text="ответ"))
+    agent = build_agent(recorder, compact_config(), summary_prompt="сожми")
+
+    reply = agent.ask("вопрос", list(HISTORY_6))
+
+    assert reply.text == "ответ"
+    assert reply.summary is None
+    assert reply.compaction is None
+    # The whole history went through untouched — no compaction, nothing to trim by (no window).
+    assert [m["content"] for m in recorder.calls[1]][:2] == ["в1", "о1"]
+    assert any("сжатие истории не удалось" in text for text in agent.warnings)
+
+
+def test_a_paid_compaction_is_parked_when_the_turn_itself_fails():
+    """A successful summarizer call must survive the turn that failed after it.
+
+    It is already paid for: losing it means no journal row, nothing in
+    /tokens, and — since the history it was built from is unchanged — a second
+    summarizer call on the next attempt.
+    """
+
+    class _FailingTurn(_Recorder):
+        def complete(self, config, messages, capabilities=None) -> CallResult:
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return CallResult(text="пересказ", model_requested="m")
+            raise AdventError("сеть отвалилась")
+
+    agent = build_agent(_FailingTurn(), compact_config(), summary_prompt="сожми")
+
+    with pytest.raises(AdventError):
+        agent.ask("вопрос", list(HISTORY_6))
+
+    pending = agent.take_pending_compaction()
+    assert pending is not None
+    assert pending.summary == "пересказ"
+    # Handed over exactly once: a second caller would bill the same call twice.
+    assert agent.take_pending_compaction() is None
+
+
+def test_a_successful_turn_leaves_nothing_parked():
+    """The compaction travels in the reply — a copy left behind would be reported twice."""
+    recorder = _Recorder(CallResult(text="пересказ"), CallResult(text="ответ"))
+    agent = build_agent(recorder, compact_config(), summary_prompt="сожми")
+
+    reply = agent.ask("вопрос", list(HISTORY_6))
+
+    assert reply.compaction is not None
+    assert agent.pending_compaction is None
+
+
+def test_thresholds_unset_fall_back_to_the_same_numbers_the_registry_hands_out():
+    """`None` means "not set", and the fallback must equal the registry default.
+
+    Two constants for one rule (Spec.defaults in params.py and DEFAULT_* in
+    agent.py) — this is the only place that compares them, and every other
+    compaction test sets both values explicitly.
+    """
+    agent = build_agent(_Recorder(), compact_config(keep_last=None, compact_every=None))
+
+    assert agent.keep_last == DEFAULT_KEEP_LAST
+    assert agent.compact_every == DEFAULT_COMPACT_EVERY
+    registry = defaults_for(AGENT_COMMAND)
+    assert (registry["keep_last"], registry["compact_every"]) == (6, 10)
+    assert (DEFAULT_KEEP_LAST, DEFAULT_COMPACT_EVERY) == (6, 10)
+
+
+def test_compact_now_without_a_summarizer_names_the_prompt_not_the_toggle():
+    """compact=on plus no summarizer prompt is not "compaction is off".
+
+    `/set compact on` is a remedy for a setting that is already on — the user
+    re-toggles it and `/compact` keeps doing nothing.
+    """
+    agent = build_agent(_Recorder(), compact_config())
+
+    assert agent.compact_now(None, list(HISTORY_6)) is None
+    assert any("суммаризатора" in text for text in agent.warnings)
+    assert not any("/set compact on" in text for text in agent.warnings)
+
+
+def test_compact_now_off_by_setting_still_points_at_the_toggle():
+    agent = build_agent(_Recorder(), make_config(compact=False), summary_prompt="сожми")
+
+    assert agent.compact_now(None, list(HISTORY_6)) is None
+    assert any("/set compact on" in text for text in agent.warnings)
+
+
+def test_compact_now_on_a_short_history_makes_no_call():
+    """`/compact` on a short history is a clear message, not an LLM call (§10)."""
+    recorder = _Recorder()
+    agent = build_agent(recorder, compact_config(), summary_prompt="сожми")
+
+    assert agent.compact_now(None, HISTORY_6[:2]) is None
+    assert recorder.calls == []
+    assert any("сжимать нечего" in text for text in agent.warnings)

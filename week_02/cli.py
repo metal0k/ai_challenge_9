@@ -29,7 +29,7 @@ from rich.table import Table
 
 from advent_core import chat as chat_core
 from advent_core import console, formats, tokens
-from advent_core.agent import Agent, AgentReply
+from advent_core.agent import Agent, AgentReply, Compaction
 from advent_core.client import (
     capabilities_of,
     chat_models,
@@ -38,6 +38,7 @@ from advent_core.client import (
     model_names,
     resolve_alias,
 )
+from advent_core.compact import summary_messages
 from advent_core.config import DEFAULT_SYSTEM_PROMPT, Config, ConfigError
 from advent_core.errors import AdventError
 from advent_core.journal import log_call
@@ -63,11 +64,17 @@ from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCheck, counter_for
 
 WEEK = 2
-# Номер дня, который последним трогал ЭТОТ код. Тест сверяет литерал 8, а не
-# эту константу: ожидание, взятое из того же источника, что и код под тестом,
-# покраснеть не может (CLAUDE.md, «A test whose expected value comes from the
-# same source as the code under test»).
-DAY = 8
+# Day that last touched THIS code. The test asserts the literal 9, not this
+# constant — an expectation drawn from the same source as the code under
+# test can never go red (CLAUDE.md, "A test whose expected value comes from
+# the same source as the code under test").
+#
+# No separate constant for compaction, unlike week 01's TEMP_DAY: there one
+# module held commands from two different days (`chat` day 03, `temp` day
+# 04); here the week is ONE app growing by day, same command throughout.
+# A compaction call is distinguished from a regular turn by kind=compact in
+# the journal, not by a day number.
+DAY = 9
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -77,6 +84,10 @@ AGENT_PROMPT_PATH = PROMPTS_DIR / "agent.md"
 # Копия пресета недели 01, а не импорт из неё: у недели своя копия, и правка
 # диалога агента не должна менять поведение уже сданного дня 02.
 DIALOG_PROMPT_PATH = PROMPTS_DIR / "dialog.md"
+# The summarizer prompt lives in advent_core/prompts, not in the week: history
+# compaction is core mechanics (inherited by anything built on Agent), not a
+# week-02 persona like agent.md/dialog.md above.
+SUMMARY_PROMPT_PATH = DEFAULT_SYSTEM_PROMPT.parent / "summary.md"
 
 # Многострочный ввод — sentinel, а не Shift+Enter: портируемого способа поймать
 # Shift+Enter в терминалах не существует, документация aider говорит это прямо
@@ -178,6 +189,18 @@ class AgentShell:
     # диалог идёт в ОБЩЕЙ памяти сессии (SPEC-w02d06.md §9), поэтому вывести
     # число ходов из длины истории нельзя — там лежит и всё, что обсуждали до.
     dialog_turns: int = 0
+    # Summary of the old part of the conversation, currently in effect. Lives
+    # here, not in the agent: the agent holds no memory at all
+    # (advent_core/agent.py) — it takes the summary in ask() and returns the
+    # current one in AgentReply, same as history.
+    summary: str | None = None
+    # Cost of compactions this run. Summarizer calls deliberately don't land
+    # in session.turns (they're service calls, not conversation turns), so
+    # neither "total for session" nor the growth table sees them — but they
+    # are real spend, and something has to name it (SPEC-w02d09.md §7).
+    compact_calls: int = 0
+    compact_prompt: int = 0
+    compact_completion: int = 0
 
     def __post_init__(self) -> None:
         try:
@@ -232,6 +255,7 @@ class AgentShell:
             context_limit=self.effective_context_limit(),
             persona=_persona(self.config),
             dialog_preset=_dialog_preset(),
+            summary_prompt=_summary_prompt(),
             # Агент не печатает — он отдаёт текст сюда (SPEC §5).
             on_warning=console.warn,
         )
@@ -418,7 +442,64 @@ class AgentShell:
                 console.warn(
                     f"в файле сессии {session.name} негодное context_limit={raw_limit!r} — игнор"
                 )
+        self._apply_session_summary(session)
         return resumed_dialog
+
+    def _apply_session_summary(self, session: Session) -> None:
+        """Loads the summary and rewinds the working history to its boundary.
+
+        The session file stores the FULL conversation (the growth table and
+        token sums depend on that), so the summary alone isn't enough: without
+        a coverage boundary a restart would send the model both the summary
+        and the summarized part at once — doubling what compaction had just
+        shrunk.
+
+        Called after the caller has put the session's full history into
+        self.history, and trims it. No explicit flag here: the summary isn't
+        a run setting, there's nothing to override it from the command line.
+        """
+        raw_summary = session.state.get("summary")
+        if not isinstance(raw_summary, str) or not raw_summary.strip():
+            # Key absent (session files tagged w02d06-w02d08) or empty —
+            # no summary, leave history alone.
+            self.summary = None
+            return
+
+        raw_upto = session.state.get("summary_upto")
+        # bool excluded explicitly: True is an int in Python, and "1 message
+        # covered" would come out of a value that isn't actually a boundary.
+        if not isinstance(raw_upto, int) or isinstance(raw_upto, bool):
+            # A summary whose boundary is missing or of the wrong type used to
+            # fall back to 0 — the one outcome this method exists to prevent:
+            # the summary AND the whole history it summarizes in the same
+            # request. Dropping the summary costs one compaction; keeping it
+            # without a boundary doubles the context silently.
+            console.warn(
+                f"в сессии {session.name} есть пересказ, но граница summary_upto={raw_upto!r} "
+                "негодная — пересказ отброшен, история идёт целиком"
+            )
+            self.summary = None
+            return
+        upto = raw_upto
+
+        if not 0 <= upto <= len(session.turns):
+            # Boundary doesn't match the history: the file was hand-edited or
+            # turns were partially cleared. A summary rewound to the wrong
+            # spot is quieter and worse than a lost one — it substitutes
+            # someone else's content for the conversation.
+            console.warn(
+                f"в сессии {session.name} пересказ покрывает {upto} сообщений при "
+                f"{len(session.turns)} в истории — пересказ отброшен, история идёт целиком"
+            )
+            self.summary = None
+            return
+
+        self.summary = raw_summary
+        self.history = session.history()[upto:]
+        console.note(
+            f"подхвачен пересказ: {upto} старых сообщений заменены им, "
+            f"в рабочей истории осталось {len(self.history)}"
+        )
 
     def save(self) -> None:
         """Сохраняет сессию; ошибку записи показывает, а не глотает.
@@ -467,9 +548,32 @@ def _dialog_preset() -> str | None:
         return None
 
 
+def _summary_prompt() -> str | None:
+    try:
+        return SUMMARY_PROMPT_PATH.read_text(encoding="utf-8").strip() or None
+    except OSError as error:
+        # Don't crash, but don't compact either: a summarizer with no
+        # instruction would summarize arbitrarily, and what compaction
+        # forgets doesn't come back. Agent disables compaction on None
+        # itself and says so out loud (SPEC §12).
+        console.warn(f"промпт суммаризатора не прочитался ({error}) — сжатие выключено")
+        return None
+
+
 def _warn_text(text: str | None) -> None:
     if text:
         console.warn(text)
+
+
+def _warn_extra_args(name: str, args: list[str]) -> None:
+    """An argument-less command got arguments — say so, don't swallow it.
+
+    A silently ignored argument reads as honored: "/compact 4" looks like a
+    request to compact down to four messages, and without this line the user
+    would believe it was.
+    """
+    if args:
+        console.warn(f"{name} не принимает аргументов — «{' '.join(args)}» проигнорировано")
 
 
 # --------------------------------------------------------------------------
@@ -488,6 +592,9 @@ def _turn(shell: AgentShell, question: str) -> None:
     # следующий ask(): полная запись живёт в файле сессии, а кормить агента
     # session.history() каждый ход значило бы пересчитывать обрезку заново.
     shell.history = reply.history
+    # Summary holds until the next compaction and survives a restart via
+    # session state (_save_state) — like the working history, it's memory.
+    shell.summary = reply.summary
     _remember(shell, question, reply)
     # Панель — ПОСЛЕ обновления истории и записи хода, иначе оба её числа
     # отстают на ход: «сессия» не считала бы только что полученный usage, а
@@ -504,9 +611,15 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
     streaming = chat_core.should_stream(shell.config)
     try:
         reply = shell.agent.ask(
-            question, history, on_chunk=console.write_chunk if streaming else None
+            question,
+            history,
+            summary=shell.summary,
+            on_chunk=console.write_chunk if streaming else None,
         )
     except AdventError as error:
+        # Compaction, if it happened, happened BEFORE the failure — so it is
+        # reported first, in the order things actually occurred.
+        _salvage_compaction(shell)
         # Ошибка печатается и НЕ убивает сессию — как в REPL недели 01.
         console.fail(error)
         # messages реального запроса построил и потерял упавший вызов;
@@ -538,6 +651,11 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             f"{shell.config.model} не поддерживает: {', '.join(reply.result.skipped_params)} — "
             "параметры не отправлены"
         )
+    if reply.compaction is not None:
+        # BEFORE the trim warning: compaction happens earlier, and the
+        # on-screen order should match reality — otherwise it reads as if
+        # the summary replaced what trimming had already dropped.
+        _report_compaction(shell, reply.compaction)
     if reply.dropped:
         # Токены названы вслух, а не только сообщения (SPEC-w02d06.md §8):
         # «выброшено 6» не отличает освобождённые 200 токенов от 20 000, а
@@ -566,6 +684,65 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
     return reply
 
 
+def _salvage_compaction(shell: AgentShell) -> None:
+    """Keeps a compaction whose turn then failed.
+
+    The summarizer call is a separate, already paid call. When the turn's own
+    call fails afterwards, the compaction never reaches the reply — and
+    without this it would be lost whole: no `kind=compact` row in the journal,
+    no line in `/tokens` (against §7, where every before/after comparison
+    includes the price of compacting), and a second summarizer call on the
+    next attempt, since the history it was built from would be unchanged.
+    Applying it here is what makes the retry cheap instead of paid twice.
+    """
+    compaction = shell.agent.take_pending_compaction()
+    if compaction is None:
+        return
+    _report_compaction(shell, compaction)
+    shell.summary = compaction.summary
+    shell.history = list(compaction.tail)
+    # Straight to disk, for the same reason `/compact` does it: the summary is
+    # memory, and the turn that would have saved it did not happen.
+    _save_state(shell)
+
+
+def _report_compaction(shell: AgentShell, compaction: Compaction) -> None:
+    """Announces the compaction out loud and logs the service call.
+
+    Gain and cost in one line. "Request got 4940 tokens lighter" without the
+    second number is a profit report that never names the cost: the summary
+    came from a model call, that call has usage, and it's paid for (SPEC §7).
+    """
+    usage = compaction.result.usage
+    shell.compact_calls += 1
+    # `or 0`: usage may not come back at all, undercounting this compaction's
+    # cost. Zero here isn't "free", it's "server didn't say" — the nearby
+    # "summary itself cost —/—" line says that.
+    shell.compact_prompt += usage.prompt_tokens or 0
+    shell.compact_completion += usage.completion_tokens or 0
+
+    saved = compaction.saved()
+    gain = f" (−{saved})" if saved is not None else ""
+    console.note(
+        f"история сжата: {compaction.covered} старых сообщений заменены пересказом; "
+        f"запрос {_num(compaction.tokens_before)} → {_num(compaction.tokens_after)}"
+        f"{gain} токенов; сам пересказ стоил "
+        f"{_num(usage.prompt_tokens)}/{_num(usage.completion_tokens)}"
+    )
+    log_call(
+        compaction.result,
+        compaction.result.sent_messages or [],
+        week=WEEK,
+        day=DAY,
+        # kind=compact distinguishes a service call from a conversation turn.
+        # Without it any journal-based count — day 08's growth table
+        # included — would count compaction as a regular turn, and its
+        # prompt (the old history!) would skew exactly the curve day 08
+        # shows.
+        extra={"kind": "compact", "covered": compaction.covered},
+    )
+
+
 def _remember(shell: AgentShell, question: str, reply: AgentReply) -> None:
     """Кладёт обмен в память сессии и сохраняет её на диск.
 
@@ -573,6 +750,12 @@ def _remember(shell: AgentShell, question: str, reply: AgentReply) -> None:
     прерывании стрима агент дописывает в историю пометку об обрыве, и в файле
     сессии она должна быть — иначе следующий запуск подсунет модели её же
     оборванный ответ как законченный (SPEC-w02d06.md §12).
+
+    Goes through `_save_state()`, not a bare `shell.save()`: since day 09 the
+    state holds the summary, which is MEMORY, not a setting. A saved turn
+    without a saved summary would mean history goes in full after a restart
+    as if compaction never happened — the day would only work until the
+    first exit.
     """
     last = reply.history[-1] if reply.history else None
     assistant_text = last["content"] if last and last["role"] == "assistant" else ""
@@ -585,7 +768,7 @@ def _remember(shell: AgentShell, question: str, reply: AgentReply) -> None:
         model=shell.config.model,
         usage=None if usage.is_empty() else usage,
     )
-    shell.save()
+    _save_state(shell)
 
 
 def _save_state(shell: AgentShell) -> None:
@@ -601,6 +784,20 @@ def _save_state(shell: AgentShell) -> None:
     # None — честное «карточка»: перечитывание файла вернёт лимит из карточки,
     # и ключ не нужно удалять, достаточно пустого значения.
     shell.session.state["context_limit"] = shell.config.params.context_limit
+    # Summary and its coverage boundary are conversation CONTENT, not a
+    # setting: Session.clear() wipes them along with the turns
+    # (CONTENT_STATE_KEYS), unlike mode/done/context_limit above.
+    #
+    # summary_upto — how many of the session file's leading messages are
+    # outside the working history. Computed as a difference, not a separate
+    # counter: working history is always a suffix of the session record
+    # (both trimming and compaction only remove from the front), so a
+    # difference can't drift from fact the way a counter could. Turns
+    # dropped by trimming count here alongside compacted ones, which is
+    # correct — a restart isn't obligated to revive what already fell out of
+    # the working context.
+    shell.session.state["summary"] = shell.summary
+    shell.session.state["summary_upto"] = max(0, len(shell.session.turns) - len(shell.history))
     shell.save()
 
 
@@ -1163,6 +1360,7 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
     table.add_row("prompt/completion", f"{prompt_label}/{completion_label}")
     table.add_row("всего за сессию", _session_tokens_label(shell))
     table.add_row("следующий запрос", _context_label(shell))
+    table.add_row("сжатие истории", _compact_label(shell))
     override = shell.config.params.context_limit
     if override is not None:
         # Override обязан быть виден и здесь: «окно 2500» без второго числа
@@ -1206,6 +1404,95 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
         )
     console.err.print(table)
     _print_growth_table(shell)
+    return False
+
+
+def _summary_tokens(shell: AgentShell) -> int | None:
+    """Size of the summary pseudo-pair, counted in a shape the counter accepts.
+
+    `counter.count(summary_messages(...))` looks right and returns None on the
+    exact tokenizer: the pair ends with role=assistant, and MistralCounter
+    refuses that shape outright (the same refusal documented for
+    _completion_estimate). Both /tokens and /summary then printed a dash
+    instead of the number — measured on a w02d09 dry-run. Counting a probe
+    request that ENDS with an empty user message keeps the shape legal;
+    subtracting that empty request removes the chat-template overhead, so what
+    is left is the pair's own cost.
+    """
+    if shell.counter is None or not shell.summary:
+        return None
+    empty = [{"role": "user", "content": ""}]
+    with_pair = shell.counter.count([*summary_messages(shell.summary), *empty])
+    overhead = shell.counter.count(empty)
+    if with_pair is None or overhead is None:
+        return None
+    return max(0, with_pair - overhead)
+
+
+def _compact_label(shell: AgentShell) -> str:
+    """/tokens line about compaction: on or off, summary present, its cost.
+
+    Compaction cost is named here because there's nowhere else to name it:
+    service calls land in neither "total for session" nor the growth table
+    (SPEC §7).
+    """
+    if not shell.config.params.compact:
+        return "выключено (/set compact on)"
+    if not shell.agent.compact_enabled():
+        # Param is on but there's nothing to compact with (prompt didn't
+        # load) — not "disabled by the user", needs different wording.
+        return "включено, но суммаризатора нет — работает обычная обрезка"
+
+    parts = [f"порог {shell.agent.compact_every} сообщений, хвост {shell.agent.keep_last}"]
+    if shell.summary:
+        covered = max(0, len(shell.session.turns) - len(shell.history))
+        size = _summary_tokens(shell)
+        mark = "" if shell.counter is not None and shell.counter.exact else "~"
+        parts.append(f"пересказ есть: {covered} сообщений в {mark}{_num(size)} токенов")
+    else:
+        parts.append("пересказа ещё нет")
+    if shell.compact_calls:
+        parts.append(
+            f"сжатий {shell.compact_calls}, стоили "
+            f"{shell.compact_prompt}/{shell.compact_completion}"
+        )
+    return "; ".join(parts)
+
+
+@command("/compact", "сжать историю прямо сейчас, не дожидаясь порога")
+def _cmd_compact(shell: AgentShell, args: list[str]) -> bool:
+    _warn_extra_args("/compact", args)
+    compaction = shell.agent.compact_now(shell.summary, shell.history)
+    if compaction is None:
+        # Agent already named the reason via on_warning: disabled, nothing
+        # to compact, or the call failed. Repeating it here is just noise.
+        return False
+    shell.summary = compaction.summary
+    shell.history = list(compaction.tail)
+    _report_compaction(shell, compaction)
+    # Straight to disk: the summary is a form of memory, and losing it to
+    # Ctrl+C between compaction and the next turn would lose the whole
+    # conversation up to the tail — the compacted part won't return to the
+    # working history.
+    _save_state(shell)
+    return False
+
+
+@command("/summary", "показать действующий пересказ целиком")
+def _cmd_summary(shell: AgentShell, args: list[str]) -> bool:
+    _warn_extra_args("/summary", args)
+    if not shell.summary:
+        console.note("пересказа нет: история идёт в модель целиком")
+        return False
+    covered = max(0, len(shell.session.turns) - len(shell.history))
+    size = _summary_tokens(shell)
+    mark = "" if shell.counter is not None and shell.counter.exact else "~"
+    console.note(f"пересказ заменяет {covered} сообщений и занимает {mark}{_num(size)} токенов:")
+    # stderr, like all REPL service output: a command's product is the
+    # model's answer, not a status report (stdout/stderr contract, CLAUDE.md).
+    # rich_escape: the summary came from the model, and any [something] in
+    # it would be taken by Rich as markup.
+    console.err.print(rich_escape(shell.summary))
     return False
 
 

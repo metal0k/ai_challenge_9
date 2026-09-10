@@ -21,12 +21,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from advent_core import chat as chat_core
 from advent_core import formats
 from advent_core.chat import Message
+from advent_core.compact import (
+    fold_summary,
+    should_compact,
+    split_history,
+    summary_messages,
+)
 from advent_core.config import Config, ConfigError
+from advent_core.errors import AdventError
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCounter, reconcile
 
@@ -47,6 +54,20 @@ DEFAULT_MAX_TURNS = 10
 # значит гарантированно получить 400 на длинном ответе.
 RESPONSE_RESERVE_TOKENS = 1024
 
+# How many recent messages stay untouched when keep_last is unset. Six is
+# three full pairs: measured on a real session, minus 62% on the request
+# while keeping the last three exchanges live (PROBE-w02d09-compact.md §2).
+DEFAULT_KEEP_LAST = 6
+
+# Threshold for scheduled compaction, in not-yet-compacted old messages.
+DEFAULT_COMPACT_EVERY = 10
+
+# Summary length cap. Set explicitly rather than inherited from the session's
+# max_tokens: a predictable compaction cost matters more than letting the
+# model write longer — a summary that grows to the size of the original
+# history defeats the point of compacting.
+SUMMARY_MAX_TOKENS = 600
+
 # Пометка об обрыве, дописываемая к сохранённой части ответа. Приём взят у
 # gptme (INTERRUPT_CONTENT): следующий ход модели должен видеть, что её
 # оборвали, а не считать обрубок законченной мыслью.
@@ -56,6 +77,43 @@ RESPONSE_RESERVE_TOKENS = 1024
 # трактует по-своему, а обрыв касается ровно этого ответа и должен ехать
 # вместе с ним (в том числе в файл сессии).
 INTERRUPT_NOTE = "[ответ прерван пользователем и остался незаконченным]"
+
+
+@dataclass(slots=True, frozen=True)
+class Compaction:
+    """One completed history compaction.
+
+    A separate type rather than a pair of numbers on AgentReply: compaction is
+    a MODEL CALL with its own usage, and it must be visible as one. Showing
+    "the request dropped from 6369 tokens to 1429" while staying silent about
+    what the summary itself cost would be misleading — this type exists to
+    prevent exactly that (SPEC-w02d09.md §7).
+
+    `covered` — how many messages went into the summary this round.
+    `tokens_before`/`tokens_after` — request size before and after
+    substitution; None means "could not be counted", not zero.
+
+    `tail` — the history left untouched. `ask()`'s caller doesn't need it (it
+    gets the finished `AgentReply.history`), but `/compact` compacts outside a
+    turn, and without the tail it would have to repeat split_history itself —
+    a second place knowing the pair-boundary rule.
+    """
+
+    summary: str
+    covered: int
+    result: CallResult
+    # A list on a frozen dataclass: immutability here is about the fact of
+    # compaction, not about protecting the buffer. The tail is copied on
+    # input; the CLI owns it after that.
+    tail: list[Message] = field(default_factory=list)
+    tokens_before: int | None = None
+    tokens_after: int | None = None
+
+    def saved(self) -> int | None:
+        """Tokens shaved off the request. None — nothing to count from."""
+        if self.tokens_before is None or self.tokens_after is None:
+            return None
+        return self.tokens_before - self.tokens_after
 
 
 @dataclass(slots=True, frozen=True)
@@ -87,6 +145,14 @@ class AgentReply:
     context_tokens: int | None = None
     context_exact: bool = False
     dropped_tokens: int | None = None
+    # Summary in effect AFTER this turn: same one passed into ask(), or a new
+    # one if compaction fired. Lives next to history for the same reason — the
+    # agent keeps no memory of its own, the caller does. `history` does NOT
+    # include the summary: only real turns; the pseudo-pair is rebuilt fresh
+    # from this text on every turn.
+    summary: str | None = None
+    # Set only when compaction happened on this exact turn.
+    compaction: Compaction | None = None
 
 
 def marker_instruction(kind: str, needle: str) -> str:
@@ -195,6 +261,7 @@ class Agent:
         context_limit: int | None = None,
         persona: str | None = None,
         dialog_preset: str | None = None,
+        summary_prompt: str | None = None,
         on_warning: Callable[[str], None] | None = None,
     ) -> None:
         self.config = config
@@ -213,6 +280,20 @@ class Agent:
         # неделе (week_02/prompts), а не в core: core не знает про промпты
         # недели и не должен читать её файлы.
         self.dialog_preset = dialog_preset
+        # System prompt for the summarizer model. None — nothing to compact
+        # with, and the mode turns itself off with a warning: a silently
+        # "compacting" agent that actually just trims is worse than one that's
+        # off.
+        #
+        # The agent's persona is deliberately NOT mixed in here: "ask one
+        # clarifying question at a time" has nothing to do with summarizing,
+        # and the rule "a day that measures quality must drop the persona"
+        # was already paid for in week 01 (CLAUDE.md).
+        self.summary_prompt = summary_prompt
+        # A compaction that has been paid for but whose turn hasn't finished
+        # yet. ask() parks it here so a failing model call can't take it down
+        # with it — see the comment at the assignment.
+        self.pending_compaction: Compaction | None = None
         self._on_warning = on_warning
         # Одинаковые предупреждения не повторяются каждый ход: в разговоре на
         # двадцать реплик «лимит окна неизвестен» двадцать раз — это шум, в
@@ -322,8 +403,22 @@ class Agent:
         # выбросит всё, что сможет, и вызывающий код это увидит по dropped.
         return max(budget, 0)
 
-    def _trim(self, history: Sequence[Message], system: str | None, user_input: str) -> _Trimmed:
+    def _trim(
+        self,
+        history: Sequence[Message],
+        system: str | None,
+        user_input: str,
+        *,
+        head: Sequence[Message] = (),
+    ) -> _Trimmed:
         """Обрезает историю под окно модели. Пары user+assistant — целиком.
+
+        `head` — messages that go into the request but must not be dropped:
+        the summary pseudo-pair. It's the compressed form of everything
+        already dropped, and dropping it would lose the whole conversation
+        instead of just its tail. `head` is not returned in `_Trimmed.history`
+        — only real turns, which the caller uses to build the next turn's
+        history.
 
         Порог в токенах — то, ради чего в дне 06 появился счётчик: у недели 01
         он был в символах, потому что считать было нечем. Оба пути живут
@@ -340,7 +435,9 @@ class Agent:
             # есть объём выброшенного, который SPEC §8 требует назвать вслух.
             before: int | None = None
             while True:
-                messages = chat_core.build_messages(user_input, system=system, history=trimmed)
+                messages = chat_core.build_messages(
+                    user_input, system=system, history=[*head, *trimmed]
+                )
                 tokens = self.counter.count(messages)
                 if tokens is None:
                     # Посчитать не удалось — не притворяемся, что влезло:
@@ -381,9 +478,171 @@ class Agent:
                 once=True,
             )
         trimmed_chars, dropped_chars = chat_core.trim_history(list(history))
-        messages = chat_core.build_messages(user_input, system=system, history=trimmed_chars)
+        messages = chat_core.build_messages(
+            user_input, system=system, history=[*head, *trimmed_chars]
+        )
         tokens = self.counter.count(messages) if self.counter is not None else None
         return _Trimmed(trimmed_chars, dropped_chars, tokens)
+
+    # --- history compaction --------------------------------------------------
+
+    def compact_enabled(self) -> bool:
+        """Whether compaction is on. Nothing to compact with counts as off.
+
+        The summarizer prompt comes from outside (a file under
+        advent_core/prompts, read by the CLI). Without it compaction can't
+        run, and pretending it does is worse: the user would see "compact on"
+        while plain trimming runs underneath.
+        """
+        if not self.config.params.compact:
+            return False
+        if not self.summary_prompt:
+            self._warn(
+                "сжатие истории включено, но промпт суммаризатора не задан — "
+                "работает обычная обрезка",
+                once=True,
+            )
+            return False
+        return True
+
+    @property
+    def keep_last(self) -> int:
+        """How many recent messages stay untouched. None — default."""
+        value = self.config.params.keep_last
+        return DEFAULT_KEEP_LAST if value is None else value
+
+    @property
+    def compact_every(self) -> int:
+        """Scheduled-compaction threshold, in messages. None — default."""
+        value = self.config.params.compact_every
+        return DEFAULT_COMPACT_EVERY if value is None else value
+
+    def _count_request(
+        self,
+        summary: str | None,
+        history: Sequence[Message],
+        system: str | None,
+        user_input: str,
+    ) -> int | None:
+        """Request size with the summary substituted in. None — nothing to count."""
+        if self.counter is None:
+            return None
+        messages = chat_core.build_messages(
+            user_input, system=system, history=[*summary_messages(summary), *history]
+        )
+        return self.counter.count(messages)
+
+    def _summarize(self, previous: str | None, older: Sequence[Message]) -> CallResult | None:
+        """A separate model call: summarize the old part of the conversation.
+
+        A call error does NOT kill the turn — the only place in the agent
+        where AdventError is downgraded to a warning. Compaction is an
+        optimization, not a precondition: on failure plain trimming still
+        works, and there's no reason to lose the user's already-typed
+        question over it. ask()'s own error still propagates up.
+        """
+        messages: list[Message] = [
+            {"role": "system", "content": self.summary_prompt or ""},
+            {"role": "user", "content": fold_summary(previous, older)},
+        ]
+        # Session params don't fit this side call: format=json would force the
+        # summarizer to answer with an object, stop would cut the summary
+        # mid-word, and the user's max_tokens isn't this task's budget. A copy
+        # of the config, not an in-place edit: config is shared with the CLI,
+        # and an in-place edit would leak into the next ordinary turn.
+        params = replace(
+            self.config.params,
+            max_tokens=SUMMARY_MAX_TOKENS,
+            format=None,
+            schema_file=None,
+            stop=None,
+        )
+        try:
+            return self._complete(replace(self.config, params=params), messages, self.capabilities)
+        except AdventError as error:
+            self._warn(f"сжатие истории не удалось ({error.message}) — история будет обрезана")
+            return None
+
+    def _compact(
+        self,
+        previous: str | None,
+        older: Sequence[Message],
+        tail: Sequence[Message],
+        before: int | None,
+        system: str | None,
+        user_input: str,
+    ) -> Compaction | None:
+        """The compaction itself: call the summarizer, assemble a Compaction.
+
+        Shared body for scheduled compaction inside ask() and for `/compact`:
+        they differ only in the trigger condition, not in what happens. None —
+        compaction didn't happen (call failed or the summary was empty), and
+        the caller must carry on with the previous summary and history.
+        """
+        result = self._summarize(previous, older)
+        if result is None:
+            return None
+        text = (result.text or "").strip()
+        if not text:
+            # An empty response is not a summary. Substituting it would replace
+            # the old part of the conversation with nothing — exactly what
+            # compaction is supposed to avoid.
+            self._warn("суммаризатор вернул пустой пересказ — история будет обрезана")
+            return None
+        return Compaction(
+            summary=text,
+            covered=len(older),
+            result=result,
+            tail=list(tail),
+            tokens_before=before,
+            tokens_after=self._count_request(text, tail, system, user_input),
+        )
+
+    def take_pending_compaction(self) -> Compaction | None:
+        """A paid compaction whose turn then failed. Hands it over exactly once."""
+        pending = self.pending_compaction
+        self.pending_compaction = None
+        return pending
+
+    def compact_now(
+        self,
+        summary: str | None,
+        history: Sequence[Message],
+        *,
+        user_input: str = "",
+    ) -> Compaction | None:
+        """Compact the history right now, bypassing triggers. None — failed.
+
+        Same path as in ask(), minus the should_compact() condition: `/compact`
+        is an explicit request, and "compact because asked" vs. "compact
+        because it piled up" are different events — folding them into one
+        condition would give the user a button that sometimes silently does
+        nothing.
+
+        `user_input` is empty: compaction outside a turn doesn't know the next
+        question, so the before/after numbers are counted against the request
+        without it — doesn't affect the comparison, it's the same on both sides.
+        """
+        if not self.compact_enabled():
+            # Two different reasons, two different remedies. compact_enabled()
+            # also returns False when compaction is ON but the summarizer
+            # prompt failed to load — telling that user to `/set compact on`
+            # sends them to re-toggle a setting that is already on.
+            if not self.config.params.compact:
+                self._warn("сжатие выключено — /set compact on включит его")
+            else:
+                self._warn("сжимать нечем: промпт суммаризатора не загрузился")
+            return None
+        system = self.system_prompt()
+        older, tail = split_history(history, self.keep_last)
+        if not older:
+            self._warn(
+                f"сжимать нечего: в истории {len(history)} сообщений, "
+                f"а хвост keep_last={self.keep_last} остаётся как есть"
+            )
+            return None
+        before = self._count_request(summary, history, system, user_input)
+        return self._compact(summary, older, tail, before, system, user_input)
 
     # --- сам ход -----------------------------------------------------------
 
@@ -392,6 +651,7 @@ class Agent:
         user_input: str,
         history: list[Message],
         *,
+        summary: str | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> AgentReply:
         """Один ход: собрать, обрезать, спросить, разобрать.
@@ -403,13 +663,46 @@ class Agent:
         self._warn(self.check_done(), once=True)
 
         system = self.system_prompt()
-        trimmed = self._trim(history, system, user_input)
-        messages = chat_core.build_messages(user_input, system=system, history=trimmed.history)
+        summary_now = summary
+        compaction: Compaction | None = None
+        working: list[Message] = list(history)
+
+        if self.compact_enabled():
+            older, tail = split_history(working, self.keep_last)
+            before = self._count_request(summary_now, working, system, user_input)
+            budget = self._token_budget()
+            # Either side can be unknown (no counter, no window) — then the
+            # budget trigger simply doesn't fire, and the scheduled
+            # message-count trigger still works. A made-up "doesn't fit"
+            # would be worse than none at all.
+            over_budget = before is not None and budget is not None and before > budget
+            if should_compact(older, over_budget=over_budget, compact_every=self.compact_every):
+                compaction = self._compact(summary_now, older, tail, before, system, user_input)
+                if compaction is not None:
+                    summary_now = compaction.summary
+                    working = list(compaction.tail)
+                    # The summarizer call is already made and already paid for.
+                    # If the turn's own call below raises, ask() never returns
+                    # and this Compaction would vanish with it: no journal row,
+                    # no line in /tokens, and — since the history it was built
+                    # from is unchanged — a second summarizer call on the next
+                    # attempt. Park it where the caller can still collect it.
+                    self.pending_compaction = compaction
+
+        head = summary_messages(summary_now)
+        trimmed = self._trim(working, system, user_input, head=head)
+        messages = chat_core.build_messages(
+            user_input, system=system, history=[*head, *trimmed.history]
+        )
 
         if on_chunk is not None and chat_core.should_stream(self.config):
             result = self._stream(self.config, messages, on_chunk, self.capabilities)
         else:
             result = self._complete(self.config, messages, self.capabilities)
+
+        # The turn survived: the compaction now travels in the reply, so the
+        # parked copy is nobody's responsibility any more.
+        self.pending_compaction = None
 
         # Сверять надо с тем, что РЕАЛЬНО ушло в API: слой формата дописывает
         # инструкцию к system внутри chat._payload(), и сверка «до слоя» дала
@@ -442,6 +735,8 @@ class Agent:
             context_tokens=trimmed.tokens,
             context_exact=bool(self.counter and self.counter.exact and trimmed.tokens is not None),
             dropped_tokens=trimmed.dropped_tokens,
+            summary=summary_now,
+            compaction=compaction,
         )
 
     def _detect_done(self, text: str) -> bool:
@@ -463,11 +758,15 @@ class Agent:
 # Экспортируется явно: набор публичных имён модуля — часть контракта с CLI и с
 # неделей 03, которая продолжит того же агента.
 __all__ = [
+    "DEFAULT_COMPACT_EVERY",
+    "DEFAULT_KEEP_LAST",
     "DEFAULT_MAX_TURNS",
     "INTERRUPT_NOTE",
     "RESPONSE_RESERVE_TOKENS",
+    "SUMMARY_MAX_TOKENS",
     "Agent",
     "AgentReply",
+    "Compaction",
     "CompleteFn",
     "StreamFn",
     "done_conflicts_with_stop",

@@ -436,3 +436,33 @@ def test_every_local_param_is_read_by_week01_or_listed_in_non_chat_params():
         and re.search(rf"\bparams\.{re.escape(spec.name)}\b", source) is None
     ]
     assert missing == []
+
+
+# --- history compaction: three Day 09 params -------------------------------
+
+
+def test_compaction_params_never_reach_the_payload():
+    """compact/keep_last/compact_every control the agent, the server never sees them.
+
+    Not in payload, not in skipped: skipped means "the model would reject it",
+    but here the name never reaches the server at all.
+    """
+    params = GenerationParams.build(compact=False, keep_last=4, compact_every=8)
+    payload, skipped = params.as_payload(REASONING)
+    assert payload == {}
+    assert skipped == []
+
+
+def test_compaction_params_are_parsed_into_their_types():
+    params = GenerationParams.build(compact=True, keep_last=4, compact_every=8)
+    assert params.compact is True
+    assert params.keep_last == 4
+    assert params.compact_every == 8
+
+
+@pytest.mark.parametrize("bad", [{"keep_last": 1}, {"keep_last": 0}, {"compact_every": 1}])
+def test_compaction_bounds_are_enforced(bad):
+    """A user+assistant pair is indivisible: keep_last=1 would leave half an
+    exchange, and compact_every=1 would compact after every single turn."""
+    with pytest.raises(ParamError):
+        GenerationParams.build(**bad)

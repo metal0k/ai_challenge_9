@@ -414,9 +414,9 @@ def test_params_shows_only_what_the_agent_reads(monkeypatch, tmp_path, capsys):
 # --- журнал -----------------------------------------------------------------
 
 
-def test_journal_is_written_with_week_2_and_day_8(monkeypatch, tmp_path):
-    """Литералы 2 и 8, а не cli.WEEK/cli.DAY: ожидание, взятое из того же
-    источника, что и код под тестом, покраснеть не может (CLAUDE.md)."""
+def test_journal_is_written_with_week_2_and_day_9(monkeypatch, tmp_path):
+    """Literals 2 and 9, not cli.WEEK/cli.DAY: an expectation taken from the
+    same source as the code under test cannot go red (CLAUDE.md)."""
     logged: dict = {}
     monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: logged.update(kwargs))
     shell = _shell(monkeypatch, tmp_path)
@@ -424,7 +424,7 @@ def test_journal_is_written_with_week_2_and_day_8(monkeypatch, tmp_path):
     cli._turn(shell, "вопрос")
 
     assert logged["week"] == 2
-    assert logged["day"] == 8
+    assert logged["day"] == 9
 
 
 def test_journal_logs_what_actually_went_to_the_api(monkeypatch, tmp_path):
@@ -516,6 +516,11 @@ def test_defaults_come_from_the_registry_not_from_the_typer_signature():
         "mode": "chat",
         "max_turns": 10,
         "session": "default",
+        # Day 09: compaction is on by default — "an agent that works with
+        # compression" IS the day's result, not an opt-in flag.
+        "compact": True,
+        "keep_last": 6,
+        "compact_every": 10,
     }
 
     signature = inspect.signature(cli.agent)
@@ -1688,3 +1693,334 @@ def test_footer_keeps_the_question_mark_without_a_counter(monkeypatch, tmp_path,
 
     stderr = _flat(capsys.readouterr().err)
     assert "tokens ?" in stderr
+
+
+# --- history compaction (SPEC-w02d09.md §§7-11) -----------------------------
+
+
+def _compact_shell(monkeypatch, tmp_path, replies=None, **params) -> cli.AgentShell:
+    """A shell where compaction fires on the third turn.
+
+    keep_last=2 and compact_every=2 instead of the registry defaults (6 and
+    10): the defaults need sixteen messages to fire, which would turn the
+    test into a fixture wall instead of a rule.
+
+    Reply queue: two ordinary turns, then a SUMMARY (the third turn's first
+    call is the summarizer), and only then the answer.
+    """
+    params.setdefault("compact", True)
+    params.setdefault("keep_last", 2)
+    params.setdefault("compact_every", 2)
+    return _shell(
+        monkeypatch,
+        tmp_path,
+        complete=_complete(replies or ["о1", "о2", "пересказ", "о3"]),
+        **params,
+    )
+
+
+def _three_turns(shell) -> None:
+    for question in ("первый", "второй", "третий"):
+        cli._turn(shell, question)
+
+
+def test_compaction_note_names_both_the_gain_and_its_price(monkeypatch, tmp_path, capsys):
+    """A gain with no price is a profit report that names no cost (§7)."""
+    shell = _compact_shell(monkeypatch, tmp_path)
+
+    _three_turns(shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "история сжата: 2 старых сообщений заменены пересказом" in stderr
+    # Double's usage: prompt 10, completion 5 — the price of the summary call itself.
+    assert "сам пересказ стоил 10/5" in stderr
+
+
+def test_the_compaction_call_is_journalled_as_a_service_call_not_a_turn(monkeypatch, tmp_path):
+    """`kind=compact` tells a service call apart from a conversation turn:
+    otherwise the day 08 growth table would count the summary as a user turn,
+    and its prompt (the old history!) would skew exactly the curve it shows.
+
+    Literal 9, not cli.DAY: an expectation taken from the same source as the
+    code under test cannot go red (CLAUDE.md)."""
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    shell = _compact_shell(monkeypatch, tmp_path)
+
+    _three_turns(shell)
+
+    compact_rows = [row for row in rows if row.get("extra", {}).get("kind") == "compact"]
+    assert len(compact_rows) == 1
+    assert compact_rows[0]["week"] == 2
+    assert compact_rows[0]["day"] == 9
+    assert compact_rows[0]["extra"]["covered"] == 2
+    # Ordinary turns stay unmarked: the growth table counts them.
+    assert [row.get("extra") for row in rows if row.get("extra") is None] != []
+    # And in session memory the compaction did not become a turn: three exchanges, not four.
+    assert len(shell.session.turns) == 6
+
+
+def test_summary_survives_a_restart_and_shortens_the_working_history(monkeypatch, tmp_path, capsys):
+    """The session file stays complete, and after a restart the working
+    history starts exactly where the summary's coverage ends (§8)."""
+    shell = _compact_shell(monkeypatch, tmp_path)
+    _three_turns(shell)
+
+    assert shell.summary == "пересказ"
+    saved = Session.load("default", directory=tmp_path)
+    assert saved.state["summary"] == "пересказ"
+    assert saved.state["summary_upto"] == 2
+    # Compaction changes the request, not the record: the file keeps all three exchanges.
+    assert len(saved.turns) == 6
+
+    capsys.readouterr()
+    second = _shell(monkeypatch, tmp_path, complete=_complete(["ещё"]))
+
+    assert second.summary == "пересказ"
+    assert [m["content"] for m in second.history] == ["второй", "о2", "третий", "о3"]
+    assert "подхвачен пересказ" in _flat(capsys.readouterr().err)
+
+
+def test_a_session_file_without_the_summary_key_is_read_as_no_summary(monkeypatch, tmp_path):
+    """The key is additive, the version was not bumped: files from days 06-08
+    don't know it, and "key absent" means "no summary", not breakage (§8)."""
+    session = Session.new("default", directory=tmp_path)
+    session.record("вопрос", "ответ", model="ministral-14b-latest")
+    session.state = {"mode": "chat", "done": None}
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.summary is None
+    assert len(shell.history) == 2
+
+
+def test_summary_upto_beyond_the_history_drops_the_summary_with_a_warning(
+    monkeypatch, tmp_path, capsys
+):
+    """The boundary doesn't match the history — a summary rewound to the wrong
+    place substitutes someone else's content for the conversation; not to be trusted (§8)."""
+    session = Session.new("default", directory=tmp_path)
+    session.record("вопрос", "ответ", model="ministral-14b-latest")
+    session.state = {"summary": "пересказ", "summary_upto": 99}
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.summary is None
+    assert len(shell.history) == 2
+    assert "пересказ отброшен" in _flat(capsys.readouterr().err)
+
+
+@pytest.mark.parametrize("upto", [None, "2", True, 1.5, "нет"])
+def test_a_summary_without_a_usable_boundary_is_dropped_with_a_warning(
+    monkeypatch, tmp_path, capsys, upto
+):
+    """A boundary that is present-and-wrong is not the same as an absent key.
+
+    Defaulting it to 0 was the one outcome the mechanism exists to prevent:
+    the summary AND the whole history it summarizes go into the same request,
+    doubling what compaction had just shrunk (§8). `None` is in the list on
+    purpose — that is what a hand-edited file looks like — and `True` too,
+    since bool is an int in Python.
+    """
+    session = Session.new("default", directory=tmp_path)
+    session.record("вопрос", "ответ", model="ministral-14b-latest")
+    session.state = {"summary": "пересказ"}
+    if upto is not None:
+        session.state["summary_upto"] = upto
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.summary is None
+    assert len(shell.history) == 2
+    assert "пересказ отброшен" in _flat(capsys.readouterr().err)
+
+
+def test_a_paid_compaction_is_kept_when_the_turn_after_it_fails(monkeypatch, tmp_path, capsys):
+    """The summarizer call is separate and already paid for (§7).
+
+    Losing it because the turn failed afterwards would mean: no `kind=compact`
+    row, nothing in `/tokens`, and a second summarizer call on the retry —
+    the history it was built from is unchanged, so the trigger fires again.
+    """
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    inner = _complete(["о1", "о2", "пересказ"])
+    calls: list[int] = []
+
+    def complete(config, messages, capabilities=None):
+        calls.append(1)
+        # Call 3 is the summarizer of the third turn; call 4 is that turn's own
+        # request — the one that fails.
+        if len(calls) == 4:
+            raise AdventError("сеть отвалилась")
+        return inner(config, messages, capabilities)
+
+    shell = _shell(
+        monkeypatch, tmp_path, complete=complete, compact=True, keep_last=2, compact_every=2
+    )
+    _three_turns(shell)
+
+    assert [row.get("extra", {}).get("kind") for row in rows].count("compact") == 1
+    assert shell.compact_calls == 1
+    assert shell.summary == "пересказ"
+    assert [m["content"] for m in shell.history] == ["второй", "о2"]
+    # And on disk, so a restart doesn't pay for the same summary again.
+    saved = Session.load("default", directory=tmp_path)
+    assert saved.state["summary"] == "пересказ"
+    assert saved.state["summary_upto"] == 2
+    stderr = _flat(capsys.readouterr().err)
+    assert "история сжата" in stderr
+    assert "сеть отвалилась" in stderr
+
+
+def test_new_clears_the_summary_but_keeps_the_settings(monkeypatch, tmp_path):
+    """A summary is conversation content, not a setting: a summary surviving
+    `/new` would mean an agent remembering what isn't in the history (§8)."""
+    shell = _compact_shell(monkeypatch, tmp_path)
+    _three_turns(shell)
+    cli._dispatch("/set context_limit 2500", shell)
+    assert shell.summary == "пересказ"
+
+    cli._dispatch("/new", shell)
+
+    assert shell.summary is None
+    assert shell.history == []
+    state = Session.load("default", directory=tmp_path).state
+    assert state.get("summary") is None
+    # ...while settings stay put: `/new` doesn't touch them.
+    assert state["context_limit"] == 2500
+    assert state["mode"] == "chat"
+
+
+def test_compact_command_on_a_short_history_makes_no_api_call(monkeypatch, tmp_path, capsys):
+    """A clear message instead of an LLM call (§10): nothing to compact."""
+    seen: list[list[dict]] = []
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(seen=seen), compact=True)
+    capsys.readouterr()
+
+    cli._dispatch("/compact", shell)
+
+    assert seen == []
+    assert shell.summary is None
+    assert "сжимать нечего" in _flat(capsys.readouterr().err)
+
+
+def test_compact_command_compresses_now_and_persists_the_result(monkeypatch, tmp_path, capsys):
+    """`/compact` doesn't wait for a threshold — and persists the summary to
+    disk right away: losing it before the next turn would mean losing the conversation."""
+    shell = _compact_shell(
+        monkeypatch, tmp_path, replies=["о1", "о2", "сжатие по просьбе"], compact_every=100
+    )
+    cli._turn(shell, "первый")
+    cli._turn(shell, "второй")
+    capsys.readouterr()
+
+    cli._dispatch("/compact", shell)
+
+    assert shell.summary == "сжатие по просьбе"
+    assert [m["content"] for m in shell.history] == ["второй", "о2"]
+    assert Session.load("default", directory=tmp_path).state["summary"] == "сжатие по просьбе"
+    assert "история сжата" in _flat(capsys.readouterr().err)
+
+
+def test_summary_command_shows_what_the_agent_remembers(monkeypatch, tmp_path, capsys):
+    """Without this command a summary is an invisible entity shaping the answers."""
+    shell = _compact_shell(monkeypatch, tmp_path)
+    _three_turns(shell)
+    capsys.readouterr()
+
+    cli._dispatch("/summary", shell)
+
+    captured = capsys.readouterr()
+    stderr = _flat(captured.err)
+    assert "пересказ заменяет 2 сообщений" in stderr
+    assert "пересказ" in stderr
+    # REPL diagnostics go to stderr: the command's product is the model's answer.
+    assert captured.out == ""
+
+
+def test_summary_command_without_a_summary_says_so(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/summary", shell)
+
+    assert "история идёт в модель целиком" in _flat(capsys.readouterr().err)
+
+
+class _RefusesUnlessLastIsUser:
+    """Double reproducing MistralCounter's actual refusal.
+
+    Measured 2026-09-10 on the real tokenizer: summary_messages() alone → None,
+    the same pair plus an empty user message → 35 against 3 for the empty one.
+    The no_network fixture installs a permissive EstimateCounter that counts any
+    shape, so only a double this strict can go red on the shape bug.
+    """
+
+    exact = True
+    name = "точный-двойник"
+
+    def count(self, messages):
+        if not messages or messages[-1]["role"] != "user":
+            return None
+        return sum(len(m["content"]) for m in messages) + 3
+
+    def calibrate(self, messages, prompt_tokens):
+        return None
+
+
+def test_summary_size_is_counted_in_a_shape_the_exact_tokenizer_accepts(
+    monkeypatch, tmp_path, capsys
+):
+    """`/summary` printed «занимает — токенов» on a dry-run one step from the
+    camera: the pair it counted ends with role=assistant, which the exact
+    tokenizer refuses outright."""
+    monkeypatch.setattr(
+        cli, "counter_for", lambda model, **kwargs: (_RefusesUnlessLastIsUser(), None)
+    )
+    shell = _compact_shell(monkeypatch, tmp_path)
+    _three_turns(shell)
+    capsys.readouterr()
+
+    cli._dispatch("/summary", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "— токенов" not in stderr
+    assert cli._summary_tokens(shell) > 0
+
+
+def test_tokens_names_the_size_of_the_summary_on_an_exact_counter(monkeypatch, tmp_path, capsys):
+    """The same refusal on the second call site: /tokens showed the compaction
+    line with a dash where the summary's size belongs."""
+    monkeypatch.setattr(
+        cli, "counter_for", lambda model, **kwargs: (_RefusesUnlessLastIsUser(), None)
+    )
+    shell = _compact_shell(monkeypatch, tmp_path)
+    _three_turns(shell)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "пересказ есть: 2 сообщений в" in table
+    assert "— токенов" not in table
+
+
+def test_tokens_names_the_number_of_compactions_and_their_price(monkeypatch, tmp_path, capsys):
+    """Nowhere else names the price of compactions: by construction, service
+    calls are absent from both "session total" and the growth table (§7)."""
+    shell = _compact_shell(monkeypatch, tmp_path)
+    _three_turns(shell)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "сжатие истории" in table
+    assert "сжатий 1, стоили 10/5" in table
+    assert "пересказ есть: 2 сообщений" in table
+
+
+def test_tokens_says_compaction_is_off_when_it_is(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, compact=False)
+
+    assert "выключено (/set compact on)" in _tokens_table(shell, capsys)

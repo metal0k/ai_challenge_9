@@ -57,6 +57,10 @@ AGENT_PARAMS: tuple[str, ...] = (
     # Override лимита окна (день 08): агент читает его при trim — без имени
     # в этом списке /set context_limit в агенте отвергся бы как «не читается».
     "context_limit",
+    # History compaction (day 09): agent reads it before building the request.
+    "compact",
+    "keep_last",
+    "compact_every",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -174,6 +178,37 @@ SPECS: tuple[Spec, ...] = (
         1,
         None,
         local=True,
+    ),
+    # Day 09 (SPEC-w02d09.md §9): history compaction. All three are local —
+    # the server never sees them, the agent decides before sending the request.
+    Spec(
+        "compact",
+        "bool",
+        "Сжимать старую часть истории в пересказ вместо выбрасывания.",
+        local=True,
+        # On by default: the day's result is framed as "an agent that
+        # compresses". Turning it off is needed for comparison and the demo.
+        defaults={AGENT_COMMAND: True},
+    ),
+    Spec(
+        "keep_last",
+        "int",
+        "Сколько последних сообщений остаётся в контексте как есть.",
+        # Minimum 2, not 1: a question-answer pair is indivisible; a
+        # one-message tail would mean an answer without its question or vice versa.
+        2,
+        None,
+        local=True,
+        defaults={AGENT_COMMAND: 6},
+    ),
+    Spec(
+        "compact_every",
+        "int",
+        "Порог сжатия: столько несжатых старых сообщений запускают пересказ.",
+        2,
+        None,
+        local=True,
+        defaults={AGENT_COMMAND: 10},
     ),
     Spec(
         "session",
@@ -395,6 +430,13 @@ class GenerationParams:
     # Умолчание команды не заводим: `/set context_limit default` обязан
     # вернуть именно None, а не подменить его дефолтом через apply_defaults().
     context_limit: int | None = None
+
+    # Day 09 params (SPEC-w02d09.md §9): history compaction. None here means
+    # "command default" (apply_defaults fills it in), not "off" — the agent's
+    # compact defaults to on.
+    compact: bool | None = None
+    keep_last: int | None = None
+    compact_every: int | None = None
 
     # Параметр агента (день 06): имя сессии на диске. Тоже локальный — в
     # payload не идёт, но живёт в общем реестре, потому что `/set session

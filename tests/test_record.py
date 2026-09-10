@@ -233,8 +233,9 @@ def test_demo_steps_raises_on_an_unknown_week_and_day():
 
     Пары держим всегда за пределами реализованных сценариев: (2, 7) стоял
     здесь как «несуществующий», и день 7, получив свой сценарий, сломал тест —
-    сам по себе он ничего не проверял о дне 7."""
-    for week, day in ((2, 9), (3, 1), (1, 9)):
+    сам по себе он ничего не проверял о дне 7. То же повторилось с (2, 9)
+    в день 09; заменено на (2, 10)."""
+    for week, day in ((2, 10), (3, 1), (1, 9)):
         with pytest.raises(AdventError):
             record_mod.demo_steps(week, day)
 
@@ -398,6 +399,146 @@ def test_day_08_scenario_has_no_step_without_an_action():
     ), "день 08: шаг без действия и без текста"
 
 
+# --------------------------------------------------------------------------
+# Week 02, Day 09 (SPEC-w02d09.md §14): the same dialog with compaction off and
+# on, then the offline comparison in numbers.
+# --------------------------------------------------------------------------
+
+
+def test_day_09_plays_the_dialog_live_only_with_compaction_on():
+    """The live "compaction off" run was cut on 2026-09-10: the bench's own off
+    column shows the same thing, and playing the 12-turn dialog four times in
+    one take (twice live, twice in the bench) made the video ten minutes long.
+
+    The `off` half is not gone from the day — it moved into the harness, which
+    is what the last step asserts."""
+    steps = record_mod.demo_steps(2, 9)
+    live = steps[0]
+
+    assert live.stdin_lines[0] == "/new"
+    assert "/set compact on" in live.stdin_lines
+    assert "/set context_limit 2500" in live.stdin_lines
+    assert not any("/set compact off" in step.stdin_lines for step in steps), (
+        "живой прогон без сжатия вернулся в сценарий — его показывает bench"
+    )
+
+    asked = [line for line in live.stdin_lines if not line.startswith("/")]
+    assert asked[0].startswith("Запомни кодовое слово")
+    assert "кодовое слово" in asked[-1].lower()
+
+
+def test_day_09_keeps_the_dialog_and_the_summary_in_one_session():
+    """`/summary` after a restart only means something if it reads the session
+    the dialog just filled."""
+    live, restart = record_mod.demo_steps(2, 9)[:2]
+
+    assert live.args == restart.args
+    assert restart.stdin_lines[0] == "/summary"
+
+
+def test_day_09_names_compaction_the_summary_and_the_numbers():
+    """Same discipline as days 04-08: what the day claims has to be said out
+    loud in the titles, not left to the viewer to infer from output."""
+    titles = " ".join(step.title.lower() for step in record_mod.demo_steps(2, 9))
+
+    assert "сжат" in titles
+    assert "пересказ" in titles
+    assert "/summary" in titles
+    assert "/tokens" in titles
+
+
+def test_day_09_ends_with_a_bench_run_pinned_to_one_that_measures_something():
+    """All four numbers hang together and most combinations show nothing: at the
+    real window trim never fires, and at a low window with the default tail trim
+    holds history at keep_last, so `older` stays empty and compaction cannot
+    fire either. Literals, not the module's constants — an expectation taken
+    from the same source as the code under test cannot go red."""
+    last = record_mod.demo_steps(2, 9)[-1]
+
+    assert last.module == "tools.compact_bench"
+    assert last.args == [
+        "--limit",
+        "1700",
+        "--turns",
+        "6",
+        "--keep-last",
+        "2",
+        "--compact-every",
+        "2",
+    ]
+
+
+def test_day_09_long_steps_get_more_time_than_the_shared_limit():
+    """Twelve turns plus typing pauses in the live step, and both bench arms in
+    one process: at STEP_TIMEOUT the take would die on the scenario being long,
+    not on a hang. A raised timeout is only ever raised."""
+    steps = record_mod.demo_steps(2, 9)
+
+    assert steps[-1].timeout is not None
+    assert steps[-1].timeout > record_mod.STEP_TIMEOUT
+    assert all(step.timeout is None or step.timeout > record_mod.STEP_TIMEOUT for step in steps), (
+        "таймаут шага занижен ниже общего потолка"
+    )
+
+
+def test_day_09_dialog_holds_the_screen_longer_than_the_shared_pause():
+    """The answer naming the codeword is the day's headline and it is ONE line;
+    the very next input (/tokens) prints a twenty-line table over it. Measured
+    on frames of the first w02d09 take: readable for ~0.4 s. The step therefore
+    asks for a longer hold than every other day gets."""
+    live = record_mod.demo_steps(2, 9)[0]
+
+    assert live.line_pause is not None
+    assert live.line_pause > record_mod.STEP_PAUSE
+
+
+def test_day_09_scenario_has_no_step_without_an_action():
+    steps = record_mod.demo_steps(2, 9)
+    assert steps, "день 09 остался без сценария"
+    assert all(
+        step.args or step.note or step.stdin_file or step.module != record_mod.DEFAULT_MODULE
+        for step in steps
+    ), "день 09: шаг без действия и без текста"
+
+
+def test_run_step_honours_a_per_step_timeout_without_stdin(monkeypatch):
+    """The bench has no stdin, so it takes the subprocess.run branch — which
+    carried no timeout at all before day 09 and could hang a take forever."""
+    seen: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(command, **kwargs):
+        seen.clear()
+        seen.update(kwargs)
+        return _Result()
+
+    monkeypatch.setattr(record_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(record_mod.time, "sleep", lambda _: None)
+
+    record_mod._run_step(record_mod.Step(title="bench", module="tools.compact_bench", timeout=600))
+    assert seen["timeout"] == 600
+
+    record_mod._run_step(record_mod.Step(title="обычный", args=["w01", "models"]))
+    assert seen["timeout"] == record_mod.STEP_TIMEOUT
+
+
+def test_run_step_reports_a_hang_on_the_no_stdin_branch(monkeypatch):
+    """A hung step must be named as such, not surface as a raw TimeoutExpired."""
+
+    def fake_run(command, **kwargs):
+        raise record_mod.subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+    monkeypatch.setattr(record_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(record_mod.time, "sleep", lambda _: None)
+
+    with pytest.raises(record_mod.AdventError) as excinfo:
+        record_mod._run_step(record_mod.Step(title="bench", module="tools.compact_bench"))
+
+    assert "завис" in str(excinfo.value)
+
+
 class _FakeStdin:
     """Принимает записи в список вместо настоящего пайпа."""
 
@@ -493,3 +634,43 @@ def test_run_step_refuses_a_missing_stdin_file(monkeypatch, tmp_path):
                 stdin_file="biginput.txt",
             )
         )
+
+
+def test_run_step_waits_a_steps_own_pause_instead_of_the_shared_one(monkeypatch):
+    """Step.line_pause (день 09) — иначе поле есть, а экран не держится:
+    константа в сценарии, которую никто не читает, выглядит как исправление и
+    им не является."""
+    written: list[str] = []
+    slept: list[float] = []
+    monkeypatch.setattr(
+        record_mod.subprocess, "Popen", lambda *args, **kwargs: _FakeProcess(written)
+    )
+    monkeypatch.setattr(record_mod.time, "sleep", slept.append)
+
+    record_mod._run_step(
+        record_mod.Step(
+            title="диалог",
+            module="week_02.cli",
+            stdin_lines=["привет"],
+            line_pause=9.0,
+        )
+    )
+
+    assert 9.0 in slept
+    assert record_mod.STEP_PAUSE not in slept
+
+
+def test_run_step_keeps_the_shared_pause_when_a_step_asks_for_nothing(monkeypatch):
+    """Дни 01-08 не должны заметить нового поля."""
+    written: list[str] = []
+    slept: list[float] = []
+    monkeypatch.setattr(
+        record_mod.subprocess, "Popen", lambda *args, **kwargs: _FakeProcess(written)
+    )
+    monkeypatch.setattr(record_mod.time, "sleep", slept.append)
+
+    record_mod._run_step(
+        record_mod.Step(title="диалог", args=["w01", "chat"], stdin_lines=["/exit"])
+    )
+
+    assert record_mod.STEP_PAUSE in slept

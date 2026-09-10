@@ -29,6 +29,7 @@ from advent_core.errors import AdventError
 # Зависимость от week_01 у этого модуля уже есть по существу — сценарии здесь
 # понедельные, — и направлена она в одну сторону: week_01 про advent_cli не
 # знает, цикла нет.
+from tools.compact_bench import SCENARIO as COMPACT_SCENARIO
 from week_01 import strategies
 
 STEP_PAUSE = 2.0
@@ -63,6 +64,8 @@ MODULE_COMMANDS = {
     "json.tool": "python -m json.tool",
     # День 08: генератор гигантского ввода — инструмент, а не команда агента.
     "tools.make_biginput": "python -m tools.make_biginput",
+    # Day 09: the offline off/on comparison — a harness, not an agent command.
+    "tools.compact_bench": "python -m tools.compact_bench",
 }
 
 
@@ -89,6 +92,17 @@ class Step:
     # этим — штатный выход: REPL встречает EOF, прощается и завершается с 0,
     # отдельный /exit после файла не нужен.
     stdin_file: str | None = None
+    # Per-step override of STEP_TIMEOUT. Day 09's bench runs the same dialog
+    # twice — two dozen calls in one process — and dying at 180 s would kill
+    # the take, not the harness. None keeps the shared limit for every other
+    # step, so days 01-08 are untouched.
+    timeout: int | None = None
+    # Per-step override of STEP_PAUSE — how long the screen holds after each
+    # REPL line. Measured on the w02d09 take: the answer naming the codeword
+    # stayed readable for ~0.4 s, because the next line (/tokens) prints twenty
+    # lines and scrolls it off. The day's headline needs a longer hold; None
+    # keeps the shared pause, so earlier days are untouched.
+    line_pause: float | None = None
 
 
 def demo_steps(week: int, day: int) -> list[Step]:
@@ -103,6 +117,8 @@ def demo_steps(week: int, day: int) -> list[Step]:
     которой не существует: проверка, чей failure path продолжается, хуже
     отсутствующей проверки, потому что читается как пройденная (CLAUDE.md).
     """
+    if week == 2 and day == 9:
+        return _demo_steps_w02d09()
     if week == 2 and day == 8:
         return _demo_steps_w02d08()
     if week == 2 and day == 7:
@@ -1047,6 +1063,114 @@ def _demo_steps_w02d08() -> list[Step]:
     ]
 
 
+# One session, not two. The live "compaction off" run was cut on 2026-09-10:
+# turn for turn it showed what the bench's own `off` column shows anyway, and
+# the same 12-turn dialog was being played FOUR times in one take (twice live,
+# twice inside the bench) — ten minutes of video for one fact.
+_DEMO_SESSION_D09 = "demo09"
+
+# How long the day-09 dialog holds the screen after each REPL line. The shared
+# STEP_PAUSE (2 s) is not enough here: the answer naming the codeword arrives
+# ~2.3 s after the question, and the next line (/tokens) prints a twenty-line
+# table that scrolls it away. Measured on frames of the first w02d09 take — the
+# day's headline was readable for ~0.4 s. At 4 s it holds for ~3.
+_DEMO_DIALOG_PAUSE = 4.0
+
+# What the bench runs in frame, pinned by live runs rather than reasoned about.
+# The full 12-turn scenario stays the harness default and is what the day's
+# measured table rests on (SPEC-w02d09.md §17); in frame it runs short.
+#
+# All four numbers hang together, and most combinations measure NOTHING. The
+# window must be low enough that six turns overflow it — and the trim budget is
+# the window MINUS a 1024-token response reserve, not the window itself. The
+# tail must be short too: trim holds history at keep_last, so `older` (what
+# should_compact looks at) never fills up while the default tail of 6 is in
+# force. Measured 2026-09-10: limit 1500 at the default keep_last gave zero
+# compactions and a codeword forgotten in BOTH arms; this combination gives
+# three compactions, forgotten with compaction off and remembered with it on.
+_DEMO_BENCH_TURNS = "6"
+_DEMO_BENCH_LIMIT = "1700"
+_DEMO_BENCH_KEEP_LAST = "2"
+_DEMO_BENCH_COMPACT_EVERY = "2"
+
+
+def _demo_steps_w02d09() -> list[Step]:
+    """Day 09 — сжатие истории: пересказ вместо старых сообщений.
+
+    Step 1 is the day's claim, live: the lowered window day 08 already used, the
+    codeword planted in the first turn, and — because compaction is on — an
+    agent that still answers it twelve turns later. Its counterpart, the same
+    dialog with compaction OFF, is deliberately not played live: the bench in
+    step 3 runs exactly that arm and prints its result, so playing it here as
+    well spent two more minutes of video on a fact the table already carries.
+
+    The replies are `tools.compact_bench`'s SCENARIO, imported rather than
+    retyped: step 3 measures this same dialog, and two hand-kept copies would
+    drift into a demo whose numbers belong to some other conversation. The
+    scenario's own first turn caps the answer length, which is load-bearing at
+    this window — see the comment on SCENARIO. Triggers stay at their defaults:
+    at context_limit 2500 the budget trigger fires on its own (§4), and the take
+    then shows the same event the bench counts.
+
+    Step 2 is a separate process on purpose. `/summary` and `/tokens` after a
+    restart show what the agent now remembers instead of the discarded history —
+    and prove in passing that the summary survives in the session file, which is
+    §8 and would otherwise stay invisible.
+
+    Step 3 is the "compare" the task statement asks for, in numbers: both modes,
+    the cost of the compaction calls subtracted. It runs shortened
+    (_DEMO_BENCH_TURNS turns at _DEMO_BENCH_LIMIT), and still gets its own
+    timeout — two arms in one process do not fit in STEP_TIMEOUT.
+    """
+    return [
+        Step(
+            title=(
+                "1. Диалог со сжатием: старые сообщения уходят в пересказ — "
+                "кодовое слово переживает обрезку"
+            ),
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION_D09],
+            stdin_lines=[
+                "/new",
+                "/set context_limit 2500",
+                "/set compact on",
+                *COMPACT_SCENARIO,
+                "/tokens",
+                "/exit",
+            ],
+            timeout=300,
+            line_pause=_DEMO_DIALOG_PAUSE,
+        ),
+        Step(
+            title="2. Что именно агент помнит: /summary и /tokens после перезапуска",
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION_D09],
+            stdin_lines=["/summary", "/tokens", "/exit"],
+        ),
+        Step(
+            title=(
+                "3. Тот же диалог дважды в цифрах: prompt-токены без сжатия и со сжатием, "
+                "цена самих сжатий вычтена"
+            ),
+            module="tools.compact_bench",
+            # Window, turn count AND both thresholds passed explicitly: the
+            # harness prints them back, so the table on screen carries the run
+            # it belongs to and cannot be mistaken for the 12-turn measurement.
+            args=[
+                "--limit",
+                _DEMO_BENCH_LIMIT,
+                "--turns",
+                _DEMO_BENCH_TURNS,
+                "--keep-last",
+                _DEMO_BENCH_KEEP_LAST,
+                "--compact-every",
+                _DEMO_BENCH_COMPACT_EVERY,
+            ],
+            timeout=400,
+        ),
+    ]
+
+
 def rehearsal_step(week: int) -> Step:
     """Дешёвый прогон той же машинерии, что ведёт демо.
 
@@ -1164,12 +1288,25 @@ def _play(steps: list[Step]) -> None:
 
 def _run_step(step: Step, pause: float | None = None) -> None:
     typing_pause = REPL_TYPING_PAUSE if pause is None else pause
-    step_pause = STEP_PAUSE if pause is None else pause
+    if pause is not None:
+        step_pause = pause
+    elif step.line_pause is not None:
+        step_pause = step.line_pause
+    else:
+        step_pause = STEP_PAUSE
     env = {**os.environ, **step.env, "PYTHONIOENCODING": "utf-8"}
     command = [sys.executable, "-m", step.module, *step.args]
 
     if not step.stdin_lines and not step.stdin_file:
-        result = subprocess.run(command, cwd=PROJECT_ROOT, env=env)
+        # This branch carried no timeout at all until day 09: a step without
+        # stdin could hang a take forever, while the REPL branch below was
+        # already capped. Same cap, same message.
+        try:
+            result = subprocess.run(
+                command, cwd=PROJECT_ROOT, env=env, timeout=step.timeout or STEP_TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            raise AdventError(f"Шаг «{step.title}» завис и был снят по таймауту.") from None
         _check(step, result.returncode)
         return
 
@@ -1209,7 +1346,7 @@ def _run_step(step: Step, pause: float | None = None) -> None:
             process.stdin.close()
 
     try:
-        code = process.wait(timeout=STEP_TIMEOUT)
+        code = process.wait(timeout=step.timeout or STEP_TIMEOUT)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=10)

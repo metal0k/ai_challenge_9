@@ -340,6 +340,18 @@ any shape. The estimate now counts the text as a user message minus the empty
 user message's template overhead, and the test drives a double that
 reproduces the refusal rather than one that tolerates everything.
 
+**The same refusal came back on Day 09, at two new call sites, and reached a
+dry-run.** `/summary` and `/tokens` sized the summary with
+`counter.count(summary_messages(...))` — a `[user, assistant]` pair, which ends
+on the wrong role — so both printed «— токенов» where the day's headline
+artefact belongs. Measured 2026-09-10 on the real tokenizer: the pair alone is
+`None`, the pair plus an empty user message is 35 against 3 for the empty one.
+The general fix is a **probe request that ends with an empty user message**:
+count `[*fragment, empty_user]`, subtract `count([empty_user])`, and what's left
+is the fragment's own cost, chat-template overhead included. Anything counted
+outside a well-formed request needs that wrapper — the tokenizer counts
+requests, not fragments.
+
 **`logs/record_last.log` is not proof that a take is complete.** On the
 w02d08 recording the PowerShell transcript held only the last demo step,
 while the video had all four — the transcript is written by the host and
@@ -563,6 +575,70 @@ The first call is not slower — if anything it is marginally faster. `bench`
 ships with no warm-up call for this reason: a warm-up would have been a cost
 paid against an effect that does not exist.
 
+**History compaction does not save tokens on a short dialog — it buys memory
+with them.** Three live runs of `tools/compact_bench.py` on 2026-09-10, same
+12-turn scenario, `ministral-14b-latest`, each run twice (compact off / on):
+
+| window | keep_last / compact_every | compactions | net (off − on − cost) | codeword survived |
+|---|---|---|---|---|
+| 2500 | 6 / 10 | 2 | **−3464** | only with compaction |
+| 8000 | 6 / 10 | 1 | **−867** | both |
+| 8000 | 4 / 4 | 4 | **−4163** | both |
+
+One compaction costs ~1450 tokens (≈1076 prompt + ≈334 completion — the
+summarizer reads the whole old history) and saves 150-460 prompt tokens on
+each *later* turn, so twelve turns never repay it, and compacting more often
+makes it strictly worse. At the tight window the two arms cost the same
+anyway, because trim caps both at the same budget (10896 against 10918) —
+there the entire difference is that the codeword survived. So the honest claim
+is "compaction trades tokens for memory", never "compaction is cheaper"; the
+day prints `_verdict()` next to the number for exactly this reason, because a
+bare negative reads as a failed feature.
+
+**A scenario whose answers are too long measures nothing at all.** The first
+version of that same bench asked for verbose replies and produced a table where
+both arms were byte-identical (3418 against 3418), zero compactions, and the
+codeword lost in both. The cause was not in the agent: live answers ran to
+**2929 completion tokens**, so a single exchange did not fit the 2500-token
+window, trim wiped the history on *every* turn, `older` stayed empty and the
+trigger could never fire. The scenario now caps the answer length in its first
+turn, and the demo imports that same `SCENARIO` instead of keeping a second
+copy of the replies — a demo dialog that drifts from the measured one shows
+numbers belonging to a different conversation.
+
+**That trap has a second door: `older` empty because trim already holds
+history at `keep_last`.** `should_compact()` fires on
+`len(older) >= compact_every` or on overflow, where `older` is history minus
+the tail — so if the window is small enough that trim runs every turn, history
+never grows past `keep_last`, `older` stays empty and compaction cannot fire at
+all. Measured 2026-09-10 while shortening the day-09 bench to six turns:
+`--limit 1500` with the default `keep_last 6` gave zero compactions and a
+codeword forgotten in *both* arms, with prompt frozen at 262 tokens from turn 4
+on. Two numbers have to be kept in view together — the trim budget is the
+window **minus a 1024-token response reserve** (`RESPONSE_RESERVE_TOKENS`), so
+a 1500-token window leaves 476; and a shortened run needs its thresholds
+shortened with it. What works at six turns is a short tail:
+`--limit 1700 --keep-last 2 --compact-every 2` → three compactions, codeword
+lost with compaction off and kept with it on.
+
+**A paid side call must survive the turn it was made for.** The summarizer runs
+inside `Agent.ask()` before the turn's own request. When that request then
+failed, `ask()` raised, the `Compaction` died with it — no `kind=compact`
+journal row, nothing in `/tokens`, no summary — and the next attempt paid for
+the same summary again, because the history it was built from was unchanged.
+The fix is `Agent.pending_compaction` plus `take_pending_compaction()`, which
+the CLI's error branch collects (`_salvage_compaction`). The general rule: any
+call that costs money before the main one needs a place to land that is not the
+return value.
+
+**In session state, "key present and wrong" is a third case, distinct from
+"absent" and from a value.** `summary_upto` missing (or a string, or `True`)
+used to fall back to `0`, which is the one outcome the boundary exists to
+prevent: the summary AND the whole history it summarizes go into the same
+request, doubling exactly what compaction had just shrunk. Same shape as day
+08's `context_limit` — and it is the same lesson twice, so treat the
+three-case read as the default for every optional state key.
+
 ## OBS recording
 
 `advent record` drives OBS through obs-websocket. Non-obvious constraints, all
@@ -731,11 +807,18 @@ sanitised specification lives in `specs/SPEC.md`.
   Template and rationale: `specs/reports/README.md`. Whatever in it is permanent
   project knowledge also goes into "Things that will bite you" above — the report
   is the source, not the substitute.
-- README files, chat, code comments and docstrings are in Russian — the whole
-  codebase is written that way, and an English comment now reads as foreign in
-  its own file. **This file (`CLAUDE.md`) stays English**, per the global rule.
-  Confirmed by the user 2026-09-07; the line previously claimed comments were
-  English and had been contradicted by every module in the repository.
+- **Source comments and docstrings are in English and as terse as possible** —
+  set by the user 2026-09-10, reversing the 2026-09-07 decision that had them
+  in Russian. One line where one line does; keep the *why*, drop the prose.
+  Day 09 is the first code written under this rule; older files still carry
+  Russian comments and get migrated when they are touched for other reasons,
+  not in a sweep of their own.
+- **Русские строковые литералы остаются русскими.** Everything printed to the
+  user or sent to the model — `console.warn(...)`, table headers, command help,
+  prompts, test data — is part of the product, not commentary. The rule above
+  covers `#` and `"""..."""`, nothing else.
+- README files and chat prose stay Russian; `CLAUDE.md` files stay English,
+  per the global rule.
 - Comments explain *why*, especially where the code looks odd on purpose (the
   traps above). Do not add comments that restate the code.
 

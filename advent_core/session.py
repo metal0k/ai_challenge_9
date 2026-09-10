@@ -40,6 +40,13 @@ _NAME_RE = re.compile(r"^[\w-]{1,64}$")
 ROLE_USER = "user"
 ROLE_ASSISTANT = "assistant"
 
+# state keys that are conversation CONTENT, not a run setting. clear() erases
+# them along with the turns — unlike mode/done/context_limit, which survive
+# `/new` on purpose (SPEC-w02d09.md §8). The list lives here, next to clear(),
+# because "setting or content" is a fact about storage, not about the
+# interface — a second list in the CLI would drift on the first new key.
+CONTENT_STATE_KEYS = ("summary", "summary_upto")
+
 
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -383,12 +390,21 @@ class Session:
     def clear(self) -> None:
         """`/new`: забыть ходы, оставить имя. Дата начала — новая.
 
-        state НЕ стирается: mode/done — настройки текущего запуска, а не
-        содержимое разговора; счётчик ходов диалога сбрасывает CLI, и в файл
-        он попадает уже нулевым.
+        Run settings in state are NOT erased: mode/done/context_limit are not
+        conversation content; the CLI resets the dialog turn counter, so it
+        hits the file already at zero.
+
+        CONTENT_STATE_KEYS, however, are erased along with the turns — the
+        boundary sits exactly here (SPEC-w02d09.md §8). A summary is a
+        compressed form of the conversation, not a setting: a summary that
+        survived `/new` would mean an agent remembering things no longer in
+        the history — on a demo that looks like a ghost of the previous
+        session.
         """
         self.turns.clear()
         self.created = _now()
+        for key in CONTENT_STATE_KEYS:
+            self.state.pop(key, None)
 
     def token_total(self) -> int | None:
         """Сумма total_tokens по ходам. None — ни один ход не принёс usage."""
