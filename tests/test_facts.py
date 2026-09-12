@@ -270,3 +270,37 @@ def test_prompt_mentions_all_categories_and_key_rules():
     assert "delete" in text
     assert "\U0001f4cc" in text  # pinned marker rule
     assert "additionalProperties" in text  # schema duplicated as text
+
+
+# --- дельта верной формы JSON, но неверной структуры --------------------------
+
+
+def test_apply_delta_rejects_a_set_item_that_is_not_an_object():
+    """Valid JSON, wrong shape: the extractor writes a bare key string. Used to
+    raise AttributeError out of apply_delta, past every catch on the way up."""
+    result = apply_delta({"цель.проект": "кофейня"}, (), {"set": ["цель.проект"], "delete": []})
+
+    assert result.facts == {"цель.проект": "кофейня"}
+    assert result.rejected == ("цель.проект",)
+    assert result.added == ()
+    assert result.updated == ()
+
+
+def test_apply_delta_rejects_a_non_string_key_and_keeps_a_non_string_value():
+    result = apply_delta(
+        {},
+        (),
+        {"set": [{"key": 7, "value": "x"}, {"key": "ограничения.бюджет", "value": 520}]},
+    )
+
+    assert result.rejected == ("7",)
+    assert result.facts == {"ограничения.бюджет": "520"}
+    assert result.added == ("ограничения.бюджет",)
+
+
+def test_apply_delta_rejects_a_delete_entry_that_is_not_a_string():
+    result = apply_delta({"цель.проект": "кофейня"}, (), {"delete": [{"key": "цель.проект"}]})
+
+    assert result.facts == {"цель.проект": "кофейня"}
+    assert result.removed == ()
+    assert result.rejected == ("{'key': 'цель.проект'}",)

@@ -885,3 +885,47 @@ def test_an_unknown_strategy_is_refused_before_anything_is_spent(monkeypatch):
         strategy_bench.main(["--strategies", "window,bogus"])
 
     assert excinfo.value.code == 2
+
+
+# --------------------------------------------------------------------------
+# print_report — порядок вывода несущий: числа закрывают кадр
+# --------------------------------------------------------------------------
+
+
+def test_report_prints_the_numbers_table_after_the_answers(capsys):
+    """The take's closing screen is the one a viewer can read, and the day's
+    headline is the number, not the ТЗ excerpts. Printed the other way round
+    on the w02d10 take, the table left the frame in under a second."""
+    results = [
+        _result("window", prompt_total=100, all_details=False),
+        _result("facts", prompt_total=900),
+    ]
+    args = argparse.Namespace(limit=4000, model="ministral-14b-latest")
+
+    previous_width = strategy_bench.console.out.width
+    strategy_bench.console.out.width = 200
+    try:
+        strategy_bench.print_report(results, args)
+    finally:
+        strategy_bench.console.out.width = previous_width
+
+    out = capsys.readouterr().out
+    assert "итоговые ответы" in out
+    assert "стратегии контекста" in out
+    assert out.index("итоговые ответы") < out.index("стратегии контекста")
+
+
+def test_report_puts_the_fork_section_between_answers_and_numbers(capsys):
+    results = [_result("facts", prompt_total=900)]
+    args = argparse.Namespace(limit=4000, model="ministral-14b-latest")
+
+    previous_width = strategy_bench.console.out.width
+    strategy_bench.console.out.width = 200
+    try:
+        strategy_bench.print_report(results, args, ("бюджет 520 тысяч", "бюджет 300 тысяч"))
+    finally:
+        strategy_bench.console.out.width = previous_width
+
+    out = capsys.readouterr().out
+    assert out.index("итоговые ответы") < out.index("ветка бюджета")
+    assert out.index("ветка бюджета") < out.index("стратегии контекста")

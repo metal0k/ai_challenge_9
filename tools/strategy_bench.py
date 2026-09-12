@@ -578,6 +578,25 @@ def fork_isolation_report(a_ok: bool, b_ok: bool) -> str:
     )
 
 
+def print_report(
+    results: Sequence[StrategyResult],
+    args: argparse.Namespace,
+    fork_answers: tuple[str, str] | None = None,
+) -> None:
+    """Answers first, numbers and verdict LAST.
+
+    The closing screen of a take is the one the viewer can actually read, and
+    the day's headline is the number (window 3/6 за 6614 против facts 6/6 за
+    23143), not the ТЗ excerpts. Printed the other way round on the w02d10
+    take, the table scrolled out of frame under a twenty-line answers table in
+    under a second — the same defect day 09 fixed with Step.line_pause.
+    """
+    _print_answers(results)
+    if fork_answers is not None:
+        _print_fork_section(*fork_answers)
+    _print_table(results, args)
+
+
 def _print_fork_section(answer_a: str, answer_b: str) -> None:
     """Each branch's own answer plus the pass/fail verdict (C1): a reader has
     to be able to see the leak (or its absence) in the actual text, not just
@@ -811,12 +830,19 @@ def main(argv: list[str] | None = None) -> int:
                 summary_prompt=summary_prompt,
                 facts_prompt=facts_prompt,
             )
-            replies, _state = bench_core.run_scenario(agent, scenario)
+            replies, _state = bench_core.run_scenario(
+                agent,
+                scenario,
+                # Default arg, not a closure over the loop variable: ruff's
+                # B023 is right that a late-bound `strategy` would name the
+                # wrong run.
+                on_turn=lambda turn, total, name=strategy: console.note(
+                    f"  {name}: ход {turn}/{total}"
+                ),
+            )
             results.append(_score_run(strategy, replies))
 
-        _print_table(results, args)
-        _print_answers(results)
-
+        fork_answers: tuple[str, str] | None = None
         if args.fork:
             console.note(f"секция изоляции веток: checkpoint после хода {FORK_CHECKPOINT_TURNS}")
             fork_agent = _build_agent(
@@ -830,8 +856,9 @@ def main(argv: list[str] | None = None) -> int:
                 summary_prompt=summary_prompt,
                 facts_prompt=facts_prompt,
             )
-            answer_a, answer_b = run_fork_isolation(fork_agent, SCENARIO[:FORK_CHECKPOINT_TURNS])
-            _print_fork_section(answer_a, answer_b)
+            fork_answers = run_fork_isolation(fork_agent, SCENARIO[:FORK_CHECKPOINT_TURNS])
+
+        print_report(results, args, fork_answers)
     except AdventError as exc:
         console.fail(exc)
         return exc.exit_code

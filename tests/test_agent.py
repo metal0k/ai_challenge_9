@@ -988,10 +988,15 @@ def test_facts_extractor_gets_its_own_params_and_the_session_config_is_untouched
     # The block cap (77 here) is NOT the response ceiling: the block is what we
     # store, the delta is what the model writes to change it. Conflating them
     # cut a delta mid-JSON on a live run, 2026-09-12 (SPEC-w02d10.md §5.5).
-    assert extractor.max_tokens == FACTS_RESPONSE_TOKENS
+    # Literal, not the constant: an expectation read from the same source as
+    # the code under test cannot go red (CLAUDE.md). The second line pins the
+    # constant itself, so shrinking it is a deliberate, visible edit.
+    assert extractor.max_tokens == 900
+    assert FACTS_RESPONSE_TOKENS == 900
     assert extractor.max_tokens != 77
     assert extractor.format == "schema"
     assert extractor.schema_file == str(FACTS_SCHEMA_PATH)
+    assert extractor.schema_file.endswith("facts_delta.json")
     assert extractor.stop is None
     # The actual turn keeps the session's own params — a copy, not an edit in place.
     assert recorder.configs[1].params.max_tokens == 50
@@ -1188,6 +1193,11 @@ def test_facts_catchup_beyond_the_max_truncates_and_warns():
     assert "в11" in extractor_call[1]["content"]
     assert "о11" in extractor_call[1]["content"]
     assert any(f"больше чем на {FACTS_CATCHUP_MAX} сообщений" in text for text in agent.warnings)
+    # The cursor jumps over the part that was cut off, on purpose: holding it
+    # back would truncate the same way next turn and pay the cap forever. The
+    # trade is only defensible while `truncated` is reported, so both halves
+    # are pinned here rather than left to be inferred from the code.
+    assert reply.facts_upto == len(long_history) + 1
 
 
 def test_facts_block_over_the_cap_adds_a_squeeze_instruction():
@@ -1465,3 +1475,124 @@ def test_catchup_max_none_falls_back_to_the_longest_fitting_tail_when_over_budge
     assert any("последние 15 сообщений из 61" in text for text in agent.warnings)
     per_turn_wording = f"больше чем на {FACTS_CATCHUP_MAX} сообщений"
     assert not any(per_turn_wording in text for text in agent.warnings)
+
+
+def test_a_delta_of_the_wrong_shape_costs_the_turn_nothing():
+    """Valid JSON, wrong structure — the one extractor failure mode that used to
+    escape as an AttributeError and take the whole turn with it."""
+    recorder = _Recorder(
+        CallResult(
+            text=json.dumps({"set": ["цель.основное"], "delete": []}), usage=Usage(40, 6, 46)
+        ),
+        CallResult(text="ответ"),
+    )
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    reply = agent.ask("вопрос", [], facts={"цель.основное": "MVP"}, facts_pinned=(), facts_upto=0)
+
+    assert reply.text == "ответ"
+    # The rejected op is reported, the facts dict is untouched, and the paid
+    # call is still accounted for as an update (the delta applied cleanly —
+    # it just changed nothing).
+    assert reply.facts_update is not None
+    assert reply.facts_update.delta.rejected == ("цель.основное",)
+    assert reply.facts_update.facts == {"цель.основное": "MVP"}
+
+
+def test_extractor_cannot_delete_a_pinned_fact_through_the_agent():
+    """apply_delta blocks it, but nothing drove the path end to end: a future
+    split of set/delete handling in the wiring would only be caught here."""
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": ["ограничения.бюджет"]})),
+        CallResult(text="ответ"),
+    )
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    reply = agent.ask(
+        "вопрос",
+        [],
+        facts={"ограничения.бюджет": "520 тысяч"},
+        facts_pinned=("ограничения.бюджет",),
+        facts_upto=0,
+    )
+
+    assert reply.facts_update is not None
+    assert reply.facts_update.facts == {"ограничения.бюджет": "520 тысяч"}
+    assert reply.facts_update.delta.blocked == ("ограничения.бюджет",)
+    assert reply.facts_update.delta.removed == ()
+
+
+def test_budget_trim_cuts_history_but_never_the_facts_pseudo_pair():
+    """The facts block goes in as `head`, and `_trim` must cut the tail around
+    it — the same contract the summary pseudo-pair has. Untested until now for
+    facts, and the summary version of this bug is in CLAUDE.md."""
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})),
+        CallResult(text="ответ"),
+    )
+    agent = build_agent(
+        recorder,
+        facts_config(max_tokens=10),
+        counter=_CharCounter(),
+        context_limit=400,
+        facts_prompt="извлеки",
+    )
+    history = [
+        {"role": "user", "content": "в" * 120},
+        {"role": "assistant", "content": "о" * 120},
+        {"role": "user", "content": "в" * 120},
+        {"role": "assistant", "content": "о" * 120},
+    ]
+
+    reply = agent.ask(
+        "новый вопрос",
+        history,
+        facts={"цель.основное": "MVP"},
+        facts_pinned=(),
+        facts_upto=len(history),
+    )
+
+    sent = recorder.calls[1]
+    assert reply.dropped > 0, "бюджет не заставил обрезку сработать — тест ничего не проверяет"
+    assert any("Важные факты" in message["content"] for message in sent)
+    assert any("MVP" in message["content"] for message in sent)
+
+
+def test_budget_trim_moves_the_facts_cursor_with_the_history_it_cuts():
+    """The cursor counts leading messages of the history the caller gets back.
+    The safety-net trim cuts from the front — exactly the covered ones — so a
+    cursor left at its pre-trim value claims coverage of history that no longer
+    exists. Next turn `min(facts_upto, len(history))` then hides the drift by
+    skipping the NEWEST exchange instead: silent permanent loss, the very thing
+    facts_upto exists to prevent (SPEC-w02d10.md §5.3)."""
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})),
+        CallResult(text="ответ"),
+    )
+    agent = build_agent(
+        recorder,
+        facts_config(max_tokens=10),
+        counter=_CharCounter(),
+        context_limit=400,
+        facts_prompt="извлеки",
+    )
+    history = [
+        {"role": "user", "content": "в" * 120},
+        {"role": "assistant", "content": "о" * 120},
+        {"role": "user", "content": "в" * 120},
+        {"role": "assistant", "content": "о" * 120},
+    ]
+
+    reply = agent.ask(
+        "новый вопрос",
+        history,
+        facts={},
+        facts_pinned=(),
+        facts_upto=len(history),
+    )
+
+    assert reply.dropped > 0, "бюджет не заставил обрезку сработать — тест ничего не проверяет"
+    assert reply.facts_upto <= len(reply.history), (
+        f"курсор {reply.facts_upto} покрывает больше, чем есть истории "
+        f"({len(reply.history)}) — обмен уедет из окна непрочитанным"
+    )

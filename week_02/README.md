@@ -306,7 +306,7 @@ uv run advent submit --week 2 --day 9             # ссылки для сдач
 09 остаётся дефолтом, чтобы ни один старый файл сессии, ни один тест не
 поменяли смысл молча.
 
-### `/set context_strategy` — один параметр, четыре значения
+### `/strategy` — один параметр, четыре значения
 
 `keep_last` (день 09, по умолчанию 6) переиспользуется как N для всех значений,
 кроме `branch` — второй параметр с тем же смыслом разошёлся бы с первым на
@@ -318,6 +318,11 @@ uv run advent submit --week 2 --day 9             # ссылки для сдач
 | `facts` | system + блок facts псевдо-парой + последние N | extractor, 1 на ход |
 | `summary` (default) | пересказ псевдо-парой + хвост (поведение дня 09) | суммаризатор, по триггеру |
 | `branch` | system + **вся** история активной ветки | нет |
+
+`/strategy` без значения печатает текущую стратегию и список; `/strategy facts`
+переключает. Это обёртка над `/set context_strategy` — разбор, проверка и
+побочные эффекты переключения живут в одном месте, иначе `/strategy fcts` и
+`/set context_strategy fcts` однажды ответят по-разному.
 
 Под всеми четырьмя остаётся trim по бюджету (`context_limit` минус
 резерв под ответ) — это страховка от 400, а не стратегия. Для `branch` это
@@ -388,7 +393,7 @@ uv run advent submit --week 2 --day 9             # ссылки для сдач
 uv run python -m tools.strategy_bench                       # полный прогон, все четыре стратегии
 uv run python -m tools.strategy_bench --dry-run              # сценарий и чеклист, без сети
 uv run python -m tools.strategy_bench --strategies window,facts
-uv run python -m tools.strategy_bench --turns 8 --limit 4000 --keep-last 3   # короткий прогон (кадр)
+uv run python -m tools.strategy_bench --turns 8 --limit 4000 --keep-last 3 \n    --strategies window,facts --no-fork                      # короткий прогон (кадр)
 ```
 
 Флаги: `--model` (по умолчанию `ministral-14b-latest`), `--limit` (узкое окно

@@ -360,6 +360,42 @@ is the file itself: `ffmpeg -ss <t> -i <mp4> -frames:v 1 out.png` at a few
 timestamps, read as images. PNG frames read fine here, unlike the JPG
 screenshots of Day 07 that resolved to CDN links.
 
+**Clearing the screen before StartRecord is a race, and it is lost silently.**
+`console.clear_screen()` writes an escape sequence; the terminal repaints on
+its own schedule and OBS records whatever the window last composited. Day 04
+established the clear and its position (after verify_capture, before
+start_recording) and the tests pin that ORDER — which is why this got through:
+the order was right and the frames were still dirty. Measured on the w02d10
+take: the first 0.4 s of the file showed the rehearsal tail (`/params`, the
+deliberately wrong command, `/exit`), while the day-09 take and the same day's
+first take won the same race and looked clean. There is now a
+`CLEAR_SETTLE_PAUSE` between the two calls, and a test asserting a sleep sits
+between them. A take already made can be salvaged without re-recording:
+`ffmpeg -ss 0.75 -i in.mp4 -c:v libx264 -crf 20 -c:a aac out.mp4` cuts the head
+and leaves the rest verified as it was.
+
+**A take can be 97% static, and that is a harness defect, not a video
+problem.** The w02d10 recording ran 9:31, of which `freezedetect` found 555 s
+frozen: `tools/strategy_bench.py` printed "прогон 1/2" and then nothing for
+three minutes while four dozen calls went out. Two fixes, both cheap: a
+per-turn progress hook (`bench_core.run_scenario(..., on_turn=...)`, printed to
+stderr — progress is not the product) and printing the numbers table LAST, after
+the answers table, so the closing screen is the day's headline instead of
+whatever scrolled by. The re-take came out 3:27 with 19 s of freeze — the same
+content, no cutting needed.
+
+**`tools/cut_static.py` cuts dead time out of a take, and it must cut with
+`trim`/`concat`, not `select`.** OBS records desktop audio, so a take has two
+streams; `-vf select` dropped video frames to 97 s while `-af aselect` left the
+audio at the original 570 s, and the container then reported the ORIGINAL
+duration — a file that looks uncut to every player and to Yandex Disk. `trim` +
+`atrim` + `concat` take both streams from one interval list, so they cannot
+drift. Two more rules learned the same way: the freeze that runs to EOF is the
+closing screen and stays whole (cutting it to `--keep` ends the video
+mid-thought), and the freeze threshold is the lever that matters — at
+`--min-freeze 2` a terminal demo is "frozen" almost end to end, because every
+pause between lines counts.
+
 **REPL pickers must be tty-gated.** The interactive choices behind bare
 `/model` and `/set` (and the model picker at startup) run only when
 `sys.stdin.isatty()`: the demo harness drives stdin through a pipe, and an

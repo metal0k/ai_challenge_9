@@ -3170,3 +3170,44 @@ def test_new_refuses_to_clear_a_checkpoint(monkeypatch, tmp_path, capsys):
     assert "/new его не стирает" in stderr
     loaded = Session.load("default--cp-mvp", directory=tmp_path)
     assert loaded.state.get("kind") == "checkpoint"
+
+
+# --- /strategy: короткая обёртка над /set context_strategy -------------------
+
+
+def test_strategy_without_a_value_names_the_current_one_and_the_choices(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/strategy", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "summary" in stderr
+    for choice in ("window", "facts", "branch"):
+        assert choice in stderr
+
+
+def test_strategy_switches_through_the_same_path_as_set(monkeypatch, tmp_path, capsys):
+    """The wrapper must not become a second source of truth: switching through
+    it has to leave exactly the state `/set context_strategy` leaves."""
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/strategy branch", shell)
+
+    assert shell.agent.context_strategy == "branch"
+    assert shell.session.state["context_strategy"] == "branch"
+    assert shell.context_strategy_explicit is True
+
+
+def test_strategy_refuses_an_unknown_value_without_changing_anything(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/strategy fcts", shell)
+
+    assert shell.agent.context_strategy == "summary"
+    # Same refusal /set prints — the wrapper adds no message of its own.
+    assert "context_strategy принимает только" in _flat(capsys.readouterr().err)

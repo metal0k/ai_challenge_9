@@ -201,3 +201,29 @@ def test_trim_totals_keeps_the_partial_known_sum_when_only_some_turns_are_unknow
     assert totals.tokens == 300
     assert totals.turns_trimmed == 2
     assert totals.turns_trimmed_unknown_tokens == 1
+
+
+def test_run_scenario_reports_progress_once_per_turn_in_order():
+    """A silent multi-minute run reads as a hang — and on camera it WAS three
+    minutes of a frozen screen. The hook fires before each turn, so the last
+    call is (n, n) and not one turn short."""
+    from tests.test_strategy_bench import _FakeAgent, _reply_with_history
+
+    agent = _FakeAgent([_reply_with_history("q1"), _reply_with_history("q2")])
+    seen: list[tuple[int, int]] = []
+
+    bench_core.run_scenario(
+        agent, ["q1", "q2"], on_turn=lambda turn, total: seen.append((turn, total))
+    )
+
+    assert seen == [(1, 2), (2, 2)]
+
+
+def test_run_scenario_without_a_progress_hook_still_runs():
+    from tests.test_strategy_bench import _FakeAgent, _reply_with_history
+
+    agent = _FakeAgent([_reply_with_history("q1")])
+
+    replies, _state = bench_core.run_scenario(agent, ["q1"])
+
+    assert len(replies) == 1

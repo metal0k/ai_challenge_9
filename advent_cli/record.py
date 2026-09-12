@@ -41,6 +41,14 @@ from tools.strategy_bench import SCENARIO as STRATEGY_SCENARIO
 from week_01 import strategies
 
 STEP_PAUSE = 2.0
+# Between clearing the screen and StartRecord. The clear is an escape sequence
+# the terminal has to repaint on, and OBS grabs whatever the window last
+# composited: on the w02d10 take the first 0.4 s of the file still showed the
+# rehearsal tail (/params, the deliberately wrong command, /exit), while the
+# day-09 take and this day's first take happened to win the same race. A pause
+# is the cheap half of the fix; if it ever shows up again, poll an OBS
+# screenshot until the window actually changes instead of waiting blind.
+CLEAR_SETTLE_PAUSE = 0.7
 TITLE_PAUSE = 1.5
 REPL_TYPING_PAUSE = 1.2
 
@@ -1215,6 +1223,15 @@ _DEMO_D10_PAUSE = 4.0
 _DEMO_D10_BENCH_TURNS = str(STRATEGY_MIN_TURNS)
 _DEMO_D10_BENCH_LIMIT = "4000"
 _DEMO_D10_BENCH_KEEP_LAST = "3"
+# Two of the four, and no fork section, measured on 2026-09-12: the full table
+# (four strategies plus fork isolation) takes 383 s, which put the take at ten
+# minutes — the length the user cut Day 09 for. window против facts is the
+# day's headline pair (details lost cheaply против details held dearly);
+# branching is already on camera live in step 2, and the full four-strategy
+# measurement lives in README and the spec, where a table can be read at
+# leisure. Turns stay at the harness floor: below MIN_TURNS there is nowhere
+# left to plant the six details.
+_DEMO_D10_BENCH_STRATEGIES = "window,facts"
 
 
 def _demo_steps_w02d10() -> list[Step]:
@@ -1265,7 +1282,7 @@ def _demo_steps_w02d10() -> list[Step]:
             stdin_lines=[
                 "/new",
                 f"/set context_limit {_DEMO_D10_LIMIT}",
-                "/set context_strategy facts",
+                "/strategy facts",
                 *STRATEGY_SCENARIO[:STRATEGY_HEAD_TURNS],
                 "/facts",
                 "/tokens",
@@ -1299,8 +1316,8 @@ def _demo_steps_w02d10() -> list[Step]:
         ),
         Step(
             title=(
-                "3. Bench: python -m tools.strategy_bench — четыре стратегии на "
-                "одном сценарии, укороченный прогон"
+                "3. Bench: python -m tools.strategy_bench — window против facts "
+                "на одном сценарии, укороченный прогон"
             ),
             module="tools.strategy_bench",
             args=[
@@ -1310,6 +1327,9 @@ def _demo_steps_w02d10() -> list[Step]:
                 _DEMO_D10_BENCH_LIMIT,
                 "--keep-last",
                 _DEMO_D10_BENCH_KEEP_LAST,
+                "--strategies",
+                _DEMO_D10_BENCH_STRATEGIES,
+                "--no-fork",
             ],
             timeout=600,
         ),
@@ -1390,6 +1410,7 @@ def record(
         # `/exit` попадали в начало ролика, читаясь как обрывок чужой сессии.
         # Поймано на просмотре записи Day 04 2026-09-03.
         console.clear_screen()
+        time.sleep(CLEAR_SETTLE_PAUSE)
 
         obs.start_recording(client)
         console.note("запись пошла")

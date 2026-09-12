@@ -82,6 +82,20 @@ def test_screen_is_cleared_after_verify_capture_and_before_start_recording(calls
     assert cleared < calls.index("start_recording")
 
 
+def test_recording_starts_only_after_the_clear_had_time_to_repaint(calls, monkeypatch):
+    """Measured, not theoretical: the w02d10 take's first 0.4 s still showed
+    the rehearsal tail. The clear is an escape sequence the terminal repaints
+    on, and OBS records whatever the window last composited, so the two must
+    not be issued back to back."""
+    monkeypatch.setattr(record_mod.time, "sleep", lambda _: calls.append("sleep"))
+
+    record_mod.record(day=4, week=1, dry_run=False, rehearse=True, keep_original=False)
+
+    cleared = calls.index("clear_screen")
+    assert calls.index("sleep") > cleared, "между очисткой и стартом записи нет паузы"
+    assert calls.index("sleep") < calls.index("start_recording")
+
+
 def test_rehearsal_runs_before_the_screen_is_cleared(calls):
     """Иначе чистить нечего: репетиция сама и печатает то, что мешает."""
     record_mod.record(day=4, week=1, dry_run=False, rehearse=True, keep_original=False)
@@ -733,7 +747,7 @@ def test_day_10_facts_step_replays_the_budget_and_ends_with_facts_and_tokens():
 
     assert live.stdin_lines[0] == "/new"
     assert f"/set context_limit {record_mod._DEMO_D10_LIMIT}" in live.stdin_lines
-    assert "/set context_strategy facts" in live.stdin_lines
+    assert "/strategy facts" in live.stdin_lines
     assert "/facts" in live.stdin_lines
     assert "/tokens" in live.stdin_lines
     assert live.stdin_lines.index("/facts") < live.stdin_lines.index("/exit")
@@ -820,6 +834,9 @@ def test_day_10_bench_step_args_are_a_literal_list():
         "4000",
         "--keep-last",
         "3",
+        "--strategies",
+        "window,facts",
+        "--no-fork",
     ]
 
 
@@ -834,8 +851,8 @@ def test_day_10_bench_step_turns_are_at_the_harness_floor():
 
 
 def test_day_10_bench_step_gets_more_time_than_the_shared_limit():
-    """Four strategies over the shortened scenario plus the fork-isolation
-    section (default on) is well past STEP_TIMEOUT worth of calls."""
+    """Two strategies over the shortened scenario are still sixteen live calls
+    plus an extractor call per facts turn — well past STEP_TIMEOUT."""
     bench = record_mod.demo_steps(2, 10)[2]
 
     assert bench.timeout is not None

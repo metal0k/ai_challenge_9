@@ -47,6 +47,7 @@ from advent_core.params import (
     AGENT_COMMAND,
     AGENT_PARAMS,
     BY_NAME,
+    CONTEXT_STRATEGY_CHOICES,
     FORMAT_CHOICES,
     MODE_CHOICES,
     REASONING_EFFORTS,
@@ -1568,6 +1569,25 @@ def _cmd_mode(shell: AgentShell, args: list[str]) -> bool:
     # Делегируем /set: правило разбора и валидации значения должно жить в
     # одном месте, иначе `/mode dialg` и `/set mode dialg` ответят по-разному.
     return _cmd_set(shell, ["mode", *args])
+
+
+@command(
+    "/strategy",
+    "стратегия контекста: без значения — текущая и список, со значением — переключить",
+    usage="/strategy window | facts | branch | summary",
+)
+def _cmd_strategy(shell: AgentShell, args: list[str]) -> bool:
+    """Shorthand for `/set context_strategy` — the day's switch under the day's name.
+
+    Delegates like /mode: parsing, validation and the side effects of a switch
+    (auto-backfill, the note, saving the state) stay in one place, so
+    `/strategy fcts` and `/set context_strategy fcts` cannot answer differently.
+    """
+    if not args:
+        choices = ", ".join(CONTEXT_STRATEGY_CHOICES)
+        console.note(f"стратегия контекста: {shell.agent.context_strategy} (есть: {choices})")
+        return False
+    return _cmd_set(shell, ["context_strategy", *args])
 
 
 @command("/again", "повторить последний вопрос с текущими настройками, без истории")

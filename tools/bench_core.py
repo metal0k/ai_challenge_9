@@ -16,7 +16,7 @@ argparse skeleton (--model/--limit/--dry-run) common to both scripts.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 
 from advent_core.agent import Agent, AgentReply
@@ -73,7 +73,11 @@ def run_turn(agent: Agent, state: ScenarioState, question: str) -> AgentReply:
 
 
 def run_scenario(
-    agent: Agent, scenario: Sequence[str], *, state: ScenarioState | None = None
+    agent: Agent,
+    scenario: Sequence[str],
+    *,
+    state: ScenarioState | None = None,
+    on_turn: Callable[[int, int], None] | None = None,
 ) -> tuple[list[AgentReply], ScenarioState]:
     """Runs `scenario` end to end from `state` (or a fresh one), in order.
 
@@ -85,7 +89,17 @@ def run_scenario(
     mechanism, which belongs to advent_core/session.py and its own tests).
     """
     working = state.clone() if state is not None else ScenarioState()
-    replies = [run_turn(agent, working, question) for question in scenario]
+    # `on_turn` exists because silence reads as a hang: four strategies over
+    # eight turns is minutes of nothing, and on the w02d10 take that showed as
+    # three minutes of a frozen screen — 97% of the video was static. Progress
+    # belongs on stderr (the caller decides how to say it); the product of a
+    # bench run is its table.
+    replies = []
+    total = len(scenario)
+    for index, question in enumerate(scenario, start=1):
+        if on_turn is not None:
+            on_turn(index, total)
+        replies.append(run_turn(agent, working, question))
     return replies, working
 
 

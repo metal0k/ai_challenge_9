@@ -974,6 +974,15 @@ class Agent:
             result=result,
             truncated=truncated,
         )
+        # The cursor advances over the whole segment even when only its tail was
+        # sent (`truncated`). Deliberate, and the losing alternative is the
+        # obvious one: holding the cursor back makes the next turn's segment
+        # longer still, truncated to the same last N — the middle is never seen
+        # anyway, the backlog never clears, and every later turn pays the cap.
+        # So the choice is between a one-off loss said out loud (the warning
+        # above) and a permanent one paid for every turn. `truncated` travels on
+        # the update so the caller can say it, which is what SPEC-w02d10.md §5.3
+        # requires: not silent.
         return outcome.facts, len(history) + 1, update
 
     def take_pending_facts(self) -> FactsUpdate | None:
@@ -1104,6 +1113,16 @@ class Agent:
         # budget trim below is its only limiter (SPEC §3, §7.3).
 
         trimmed = self._trim(working, system, user_input, head=head)
+        # The safety-net trim cuts from the FRONT of `working` — exactly the
+        # messages the cursor counts as already extracted. Left uncorrected,
+        # facts_upto claims coverage of history that no longer exists, and next
+        # turn `min(facts_upto, len(history))` hides the drift by skipping the
+        # NEWEST exchange instead: silent permanent loss, which is the one thing
+        # facts_upto exists to prevent (SPEC-w02d10.md §5.3). Measured on a
+        # 400-token budget: cursor 5 against a 4-message history.
+        dropped_by_trim = len(working) - len(trimmed.history)
+        if dropped_by_trim > 0:
+            facts_upto_now = max(0, facts_upto_now - dropped_by_trim)
         messages = chat_core.build_messages(
             user_input, system=system, history=[*head, *trimmed.history]
         )

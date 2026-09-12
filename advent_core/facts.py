@@ -82,8 +82,21 @@ def apply_delta(facts: dict[str, str], pinned: Iterable[str], delta: dict) -> De
     rejected: list[str] = []
 
     for item in delta.get("set") or []:
+        # The schema constrains the shape, the model still writes it: a reply
+        # of {"set": ["цель.имя"]} is valid JSON and used to die on .get() with
+        # an AttributeError, which no caller catches — a traceback instead of
+        # the turn. A malformed item is rejected like a bad key: visible in the
+        # note, never fatal.
+        if not isinstance(item, dict):
+            rejected.append(str(item))
+            continue
         raw_key = item.get("key", "")
         value = item.get("value", "")
+        if not isinstance(raw_key, str):
+            rejected.append(str(raw_key))
+            continue
+        if not isinstance(value, str):
+            value = str(value)
         try:
             key = validate_key(raw_key)
         except ValueError:
@@ -102,6 +115,9 @@ def apply_delta(facts: dict[str, str], pinned: Iterable[str], delta: dict) -> De
             added.append(key)
 
     for raw_key in delta.get("delete") or []:
+        if not isinstance(raw_key, str):
+            rejected.append(str(raw_key))
+            continue
         try:
             key = validate_key(raw_key)
         except ValueError:
