@@ -29,7 +29,7 @@ from rich.table import Table
 
 from advent_core import chat as chat_core
 from advent_core import console, formats, tokens
-from advent_core.agent import Agent, AgentReply, Compaction
+from advent_core.agent import Agent, AgentReply, Compaction, FactsFailure, FactsUpdate
 from advent_core.client import (
     capabilities_of,
     chat_models,
@@ -41,6 +41,7 @@ from advent_core.client import (
 from advent_core.compact import summary_messages
 from advent_core.config import DEFAULT_SYSTEM_PROMPT, Config, ConfigError
 from advent_core.errors import AdventError
+from advent_core.facts import format_facts, render_note, validate_key
 from advent_core.journal import log_call
 from advent_core.params import (
     AGENT_COMMAND,
@@ -53,11 +54,19 @@ from advent_core.params import (
     defaults_for,
 )
 from advent_core.session import (
+    BRANCH_SEP,
     DEFAULT_SESSION,
     ROLE_ASSISTANT,
     Session,
     Turn,
+    build_tree,
+    checkpoint_file_name,
+    delete_branch,
     list_sessions,
+    make_branch,
+    make_checkpoint,
+    parse_name,
+    root_of,
     validate_name,
 )
 from advent_core.telemetry import CallResult
@@ -74,7 +83,7 @@ WEEK = 2
 # 04); here the week is ONE app growing by day, same command throughout.
 # A compaction call is distinguished from a regular turn by kind=compact in
 # the journal, not by a day number.
-DAY = 9
+DAY = 10
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -88,6 +97,9 @@ DIALOG_PROMPT_PATH = PROMPTS_DIR / "dialog.md"
 # compaction is core mechanics (inherited by anything built on Agent), not a
 # week-02 persona like agent.md/dialog.md above.
 SUMMARY_PROMPT_PATH = DEFAULT_SYSTEM_PROMPT.parent / "summary.md"
+# Same reasoning for the facts extractor (day 10, SPEC-w02d10.md §5): core
+# mechanics, so the prompt lives in advent_core/prompts, not week_02.
+FACTS_PROMPT_PATH = DEFAULT_SYSTEM_PROMPT.parent / "facts.md"
 
 # Многострочный ввод — sentinel, а не Shift+Enter: портируемого способа поймать
 # Shift+Enter в терминалах не существует, документация aider говорит это прямо
@@ -202,6 +214,39 @@ class AgentShell:
     compact_prompt: int = 0
     compact_completion: int = 0
 
+    # Sticky facts (day 10): current dict/pins/coverage cursor, mirroring
+    # summary/summary_upto above — same "content lives here, agent has no
+    # memory of its own" split.
+    facts: dict[str, str] = field(default_factory=dict)
+    facts_pinned: list[str] = field(default_factory=list)
+    facts_upto: int = 0
+    # Extractor call cost this run — mirrors compact_calls/compact_prompt/
+    # compact_completion, same reason: a service call, invisible to both
+    # "total for session" and the growth table.
+    facts_calls: int = 0
+    facts_prompt_tokens: int = 0
+    facts_completion_tokens: int = 0
+    # Paid extractor calls that came back unusable (truncated/invalid delta) —
+    # counted separately from facts_calls above so /tokens can name them
+    # instead of folding them into a number that reads as "N successful
+    # updates" (review finding #5: these calls cost money and were going
+    # unjournalled).
+    facts_failures: int = 0
+    # Runtime-only (never persisted): whether `/set context_strategy <value>`
+    # was issued explicitly THIS run. Deliberately not derived from the
+    # session file — otherwise `/set compact off|on`, day 09's own alias,
+    # would behave differently the moment a session survives a restart, since
+    # _save_state always writes context_strategy (SPEC-w02d10.md §3).
+    context_strategy_explicit: bool = False
+    # Last `window_dropped` value already announced this run. None means
+    # "never announced yet" — distinct from 0, which IS a value the window
+    # strategy can legitimately report. Without this, "окно: выпало N
+    # сообщений" repeats the same N every turn once the window fills (review
+    # finding T1) — reset whenever the conversation identity changes
+    # (_switch_session, covering /new, /switch, /branch, /set session),
+    # otherwise a stale number would suppress a genuine new drop.
+    window_dropped_reported: int | None = None
+
     def __post_init__(self) -> None:
         try:
             self.refresh()
@@ -230,7 +275,16 @@ class AgentShell:
             # читают config.model уже новый — пересчитывать ничего не надо, было
             # бы надо, зови выбор ПОСЛЕ счётчика.
             self.refresh()
-        self.session = self.open_session(self.config.params.session or DEFAULT_SESSION)
+        target_session = self.config.params.session or DEFAULT_SESSION
+        # Checkpoints are file-snapshots, not sessions — the same rule /switch
+        # enforces (SPEC-w02d10.md §7.1). Checked here too: `--session <cp>`
+        # used to reach open_session() directly, landing the user live-editing
+        # an immutable snapshot (review finding P1). No one to ask at startup,
+        # so this is fatal, same as an unknown model name below.
+        refusal = _checkpoint_switch_refusal(self, target_session)
+        if refusal:
+            raise ConfigError(refusal)
+        self.session = self.open_session(target_session)
         self.history = self.session.history()
         # Подхватываем служебное состояние сессии ДО сборки агента: его
         # property mode читает config.params, поэтому порядок безопасен, а
@@ -256,6 +310,7 @@ class AgentShell:
             persona=_persona(self.config),
             dialog_preset=_dialog_preset(),
             summary_prompt=_summary_prompt(),
+            facts_prompt=_facts_prompt(),
             # Агент не печатает — он отдаёт текст сюда (SPEC §5).
             on_warning=console.warn,
         )
@@ -442,7 +497,26 @@ class AgentShell:
                 console.warn(
                     f"в файле сессии {session.name} негодное context_limit={raw_limit!r} — игнор"
                 )
+        if (
+            not (check_explicit and "context_strategy" in self.explicit)
+            and "context_strategy" in session.state
+        ):
+            raw_strategy = session.state["context_strategy"]
+            if isinstance(raw_strategy, str):
+                try:
+                    self.config.params.set("context_strategy", raw_strategy)
+                except ParamError as error:
+                    console.warn(
+                        f"в файле сессии {session.name} негодное "
+                        f"context_strategy={raw_strategy!r} — игнор: {error}"
+                    )
+            else:
+                console.warn(
+                    f"в файле сессии {session.name} негодное "
+                    f"context_strategy={raw_strategy!r} — игнор"
+                )
         self._apply_session_summary(session)
+        self._apply_session_facts(session)
         return resumed_dialog
 
     def _apply_session_summary(self, session: Session) -> None:
@@ -500,6 +574,67 @@ class AgentShell:
             f"подхвачен пересказ: {upto} старых сообщений заменены им, "
             f"в рабочей истории осталось {len(self.history)}"
         )
+
+    def _apply_session_facts(self, session: Session) -> None:
+        """Loads facts/facts_pinned/facts_upto — three cases each (SPEC §8).
+
+        `facts_upto` is the one place this differs from `_apply_session_summary`:
+        garbage there falls back to `len(session.turns)`, not 0. Zero would
+        mean "nothing extracted yet", and the next turn would pay for one
+        extractor call over the ENTIRE history — the exact re-extraction cost
+        a corrupted key must not trigger. `/facts backfill` is the explicit,
+        opt-in way to pay that cost.
+        """
+        raw_facts = session.state.get("facts")
+        if "facts" not in session.state:
+            self.facts = {}
+        elif isinstance(raw_facts, dict) and all(
+            isinstance(k, str) and isinstance(v, str) for k, v in raw_facts.items()
+        ):
+            cleaned: dict[str, str] = {}
+            rejected: list[str] = []
+            for key, value in raw_facts.items():
+                try:
+                    validate_key(key)
+                except ValueError:
+                    rejected.append(key)
+                    continue
+                cleaned[key] = value
+            self.facts = cleaned
+            if rejected:
+                console.warn(
+                    f"в сессии {session.name} отброшены ключи facts вне категорий: "
+                    f"{', '.join(rejected)}"
+                )
+        else:
+            console.warn(f"в сессии {session.name} facts повреждены — начинаем с пустого блока")
+            self.facts = {}
+
+        raw_pinned = session.state.get("facts_pinned")
+        if "facts_pinned" not in session.state:
+            self.facts_pinned = []
+        elif isinstance(raw_pinned, list) and all(isinstance(k, str) for k in raw_pinned):
+            self.facts_pinned = [key for key in raw_pinned if key in self.facts]
+        else:
+            console.warn(f"в сессии {session.name} facts_pinned повреждены — закрепления сброшены")
+            self.facts_pinned = []
+
+        raw_upto = session.state.get("facts_upto")
+        if "facts_upto" not in session.state:
+            self.facts_upto = 0
+        elif (
+            isinstance(raw_upto, int)
+            and not isinstance(raw_upto, bool)
+            and 0 <= raw_upto <= len(session.turns)
+        ):
+            self.facts_upto = raw_upto
+        else:
+            self.facts_upto = len(session.turns)
+            console.warn(
+                f"в сессии {session.name} негодный facts_upto={raw_upto!r} — считаем "
+                f"догон полным ({self.facts_upto}) вместо повторного извлечения по всей "
+                "истории; пересобрать заново: /facts backfill"
+            )
 
     def save(self) -> None:
         """Сохраняет сессию; ошибку записи показывает, а не глотает.
@@ -560,6 +695,16 @@ def _summary_prompt() -> str | None:
         return None
 
 
+def _facts_prompt() -> str | None:
+    try:
+        return FACTS_PROMPT_PATH.read_text(encoding="utf-8").strip() or None
+    except OSError as error:
+        # Same degrade-with-a-warning shape as _summary_prompt: Agent turns
+        # strategy="facts" into a plain window itself and says so.
+        console.warn(f"промпт экстрактора фактов не прочитался ({error}) — блок facts не растёт")
+        return None
+
+
 def _warn_text(text: str | None) -> None:
     if text:
         console.warn(text)
@@ -595,6 +740,9 @@ def _turn(shell: AgentShell, question: str) -> None:
     # Summary holds until the next compaction and survives a restart via
     # session state (_save_state) — like the working history, it's memory.
     shell.summary = reply.summary
+    if reply.facts is not None:
+        shell.facts = reply.facts
+        shell.facts_upto = reply.facts_upto
     _remember(shell, question, reply)
     # Панель — ПОСЛЕ обновления истории и записи хода, иначе оба её числа
     # отстают на ход: «сессия» не считала бы только что полученный usage, а
@@ -609,17 +757,24 @@ def _turn(shell: AgentShell, question: str) -> None:
 def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> AgentReply | None:
     """Вызов агента плюс весь вывод вокруг него. None — вызов не состоялся."""
     streaming = chat_core.should_stream(shell.config)
+    facts_before = dict(shell.facts)
     try:
         reply = shell.agent.ask(
             question,
             history,
             summary=shell.summary,
+            facts=shell.facts,
+            facts_pinned=shell.facts_pinned,
+            facts_upto=shell.facts_upto,
             on_chunk=console.write_chunk if streaming else None,
         )
     except AdventError as error:
-        # Compaction, if it happened, happened BEFORE the failure — so it is
-        # reported first, in the order things actually occurred.
+        # Compaction/facts, if either happened, happened BEFORE the failure —
+        # so both are salvaged and reported first, in the order things
+        # actually occurred.
         _salvage_compaction(shell)
+        _salvage_facts(shell, facts_before)
+        _salvage_facts_failure(shell)
         # Ошибка печатается и НЕ убивает сессию — как в REPL недели 01.
         console.fail(error)
         # messages реального запроса построил и потерял упавший вызов;
@@ -651,6 +806,21 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             f"{shell.config.model} не поддерживает: {', '.join(reply.result.skipped_params)} — "
             "параметры не отправлены"
         )
+    if reply.window_dropped != shell.window_dropped_reported:
+        if reply.window_dropped:
+            # The "window"/"facts" strategy's own deliberate forgetting —
+            # distinct from the budget-trim safety net reported below
+            # (SPEC §4). Only on CHANGE (review finding T1): printing the
+            # same count every turn once the window fills turns a one-time
+            # warning into noise nobody reads.
+            console.note(f"окно: выпало {reply.window_dropped} сообщений")
+        shell.window_dropped_reported = reply.window_dropped
+    if reply.facts_update is not None:
+        _report_facts_update(shell, reply.facts_update, before=facts_before)
+    if reply.facts_failed is not None:
+        # Paid but unusable (truncated/invalid delta) — Agent already warned
+        # WHY aloud; this only accounts for the cost (review finding #5).
+        _report_facts_failure(shell, reply.facts_failed)
     if reply.compaction is not None:
         # BEFORE the trim warning: compaction happens earlier, and the
         # on-screen order should match reality — otherwise it reads as if
@@ -743,6 +913,97 @@ def _report_compaction(shell: AgentShell, compaction: Compaction) -> None:
     )
 
 
+def _salvage_facts(shell: AgentShell, before: dict[str, str]) -> None:
+    """Keeps a paid facts update whose turn then failed. Mirrors _salvage_compaction.
+
+    `facts_upto` after salvage is `len(shell.history)`, not the cursor
+    `_run_facts` computed: the failed turn's question never entered history
+    (the exchange is not recorded), so the only truthful claim is "facts
+    reflect everything currently in history" — nothing about a turn that
+    never happened.
+    """
+    update = shell.agent.take_pending_facts()
+    if update is None:
+        return
+    _report_facts_update(shell, update, before=before)
+    shell.facts = update.facts
+    shell.facts_upto = len(shell.history)
+    _save_state(shell)
+
+
+def _salvage_facts_failure(shell: AgentShell) -> None:
+    """Keeps a paid-but-unusable extractor call whose turn then failed.
+
+    Mirrors _salvage_compaction/_salvage_facts: the call already happened and
+    was already billed, distinct from the successful-update case above — only
+    one of the two can happen per turn. Without this it would vanish with no
+    journal row at all, under-reporting the day's spend (review finding #5).
+    """
+    failure = shell.agent.take_pending_facts_failed()
+    if failure is None:
+        return
+    _report_facts_failure(shell, failure)
+
+
+def _report_facts_failure(
+    shell: AgentShell, failure: FactsFailure, *, backfill: bool = False
+) -> None:
+    """Journals a paid extractor call that came back unusable (review finding #5).
+
+    Distinguished from a successful `kind="facts"` row by `kind="facts_failed"`
+    plus the reason (truncated/invalid) — Agent already said why aloud via
+    on_warning, this only makes sure the cost isn't silently absent from the
+    journal or from /tokens.
+    """
+    shell.facts_calls += 1
+    shell.facts_failures += 1
+    usage = failure.result.usage
+    shell.facts_prompt_tokens += usage.prompt_tokens or 0
+    shell.facts_completion_tokens += usage.completion_tokens or 0
+    extra: dict[str, object] = {"kind": "facts_failed", "reason": failure.reason}
+    if backfill:
+        extra["backfill"] = True
+    log_call(
+        failure.result,
+        failure.result.sent_messages or [],
+        week=WEEK,
+        day=DAY,
+        extra=extra,
+    )
+
+
+def _report_facts_update(
+    shell: AgentShell, update: FactsUpdate, *, before: dict[str, str], backfill: bool = False
+) -> None:
+    """Announces the extractor call and logs it as a service call (SPEC §5, §9)."""
+    shell.facts_calls += 1
+    usage = update.result.usage
+    shell.facts_prompt_tokens += usage.prompt_tokens or 0
+    shell.facts_completion_tokens += usage.completion_tokens or 0
+
+    note = render_note(before, update.facts)
+    if note:
+        console.note(note)
+    for key in update.delta.blocked:
+        # A pinned key the extractor tried to touch: the user's own edit wins
+        # and stays untouched — SPEC-w02d10.md §5.4's own example wording.
+        _, _, name = key.partition(".")
+        console.note(f"facts: {name} — правка пользователя сохранена")
+    # update.truncated is already spoken aloud by the agent itself
+    # (self._warn in _run_facts, via on_warning=console.warn) — repeating it
+    # here would just be an echo.
+    extra: dict[str, object] = {"kind": "facts", "covered": update.covered}
+    if backfill:
+        extra["backfill"] = True
+    log_call(
+        update.result,
+        update.result.sent_messages or [],
+        week=WEEK,
+        day=DAY,
+        extra=extra,
+    )
+
+
 def _remember(shell: AgentShell, question: str, reply: AgentReply) -> None:
     """Кладёт обмен в память сессии и сохраняет её на диск.
 
@@ -798,6 +1059,13 @@ def _save_state(shell: AgentShell) -> None:
     # the working context.
     shell.session.state["summary"] = shell.summary
     shell.session.state["summary_upto"] = max(0, len(shell.session.turns) - len(shell.history))
+    # Day 10 (SPEC §8): context_strategy is a setting (like mode/context_limit
+    # above); facts/facts_pinned/facts_upto are CONTENT, dropped by
+    # session.clear() (CONTENT_STATE_KEYS) the same way summary is.
+    shell.session.state["context_strategy"] = shell.config.params.context_strategy
+    shell.session.state["facts"] = shell.facts
+    shell.session.state["facts_pinned"] = list(shell.facts_pinned)
+    shell.session.state["facts_upto"] = shell.facts_upto
     shell.save()
 
 
@@ -924,18 +1192,33 @@ def _completion_estimate(shell: AgentShell, reply: AgentReply) -> int | None:
     return max(0, with_text - overhead)
 
 
+def _branch_label(shell: AgentShell) -> str | None:
+    """Own segment name if the current session is a branch, else None."""
+    parent, segment, _is_checkpoint = parse_name(shell.session.name)
+    return segment if parent is not None else None
+
+
 def _token_panel(shell: AgentShell, reply: AgentReply) -> None:
     """Панель токенов после каждого хода — в stderr, как и весь не-продукт.
 
     Три числа, и они отвечают на три разных вопроса: сколько стоил этот ход
     (факт с сервера), сколько стоила сессия целиком и сколько займёт следующий
-    запрос ДО отправки (SPEC-w02d06.md §7.4).
+    запрос ДО отправки (SPEC-w02d06.md §7.4). Day 10 (SPEC §11) adds two more
+    segments — the strategy in effect always, the branch name only if there
+    is one.
     """
     usage = reply.result.usage
     turn = f"{_num(usage.prompt_tokens)}/{_num(usage.completion_tokens)}"
-    console.note(
-        f"токены · ход {turn} · сессия {_session_tokens_label(shell)} · {_context_label(shell)}"
-    )
+    parts = [
+        f"токены · ход {turn}",
+        f"сессия {_session_tokens_label(shell)}",
+        _context_label(shell),
+        f"стратегия {shell.agent.context_strategy}",
+    ]
+    branch = _branch_label(shell)
+    if branch:
+        parts.append(f"ветка {branch}")
+    console.note(" · ".join(parts))
 
 
 # --------------------------------------------------------------------------
@@ -1142,6 +1425,26 @@ def _pick_param(shell: AgentShell) -> tuple[str, str] | None:
     return name, value
 
 
+def _maybe_backfill_facts(shell: AgentShell, previous_strategy: str) -> None:
+    """Auto-backfill on switching TO facts with turns already on disk (SPEC §5.6).
+
+    Fires from whatever code path actually changes the EFFECTIVE strategy to
+    "facts" — called from both `/set context_strategy facts` and the `compact`
+    alias's own params.set(), so a future alias spelling can't reintroduce the
+    review's C3 gap by forgetting a duplicate check (there's only ever one).
+    Without this, switching mid-conversation looks like amnesia: the agent
+    suddenly has no memory of a conversation it's still having. `/facts
+    backfill` (`_facts_backfill`) is the explicit form; this calls the exact
+    same function so the two never drift.
+    """
+    if previous_strategy == "facts" or shell.agent.context_strategy != "facts":
+        return
+    if shell.facts or not shell.session.turns:
+        return
+    console.note("context_strategy → facts: сессия не пуста, а facts пуст — авто-backfill")
+    _facts_backfill(shell)
+
+
 def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
     """Общий хвост `/set <name> <value>` и двухшагового пикера.
 
@@ -1155,6 +1458,10 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
         )
         return False
 
+    # Captured BEFORE .set() mutates it: _maybe_backfill_facts needs to know
+    # what the strategy was to tell "just switched to facts" from "already
+    # was facts" (SPEC §5.6, review finding C3).
+    previous_strategy = shell.agent.context_strategy if name == "context_strategy" else None
     try:
         shell.config.params.set(name, raw)
     except ParamError as error:
@@ -1186,11 +1493,19 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
         # по нему уже со следующего хода, а «вступит после перезапуска»
         # читалось бы как поломка.
         shell.agent.context_limit = shell.effective_context_limit()
+    if name == "context_strategy":
+        # "default"/"none"/"" is params.set()'s own reset sentinel — treated
+        # as "not explicit" so `/set compact off|on` regains the alias.
+        shell.context_strategy_explicit = raw.strip().lower() not in ("", "none", "default")
+        assert previous_strategy is not None  # name == "context_strategy" set it above
+        _maybe_backfill_facts(shell, previous_strategy)
+    if name == "compact" and value is not None:
+        _apply_compact_alias(shell, bool(value))
     if name in ("mode", "done", "stop"):
         # Негодный или съедаемый stop'ом маркер надо поймать сейчас, а не
         # тогда, когда диалог не закончится ни разу.
         _warn_text(shell.agent.check_done())
-    if name in ("mode", "done", "context_limit"):
+    if name in ("mode", "done", "context_limit", "context_strategy", "compact"):
         # Значение применилось — сразу в файл: `/mode dialog` → `/exit` без
         # хода иначе терял бы режим (save после хода тут не случится). Точка
         # записи context_limit — та же (SPEC-w02d08.md §4).
@@ -1200,6 +1515,35 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
     if name in skipped:
         console.warn(f"{shell.config.model} не поддерживает {name} — параметр не отправляется")
     return False
+
+
+def _apply_compact_alias(shell: AgentShell, enabled: bool) -> None:
+    """`/set compact off|on` maps onto context_strategy (SPEC-w02d10.md §3).
+
+    Skipped once context_strategy was set explicitly this run — an explicit
+    choice loses to nothing, compact included. "Explicit" is tracked only
+    within this process (see AgentShell.context_strategy_explicit): day 09's
+    own demo and README call `/set compact off` on a freshly started REPL and
+    expect it to behave exactly as before, restart after restart —
+    persisting explicitness across a save/load cycle would break that on the
+    very first resume.
+    """
+    if shell.context_strategy_explicit:
+        console.warn(
+            f"context_strategy={shell.agent.context_strategy} уже выбран явно — "
+            "compact на сборку запроса не влияет, им управляет /set context_strategy"
+        )
+        return
+    target = "summary" if enabled else "window"
+    previous_strategy = shell.agent.context_strategy
+    if previous_strategy == target:
+        return
+    shell.config.params.set("context_strategy", target)
+    console.note(f"context_strategy → {target} (алиас /set compact {'on' if enabled else 'off'})")
+    # target is never "facts" today (on|off maps only to summary|window), but
+    # routed through the one shared check anyway — review finding C3 asked
+    # for a single place that can't be bypassed by a future alias spelling.
+    _maybe_backfill_facts(shell, previous_strategy)
 
 
 def _shown(value: object) -> object:
@@ -1268,6 +1612,15 @@ def _cmd_reset(shell: AgentShell, args: list[str]) -> bool:
 )
 def _cmd_new(shell: AgentShell, args: list[str]) -> bool:
     name = args[0] if args else shell.session.name
+    path = Session.path_for(validate_name(name), shell.directory)
+    if path.is_file():
+        peek = Session.load(name, directory=shell.directory, quarantine=False)
+        if peek.state.get("kind") == "checkpoint":
+            console.warn(
+                f"{name!r} — checkpoint, /new его не стирает: /branch <имя> --from {name} "
+                "ответвится от него"
+            )
+            return False
     _switch_session(shell, name, fresh=True)
     return False
 
@@ -1305,6 +1658,153 @@ def _cmd_sessions(shell: AgentShell, args: list[str]) -> bool:
         )
     # В stderr, а не в stdout: продукт агента — ответ модели, список сессий это
     # служебная сводка (SPEC-w02d06.md §14).
+    console.err.print(table)
+    return False
+
+
+@command(
+    "/checkpoint",
+    "снимок сессии целиком (можно только ответвиться от него, не /switch); "
+    "без имени — список checkpoint'ов этой сессии",
+    usage="/checkpoint [имя]",
+)
+def _cmd_checkpoint(shell: AgentShell, args: list[str]) -> bool:
+    infos, warnings = list_sessions(shell.directory)
+    for warning in warnings:
+        console.warn(warning)
+    if not args:
+        entries = [
+            entry
+            for entry in build_tree([info.name for info in infos])
+            if entry.is_checkpoint and entry.parent == shell.session.name
+        ]
+        if not entries:
+            console.note(f"у сессии {shell.session.name} нет checkpoint'ов")
+            return False
+        for entry in entries:
+            console.note(entry.name)
+        return False
+    name = args[0]
+    _warn_extra_args("/checkpoint", args[1:])
+    checkpoint = make_checkpoint(shell.session, name, directory=shell.directory)
+    console.note(f"checkpoint {checkpoint.name}: ходов {len(checkpoint.turns)}")
+    return False
+
+
+@command(
+    "/branch",
+    "ответвиться в новую сессию: <имя> [--from <checkpoint>] | удалить: --delete <имя>",
+    usage="/branch <имя> [--from <checkpoint>] | --delete <имя>",
+)
+def _cmd_branch(shell: AgentShell, args: list[str]) -> bool:
+    if not args:
+        console.warn("нужно: /branch <имя> [--from <checkpoint>] | --delete <имя>")
+        return False
+
+    if args[0] == "--delete":
+        if len(args) < 2:
+            console.warn("нужно: /branch --delete <имя>")
+            return False
+        name = args[1]
+        _warn_extra_args("/branch --delete", args[2:])
+        if name == shell.session.name:
+            console.warn("нельзя удалить текущую ветку — сначала /switch на другую")
+            return False
+        delete_branch(name, directory=shell.directory)
+        console.note(f"ветка {name} удалена")
+        return False
+
+    name = args[0]
+    rest = args[1:]
+    from_arg: str | None = None
+    if rest and rest[0] == "--from":
+        if len(rest) < 2:
+            console.warn("нужно: /branch <имя> --from <checkpoint>")
+            return False
+        from_arg = rest[1]
+        rest = rest[2:]
+    _warn_extra_args("/branch", rest)
+
+    if from_arg is not None:
+        cp_name = (
+            from_arg
+            if BRANCH_SEP in from_arg
+            else checkpoint_file_name(shell.session.name, from_arg)
+        )
+        if not Session.path_for(cp_name, shell.directory).is_file():
+            console.warn(f"checkpoint {cp_name!r} не найден")
+            return False
+        source = Session.load(cp_name, directory=shell.directory, quarantine=False)
+        if source.state.get("kind") != "checkpoint":
+            console.warn(f"{cp_name!r} — не checkpoint, --from ждёт снимок из /checkpoint")
+            return False
+    else:
+        infos, warnings = list_sessions(shell.directory)
+        for warning in warnings:
+            console.warn(warning)
+        checkpoints = [
+            entry
+            for entry in build_tree([info.name for info in infos])
+            if entry.is_checkpoint and entry.parent == shell.session.name
+        ]
+        if len(checkpoints) > 1:
+            console.warn(
+                "у сессии несколько checkpoint'ов — укажи --from <имя>: "
+                + ", ".join(entry.name for entry in checkpoints)
+            )
+            return False
+        source = (
+            Session.load(checkpoints[0].name, directory=shell.directory, quarantine=False)
+            if checkpoints
+            else shell.session
+        )
+
+    branch = make_branch(source, name, directory=shell.directory)
+    console.note(f"ветка {branch.name} создана от {source.name}")
+    _switch_session(shell, branch.name, announce_diff=True)
+    return False
+
+
+@command(
+    "/switch",
+    "перейти в сессию или ветку (в checkpoint нельзя — подсказка ответвиться)",
+    usage="/switch <имя>",
+)
+def _cmd_switch(shell: AgentShell, args: list[str]) -> bool:
+    if not args:
+        console.warn("нужно: /switch <имя>")
+        return False
+    name = validate_name(args[0])
+    _warn_extra_args("/switch", args[1:])
+    if not Session.path_for(name, shell.directory).is_file():
+        console.warn(f"сессия {name!r} не найдена")
+        return False
+    # Checkpoint refusal lives in _switch_session now — shared with /set
+    # session, /new and startup (review finding P1).
+    _switch_session(shell, name, announce_diff=True)
+    return False
+
+
+@command("/branches", "дерево веток и checkpoint'ов текущего корня")
+def _cmd_branches(shell: AgentShell, args: list[str]) -> bool:
+    _warn_extra_args("/branches", args)
+    infos, warnings = list_sessions(shell.directory)
+    for warning in warnings:
+        console.warn(warning)
+    root = root_of(shell.session.name)
+    entries = [entry for entry in build_tree([info.name for info in infos]) if entry.root == root]
+    if not entries:
+        console.note(f"у сессии {root} нет веток")
+        return False
+    entries.sort(key=lambda entry: (entry.depth, entry.name))
+    table = Table(title=f"Дерево сессии {root}", show_header=False, box=None)
+    table.add_column()
+    for entry in entries:
+        indent = "  " * entry.depth
+        marker = " (checkpoint)" if entry.is_checkpoint else ""
+        current = " ← текущая" if entry.name == shell.session.name else ""
+        orphan = " [сирота]" if entry.orphaned else ""
+        table.add_row(f"{indent}{entry.name}{marker}{current}{orphan}")
     console.err.print(table)
     return False
 
@@ -1360,7 +1860,12 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
     table.add_row("prompt/completion", f"{prompt_label}/{completion_label}")
     table.add_row("всего за сессию", _session_tokens_label(shell))
     table.add_row("следующий запрос", _context_label(shell))
+    table.add_row("стратегия", shell.agent.context_strategy)
+    branch = _branch_label(shell)
+    if branch:
+        table.add_row("ветка", branch)
     table.add_row("сжатие истории", _compact_label(shell))
+    table.add_row("facts", _facts_label(shell))
     override = shell.config.params.context_limit
     if override is not None:
         # Override обязан быть виден и здесь: «окно 2500» без второго числа
@@ -1429,6 +1934,45 @@ def _summary_tokens(shell: AgentShell) -> int | None:
     return max(0, with_pair - overhead)
 
 
+def _facts_tokens(shell: AgentShell) -> int | None:
+    """Size of the current facts block. Same probe-and-subtract as `_summary_tokens`.
+
+    Deliberately re-implemented here rather than calling Agent's own private
+    `_facts_block_tokens` — the CLI owns display math, the same split already
+    used for `_summary_tokens`/`_completion_estimate`.
+    """
+    if shell.counter is None or not shell.facts:
+        return None
+    block = format_facts(shell.facts, shell.facts_pinned)
+    if not block:
+        return 0
+    empty = [{"role": "user", "content": ""}]
+    with_block = shell.counter.count([{"role": "user", "content": block}, *empty])
+    overhead = shell.counter.count(empty)
+    if with_block is None or overhead is None:
+        return None
+    return max(0, with_block - overhead)
+
+
+def _facts_label(shell: AgentShell) -> str:
+    """/tokens line about facts: block size, pins, extractor calls and price."""
+    if shell.agent.context_strategy != "facts":
+        return f"неприменимо: context_strategy={shell.agent.context_strategy} (не facts)"
+    if not shell.facts:
+        parts = ["блок пуст"]
+    else:
+        size = _facts_tokens(shell)
+        mark = "" if shell.counter is not None and shell.counter.exact else "~"
+        parts = [f"ключей {len(shell.facts)}, блок {mark}{_num(size)} токенов"]
+    if shell.facts_calls:
+        failed = f", из них неуспешных {shell.facts_failures}" if shell.facts_failures else ""
+        parts.append(
+            f"вызовов экстрактора {shell.facts_calls}{failed}, стоили "
+            f"{shell.facts_prompt_tokens}/{shell.facts_completion_tokens}"
+        )
+    return "; ".join(parts)
+
+
 def _compact_label(shell: AgentShell) -> str:
     """/tokens line about compaction: on or off, summary present, its cost.
 
@@ -1438,6 +1982,11 @@ def _compact_label(shell: AgentShell) -> str:
     """
     if not shell.config.params.compact:
         return "выключено (/set compact on)"
+    if shell.agent.context_strategy != "summary":
+        # compact_enabled() would also say False here, but for a different
+        # reason than "no summarizer prompt" — naming the actual strategy
+        # avoids sending the user to fix a prompt file that isn't the issue.
+        return f"неприменимо: context_strategy={shell.agent.context_strategy} (не summary)"
     if not shell.agent.compact_enabled():
         # Param is on but there's nothing to compact with (prompt didn't
         # load) — not "disabled by the user", needs different wording.
@@ -1493,6 +2042,129 @@ def _cmd_summary(shell: AgentShell, args: list[str]) -> bool:
     # rich_escape: the summary came from the model, and any [something] in
     # it would be taken by Rich as markup.
     console.err.print(rich_escape(shell.summary))
+    return False
+
+
+def _facts_backfill(shell: AgentShell) -> None:
+    """One extractor pass over the WHOLE session (SPEC-w02d10.md §5.6).
+
+    Seeded with pinned facts only, not the full current block: apply_delta()
+    blocks any extractor set/delete touching a pinned key regardless of
+    whether that key is already present — seeding with everything would let
+    the extractor silently confirm stale non-pinned values instead of
+    actually re-deriving them from scratch, which is the whole point of an
+    explicit rebuild.
+
+    Calls Agent._run_facts() directly — a private method, not part of
+    advent_core/agent.py's public surface (no public "run the extractor once
+    over arbitrary history" exists, only the full per-turn ask()). Documented
+    as a deliberate exception rather than reimplementing the catch-up/
+    truncation rules a second time in the CLI (see followups).
+    """
+    history = shell.session.history()
+    if not history:
+        console.note("сессия пуста — извлекать нечего")
+        return
+    seed = {key: value for key, value in shell.facts.items() if key in shell.facts_pinned}
+    facts_before = dict(shell.facts)
+    # catchup_max=None (review finding P3): backfill means "the whole file",
+    # not "the last FACTS_CATCHUP_MAX messages" — the per-turn catch-up cap
+    # exists for the ongoing-conversation case, not for an explicit rebuild.
+    _facts, _upto, update = shell.agent._run_facts(
+        seed, shell.facts_pinned, history, "", 0, catchup_max=None
+    )
+    if update is None:
+        failure = shell.agent.take_pending_facts_failed()
+        if failure is not None:
+            _report_facts_failure(shell, failure, backfill=True)
+        # Agent already warned the reason (no prompt / call failed / bad delta).
+        return
+    shell.facts = update.facts
+    shell.facts_upto = len(history)
+    _report_facts_update(shell, update, before=facts_before, backfill=True)
+    _save_state(shell)
+
+
+@command(
+    "/facts",
+    "показать блок facts целиком; `backfill` — пересобрать одним вызовом по всей сессии",
+    usage="/facts [backfill]",
+)
+def _cmd_facts(shell: AgentShell, args: list[str]) -> bool:
+    if args and args[0] == "backfill":
+        _warn_extra_args("/facts backfill", args[1:])
+        _facts_backfill(shell)
+        return False
+    _warn_extra_args("/facts", args)
+    block = format_facts(shell.facts, shell.facts_pinned)
+    if not block:
+        console.note("фактов пока нет")
+        return False
+    # rich_escape: facts values come from the extractor/model, [что-то] would
+    # otherwise be eaten by Rich as markup — same reasoning as /summary.
+    console.err.print(rich_escape(block))
+    return False
+
+
+@command(
+    "/fact",
+    "правка facts вручную: set <категория.имя> <значение> (и закрепляет) | del <ключ> | "
+    "unpin <ключ>",
+    usage="/fact set|del|unpin <ключ> [значение]",
+)
+def _cmd_fact(shell: AgentShell, args: list[str]) -> bool:
+    if not args:
+        console.warn("нужно: /fact set|del|unpin <ключ> ...")
+        return False
+    sub, *rest = args
+    if sub == "set":
+        if len(rest) < 2:
+            console.warn("нужно: /fact set <категория.имя> <значение>")
+            return False
+        raw_key, value = rest[0], " ".join(rest[1:])
+        try:
+            key = validate_key(raw_key)
+        except ValueError as error:
+            console.warn(str(error))
+            return False
+        before = dict(shell.facts)
+        shell.facts[key] = value
+        if key not in shell.facts_pinned:
+            shell.facts_pinned.append(key)
+        note = render_note(before, shell.facts)
+        console.note(f"{note} (закреплено)" if note else f"{key} закреплён")
+        _save_state(shell)
+        return False
+    if sub == "del":
+        if not rest:
+            console.warn("нужно: /fact del <ключ>")
+            return False
+        key = rest[0]
+        if key not in shell.facts:
+            console.warn(f"ключ {key!r} не найден")
+            return False
+        before = dict(shell.facts)
+        del shell.facts[key]
+        if key in shell.facts_pinned:
+            shell.facts_pinned.remove(key)
+        note = render_note(before, shell.facts)
+        if note:
+            console.note(note)
+        _save_state(shell)
+        return False
+    if sub == "unpin":
+        if not rest:
+            console.warn("нужно: /fact unpin <ключ>")
+            return False
+        key = rest[0]
+        if key not in shell.facts_pinned:
+            console.warn(f"{key!r} не был закреплён")
+            return False
+        shell.facts_pinned.remove(key)
+        console.note(f"{key} больше не закреплён")
+        _save_state(shell)
+        return False
+    console.warn(f"неизвестное действие /fact {sub!r}: set | del | unpin")
     return False
 
 
@@ -1566,15 +2238,88 @@ def _print_growth_table(shell: AgentShell) -> None:
         console.note(f"в накопительном итоге не учтено ходов: {missing}")
 
 
-def _switch_session(shell: AgentShell, name: str, *, fresh: bool = False) -> None:
+def _checkpoint_switch_refusal(shell: AgentShell, name: str) -> str | None:
+    """Message refusing to switch INTO `name`, or None if it's fine.
+
+    Single shared guard (review finding P1): a checkpoint can only be
+    branched from, never switched into (SPEC-w02d10.md §7.1). `/switch` used
+    to be the only caller that checked this — `/set session <checkpoint>`
+    reached `_switch_session()`/`open_session()` directly and bypassed it
+    entirely. Every path that can land on a session now calls this one
+    function instead of re-deriving the rule: `_switch_session` (covers
+    `/set session`, `/branch`'s switch-into-the-new-branch, `/new`'s fallback)
+    and startup's `--session`.
+    """
+    if not Session.path_for(name, shell.directory).is_file():
+        return None
+    peek = Session.load(name, directory=shell.directory, quarantine=False)
+    if peek.state.get("kind") != "checkpoint":
+        return None
+    return (
+        f"{name!r} — checkpoint, в него нельзя переключиться: "
+        f"/branch <имя> --from {name} — ответвиться от него"
+    )
+
+
+def _switch_settings_note(
+    *,
+    before: tuple[str, int | None, str],
+    after: tuple[str, int | None, str],
+    target: str,
+    is_branch: bool,
+) -> str | None:
+    """Diff-only note for `/switch`/`/branch` (SPEC-w02d10.md §7.4).
+
+    None settings actually differ — a note on every switch would drown the
+    rare case that matters: settings genuinely changing underneath the user.
+    """
+    before_strategy, before_limit, before_mode = before
+    after_strategy, after_limit, after_mode = after
+    diffs: list[str] = []
+    if before_strategy != after_strategy:
+        diffs.append(f"context_strategy {after_strategy} (было {before_strategy})")
+    if before_limit != after_limit:
+        diffs.append(
+            f"окно {after_limit if after_limit is not None else 'из карточки'} "
+            f"(было {before_limit if before_limit is not None else 'из карточки'})"
+        )
+    if before_mode != after_mode:
+        diffs.append(f"mode {after_mode} (было {before_mode})")
+    if not diffs:
+        return None
+    kind = "ветка" if is_branch else "сессия"
+    return f"{kind} {target}: " + ", ".join(diffs)
+
+
+def _switch_session(
+    shell: AgentShell, name: str, *, fresh: bool = False, announce_diff: bool = False
+) -> None:
     """Переключение сессии: текущая сохраняется, история подменяется.
 
     `fresh` стирает содержимое целевой сессии — это и есть `/new`. Отказ вместо
     стирания выглядел бы безопаснее, но сорвал бы второй дубль записи: демо
     начинается с пустой сессии, и повторный прогон обязан приводить в то же
     состояние, что и первый.
+
+    `announce_diff` — только для `/switch` и `/branch` (SPEC §7.4): печатает
+    ноту, если context_strategy/context_limit/mode реально отличаются у цели.
+    `/new` и `/set session` его не просят — тот же переход, но без этой ноты,
+    чтобы не менять уже сданное поведение дня 09.
     """
     validate_name(name)
+    refusal = _checkpoint_switch_refusal(shell, name)
+    if refusal:
+        console.warn(refusal)
+        # config.params.session was already written by _apply_set's "session"
+        # branch before this function ran — undo it so /params doesn't claim
+        # a session that was never actually entered.
+        shell.config.params.session = shell.session.name
+        return
+    before = (
+        (shell.agent.context_strategy, shell.config.params.context_limit, shell.agent.mode)
+        if announce_diff
+        else None
+    )
     shell.save()
     session = shell.open_session(name)
     if fresh:
@@ -1586,6 +2331,13 @@ def _switch_session(shell: AgentShell, name: str, *, fresh: bool = False) -> Non
         # без истории врал бы. mode/done не трогаем: это настройка запуска,
         # а не содержимое разговора (clear() state не стирает).
         session.state["dialog_turns"] = 0
+        parent, _segment, _is_checkpoint = parse_name(session.name)
+        if parent is not None:
+            # SPEC §7.3: /new inside a branch clears only that branch's own
+            # file — the parent must never learn this happened.
+            console.note(
+                f"{session.name} — ветка (родитель {parent}), а не корень; стёрта только она"
+            )
     shell.session = session
     shell.history = session.history()
     shell.config.params.session = session.name
@@ -1600,8 +2352,19 @@ def _switch_session(shell: AgentShell, name: str, *, fresh: bool = False) -> Non
         console.note(
             f"подхвачен целевой диалог: ход {shell.dialog_turns} из {shell.agent.max_turns}"
         )
+    if before is not None:
+        after = (shell.agent.context_strategy, shell.config.params.context_limit, shell.agent.mode)
+        parent, _segment, _is_checkpoint = parse_name(session.name)
+        note = _switch_settings_note(
+            before=before, after=after, target=session.name, is_branch=parent is not None
+        )
+        if note:
+            console.note(note)
     shell.last_question = None
     shell.last_check = None
+    # New conversation identity — a stale "already announced N" would
+    # suppress a genuine window-drop note in the session just entered.
+    shell.window_dropped_reported = None
     if fresh:
         shell.save()
 

@@ -24,6 +24,11 @@ MODE_CHOICES = ("chat", "dialog")
 STRATEGIES = ("direct", "steps", "meta", "panel")
 STRATEGY_CHOICES = (*STRATEGIES, "all")
 
+# Context-assembly strategies of week 02 day 10 (SPEC-w02d10.md §3). One axis,
+# four values — "window+facts both on" would mean nothing (facts already
+# implies "facts + last N"), so this is a choice, not a set of flags.
+CONTEXT_STRATEGY_CHOICES = ("window", "facts", "branch", "summary")
+
 # Команды CLI, у которых есть собственные значения по умолчанию (Spec.defaults).
 CHAT_COMMAND = "chat"
 SOLVE_COMMAND = "solve"
@@ -61,6 +66,10 @@ AGENT_PARAMS: tuple[str, ...] = (
     "compact",
     "keep_last",
     "compact_every",
+    # Context strategies (day 10): which of the four assemblies to use, and
+    # the size cap on the facts block the "facts" strategy maintains.
+    "context_strategy",
+    "facts_max_tokens",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -209,6 +218,31 @@ SPECS: tuple[Spec, ...] = (
         None,
         local=True,
         defaults={AGENT_COMMAND: 10},
+    ),
+    # Day 10 (SPEC-w02d10.md §3, §12): which of the four request assemblies to
+    # use. Default "summary" — day 09 keeps behaving exactly as before for
+    # every caller that never sets this. Local: the server never sees it, the
+    # agent decides before building the request, same as compact/keep_last.
+    Spec(
+        "context_strategy",
+        "choice",
+        "Стратегия сборки контекста: window (окно) / facts (память фактов) / "
+        "branch (вся история ветки) / summary (пересказ, как в дне 09).",
+        choices=CONTEXT_STRATEGY_CHOICES,
+        local=True,
+        defaults={AGENT_COMMAND: "summary"},
+    ),
+    # Day 10 (SPEC-w02d10.md §5.5): soft cap on the facts block. Not enforced
+    # by code — the extractor gets a "уплотняй формулировки" nudge past this
+    # size; only the extractor or a human ever deletes a fact.
+    Spec(
+        "facts_max_tokens",
+        "int",
+        "Потолок размера блока facts в токенах (сигнал экстрактору, не жёсткий срез).",
+        100,
+        None,
+        local=True,
+        defaults={AGENT_COMMAND: 400},
     ),
     Spec(
         "session",
@@ -437,6 +471,12 @@ class GenerationParams:
     compact: bool | None = None
     keep_last: int | None = None
     compact_every: int | None = None
+
+    # Day 10 params (SPEC-w02d10.md §12): context strategy + facts size cap.
+    # None means "command default" (apply_defaults fills it in), matching
+    # compact/keep_last/compact_every above.
+    context_strategy: str | None = None
+    facts_max_tokens: int | None = None
 
     # Параметр агента (день 06): имя сессии на диске. Тоже локальный — в
     # payload не идёт, но живёт в общем реестре, потому что `/set session

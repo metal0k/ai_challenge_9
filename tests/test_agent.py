@@ -7,13 +7,20 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from advent_core import chat as chat_core
 from advent_core.agent import (
     DEFAULT_COMPACT_EVERY,
+    DEFAULT_CONTEXT_STRATEGY,
+    DEFAULT_FACTS_MAX_TOKENS,
     DEFAULT_KEEP_LAST,
     DEFAULT_MAX_TURNS,
+    FACTS_CATCHUP_MAX,
+    FACTS_RESPONSE_TOKENS,
+    FACTS_SCHEMA_PATH,
     INTERRUPT_NOTE,
     SUMMARY_MAX_TOKENS,
     Agent,
@@ -24,6 +31,7 @@ from advent_core.agent import (
 from advent_core.compact import SUMMARY_ACK, SUMMARY_PREFIX
 from advent_core.config import Config
 from advent_core.errors import AdventError
+from advent_core.facts import FACTS_ACK, FACTS_PREFIX
 from advent_core.params import AGENT_COMMAND, GenerationParams, defaults_for
 from advent_core.telemetry import CallResult, Usage
 
@@ -831,3 +839,629 @@ def test_compact_now_on_a_short_history_makes_no_call():
     assert agent.compact_now(None, HISTORY_6[:2]) is None
     assert recorder.calls == []
     assert any("сжимать нечего" in text for text in agent.warnings)
+
+
+# --- context strategies (day 10) --------------------------------------------
+
+
+def test_default_strategy_is_summary_and_matches_the_registry():
+    """Day 09 keeps working for every caller that never sets context_strategy."""
+    agent = build_agent(_Recorder(), make_config())
+
+    assert agent.context_strategy == "summary" == DEFAULT_CONTEXT_STRATEGY
+    registry = defaults_for(AGENT_COMMAND)
+    assert registry["context_strategy"] == "summary"
+    assert (agent.facts_max_tokens, DEFAULT_FACTS_MAX_TOKENS, registry["facts_max_tokens"]) == (
+        400,
+        400,
+        400,
+    )
+
+
+def test_window_strategy_sends_only_the_tail_and_reports_what_it_dropped():
+    recorder = _Recorder(CallResult(text="ответ"))
+    config = make_config(context_strategy="window", keep_last=2)
+    agent = build_agent(recorder, config, summary_prompt="сожми")
+
+    reply = agent.ask("вопрос", list(HISTORY_6))
+
+    assert len(recorder.calls) == 1
+    request = recorder.calls[0]
+    assert [m["content"] for m in request] == ["в3", "о3", "вопрос"]
+    assert reply.window_dropped == 4
+    assert reply.compaction is None
+    assert reply.summary is None
+
+
+def test_window_strategy_never_calls_the_summarizer_even_with_compact_on():
+    """Explicit context_strategy wins over the compact alias (SPEC §3)."""
+    recorder = _Recorder(CallResult(text="ответ"))
+    config = make_config(context_strategy="window", keep_last=2, compact=True)
+    agent = build_agent(recorder, config, summary_prompt="сожми")
+
+    agent.ask("вопрос", list(HISTORY_6))
+
+    assert len(recorder.calls) == 1
+
+
+def test_branch_strategy_sends_the_whole_history_untouched():
+    recorder = _Recorder(CallResult(text="ответ"))
+    config = make_config(context_strategy="branch", keep_last=2)
+    agent = build_agent(recorder, config)
+
+    reply = agent.ask("вопрос", list(HISTORY_6))
+
+    request = recorder.calls[0]
+    assert [m["content"] for m in request] == ["в1", "о1", "в2", "о2", "в3", "о3", "вопрос"]
+    assert reply.window_dropped == 0
+
+
+def test_compact_now_warns_when_an_explicit_strategy_conflicts_with_summary():
+    agent = build_agent(
+        _Recorder(), make_config(context_strategy="window", compact=True), summary_prompt="сожми"
+    )
+
+    assert agent.compact_now(None, list(HISTORY_6)) is None
+    assert any("context_strategy=window" in text for text in agent.warnings)
+    assert any("/set context_strategy summary" in text for text in agent.warnings)
+
+
+def test_facts_dict_is_echoed_unchanged_outside_the_facts_strategy():
+    recorder = _Recorder(CallResult(text="ответ"))
+    config = make_config(context_strategy="window", keep_last=2)
+    agent = build_agent(recorder, config)
+
+    reply = agent.ask(
+        "вопрос",
+        list(HISTORY_6),
+        facts={"цель.основное": "MVP"},
+        facts_pinned=(),
+        facts_upto=3,
+    )
+
+    assert reply.facts == {"цель.основное": "MVP"}
+    assert reply.facts_upto == 3
+    assert reply.facts_update is None
+
+
+def test_agent_reply_new_day_10_fields_have_backward_compatible_defaults():
+    reply = AgentReply(text="t", history=[], result=CallResult(text="t"))
+
+    assert reply.facts is None
+    assert reply.facts_upto == 0
+    assert reply.facts_update is None
+    assert reply.window_dropped == 0
+
+
+# --- sticky facts: extractor call (day 10) ----------------------------------
+
+
+def facts_config(**params) -> Config:
+    """Facts strategy, window disabled (keep_last huge) unless a test says otherwise."""
+    params.setdefault("context_strategy", "facts")
+    params.setdefault("keep_last", 100)
+    return make_config(**params)
+
+
+def test_facts_strategy_assembles_the_pseudo_pair_plus_tail_and_updates_the_dict():
+    recorder = _Recorder(
+        CallResult(
+            text=json.dumps({"set": [{"key": "цель.основное", "value": "MVP"}], "delete": []})
+        ),
+        CallResult(text="ответ"),
+    )
+    agent = build_agent(recorder, facts_config(keep_last=2), facts_prompt="извлеки факты")
+
+    reply = agent.ask("вопрос", list(HISTORY_6), facts={}, facts_pinned=(), facts_upto=0)
+
+    assert len(recorder.calls) == 2
+    extractor_call = recorder.calls[0]
+    assert extractor_call[0] == {"role": "system", "content": "извлеки факты"}
+    assert "в1" in extractor_call[1]["content"]
+
+    request = recorder.calls[1]
+    assert request[0] == {"role": "user", "content": f"{FACTS_PREFIX}\n\nцель:\n  основное: MVP"}
+    assert request[1] == {"role": "assistant", "content": FACTS_ACK}
+    assert [m["content"] for m in request[2:]] == ["в3", "о3", "вопрос"]
+
+    assert reply.facts == {"цель.основное": "MVP"}
+    assert reply.facts_update is not None
+    assert reply.facts_update.delta.added == ("цель.основное",)
+    assert reply.facts_update.covered == 6
+    assert reply.window_dropped == 4
+    # upto_after (len(history)+1=7) remapped by the window's own cut (4).
+    assert reply.facts_upto == 3
+    assert agent.pending_facts is None
+
+
+def test_facts_extractor_gets_its_own_params_and_the_session_config_is_untouched():
+    recorder = _ConfigRecorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})),
+        CallResult(text="ответ"),
+    )
+    config = facts_config(format="json", stop=["СТОП"], max_tokens=50, facts_max_tokens=77)
+    agent = build_agent(recorder, config, facts_prompt="извлеки")
+
+    agent.ask("вопрос", [], facts={}, facts_pinned=(), facts_upto=0)
+
+    extractor = recorder.configs[0].params
+    # The block cap (77 here) is NOT the response ceiling: the block is what we
+    # store, the delta is what the model writes to change it. Conflating them
+    # cut a delta mid-JSON on a live run, 2026-09-12 (SPEC-w02d10.md §5.5).
+    assert extractor.max_tokens == FACTS_RESPONSE_TOKENS
+    assert extractor.max_tokens != 77
+    assert extractor.format == "schema"
+    assert extractor.schema_file == str(FACTS_SCHEMA_PATH)
+    assert extractor.stop is None
+    # The actual turn keeps the session's own params — a copy, not an edit in place.
+    assert recorder.configs[1].params.max_tokens == 50
+    assert recorder.configs[1].params.format == "json"
+    assert agent.config.params.max_tokens == 50
+
+
+def test_a_truncated_extractor_answer_blames_the_ceiling_not_the_model():
+    """finish_reason=length means OUR max_tokens cut the delta mid-JSON.
+
+    Seen live 2026-09-12: the warning said "вернул невалидную дельту", which
+    sends the reader to the prompt while the cause sits in max_tokens. Note
+    complete() never sets `truncated` — that flag belongs to the stream path.
+    """
+    recorder = _Recorder(
+        CallResult(text='{"set": [{"key": "цель.основное", "value": "MV', finish_reason="length"),
+        CallResult(text="ответ"),
+    )
+    old_facts = {"цель.основное": "MVP"}
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    reply = agent.ask("вопрос", [], facts=old_facts, facts_pinned=(), facts_upto=0)
+
+    assert reply.facts == old_facts
+    assert reply.facts_upto == 0
+    assert reply.facts_update is None
+    assert any("обрезан лимитом" in text for text in agent.warnings)
+    assert not any("невалидную дельту" in text for text in agent.warnings)
+
+
+def test_facts_without_a_prompt_skips_the_call_and_cuts_the_window_normally():
+    """No prompt means no extractor, EVER — so the window-hold of SPEC §5.3
+    must not fire here. Holding is "wait for the next attempt"; with nothing
+    to wait for it would turn `facts` into a strategy with no window at all,
+    paying for the whole history every turn. A permanent misconfiguration
+    degrades to plain `window` plus the once-only warning."""
+    recorder = _Recorder(CallResult(text="ответ"))
+    agent = build_agent(recorder, facts_config(keep_last=2))
+
+    reply = agent.ask("вопрос", list(HISTORY_6), facts={}, facts_pinned=(), facts_upto=0)
+
+    assert len(recorder.calls) == 1
+    assert reply.facts_update is None
+    assert reply.facts == {}
+    assert reply.window_dropped == 4
+    assert reply.facts_upto == 0
+    request = recorder.calls[0]
+    assert [m["content"] for m in request] == ["в3", "о3", "вопрос"]
+    assert any("промпт экстрактора не задан" in text for text in agent.warnings)
+    assert not any("окно придержано" in text for text in agent.warnings)
+
+
+def test_facts_extractor_failure_keeps_old_facts_and_does_not_advance_the_cursor():
+    class _FailingExtractor(_Recorder):
+        def complete(self, config, messages, capabilities=None) -> CallResult:
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                raise AdventError("сеть отвалилась")
+            return super().complete(config, messages, capabilities)
+
+    recorder = _FailingExtractor(CallResult(text="ответ"))
+    old_facts = {"цель.основное": "MVP"}
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    reply = agent.ask(
+        "вопрос",
+        [{"role": "user", "content": "в1"}, {"role": "assistant", "content": "о1"}],
+        facts=old_facts,
+        facts_pinned=(),
+        facts_upto=0,
+    )
+
+    assert reply.text == "ответ"
+    assert reply.facts == old_facts
+    assert reply.facts_upto == 0
+    assert reply.facts_update is None
+    assert agent.pending_facts is None
+    # The old facts still went into the request — only the update failed.
+    request = recorder.calls[1]
+    assert request[0] == {"role": "user", "content": f"{FACTS_PREFIX}\n\nцель:\n  основное: MVP"}
+    assert any("извлечение фактов не удалось" in text for text in agent.warnings)
+
+
+def test_a_paid_facts_update_is_parked_when_the_turn_itself_fails():
+    class _FailingTurn(_Recorder):
+        def complete(self, config, messages, capabilities=None) -> CallResult:
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return CallResult(
+                    text=json.dumps(
+                        {"set": [{"key": "цель.основное", "value": "MVP"}], "delete": []}
+                    ),
+                    model_requested="m",
+                )
+            raise AdventError("сеть отвалилась")
+
+    agent = build_agent(_FailingTurn(), facts_config(), facts_prompt="извлеки")
+
+    with pytest.raises(AdventError):
+        agent.ask("вопрос", [], facts={}, facts_pinned=(), facts_upto=0)
+
+    pending = agent.take_pending_facts()
+    assert pending is not None
+    assert pending.facts == {"цель.основное": "MVP"}
+    # Handed over exactly once — a second caller would bill the same call twice.
+    assert agent.take_pending_facts() is None
+
+
+def test_a_successful_facts_turn_leaves_nothing_parked():
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})), CallResult(text="ответ")
+    )
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    reply = agent.ask("вопрос", [], facts={}, facts_pinned=(), facts_upto=0)
+
+    assert reply.facts_update is not None
+    assert agent.pending_facts is None
+
+
+def test_facts_catchup_survives_repeated_extractor_failures():
+    """Three turns, extractor fails twice: facts_upto never advances until it can.
+
+    The third, successful call must then cover everything since turn one —
+    not just the newest exchange (SPEC-w02d10.md §5.3).
+    """
+
+    class _FactsCatchup:
+        def __init__(self, extractor_outcomes, main_result) -> None:
+            self._extractor_outcomes = list(extractor_outcomes)
+            self._main_result = main_result
+            self.calls: list[list[dict]] = []
+            self._extractor_calls = 0
+
+        def complete(self, config, messages, capabilities=None) -> CallResult:
+            self.calls.append(messages)
+            if messages[0].get("content") == "извлеки":
+                outcome = self._extractor_outcomes[self._extractor_calls]
+                self._extractor_calls += 1
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+            return self._main_result
+
+        def stream(self, config, messages, on_chunk, capabilities=None) -> CallResult:
+            raise AssertionError("this test never streams")
+
+    recorder = _FactsCatchup(
+        [
+            AdventError("сеть 1"),
+            AdventError("сеть 2"),
+            CallResult(
+                text=json.dumps({"set": [{"key": "цель.основное", "value": "MVP"}], "delete": []})
+            ),
+        ],
+        CallResult(text="ok"),
+    )
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    history: list[dict] = []
+    facts: dict[str, str] = {}
+    facts_upto = 0
+    reply = None
+    for user_input in ("A", "B", "C"):
+        reply = agent.ask(user_input, history, facts=facts, facts_pinned=(), facts_upto=facts_upto)
+        history = reply.history
+        facts = reply.facts or {}
+        facts_upto = reply.facts_upto
+
+    assert reply.facts == {"цель.основное": "MVP"}
+    assert reply.facts_update is not None
+    assert reply.facts_update.covered == 4  # A/ok, B/ok — 4 messages, nothing extracted yet
+    assert reply.facts_update.truncated is False
+    assert reply.facts_upto == 5
+    assert sum("извлечение фактов не удалось" in text for text in agent.warnings) == 2
+
+
+def test_facts_catchup_beyond_the_max_truncates_and_warns():
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})), CallResult(text="ответ")
+    )
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+    long_history = []
+    for i in range(12):
+        long_history.append({"role": "user", "content": f"в{i}"})
+        long_history.append({"role": "assistant", "content": f"о{i}"})
+
+    reply = agent.ask("вопрос", long_history, facts={}, facts_pinned=(), facts_upto=0)
+
+    assert reply.facts_update is not None
+    assert reply.facts_update.truncated is True
+    extractor_call = recorder.calls[0]
+    assert "в0" not in extractor_call[1]["content"]
+    assert "в11" in extractor_call[1]["content"]
+    assert "о11" in extractor_call[1]["content"]
+    assert any(f"больше чем на {FACTS_CATCHUP_MAX} сообщений" in text for text in agent.warnings)
+
+
+def test_facts_block_over_the_cap_adds_a_squeeze_instruction():
+    config = facts_config(facts_max_tokens=1)
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})), CallResult(text="ответ")
+    )
+    agent = build_agent(recorder, config, facts_prompt="извлеки", counter=_CharCounter())
+
+    agent.ask("вопрос", [], facts={"цель.основное": "MVP"}, facts_pinned=(), facts_upto=0)
+
+    extractor_call = recorder.calls[0]
+    assert "уплотняй формулировки" in extractor_call[1]["content"]
+
+
+def test_facts_block_under_the_cap_has_no_squeeze_instruction():
+    config = facts_config(facts_max_tokens=DEFAULT_FACTS_MAX_TOKENS)
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})), CallResult(text="ответ")
+    )
+    agent = build_agent(recorder, config, facts_prompt="извлеки", counter=_CharCounter())
+
+    agent.ask("вопрос", [], facts={"цель.основное": "MVP"}, facts_pinned=(), facts_upto=0)
+
+    extractor_call = recorder.calls[0]
+    assert "уплотняй формулировки" not in extractor_call[1]["content"]
+
+
+class _RefusesUnlessLastIsUser:
+    """Double reproducing MistralCounter's actual refusal (see tests/test_cli_agent.py).
+
+    A permissive double that counts any shape could not catch a facts-sizing
+    bug that measures the wrong fragment (e.g. the full pseudo-pair, which
+    ends in role=assistant and the real tokenizer refuses outright).
+    """
+
+    exact = True
+    name = "точный-двойник"
+
+    def count(self, messages):
+        if not messages or messages[-1]["role"] != "user":
+            return None
+        return sum(len(m["content"]) for m in messages) + 3
+
+    def calibrate(self, messages, prompt_tokens):
+        return None
+
+
+def test_facts_block_is_sized_in_a_shape_the_exact_tokenizer_accepts():
+    config = facts_config(facts_max_tokens=1)
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})), CallResult(text="ответ")
+    )
+    agent = build_agent(
+        recorder, config, facts_prompt="извлеки", counter=_RefusesUnlessLastIsUser()
+    )
+
+    agent.ask("вопрос", [], facts={"цель.основное": "MVP"}, facts_pinned=(), facts_upto=0)
+
+    extractor_call = recorder.calls[0]
+    assert "уплотняй формулировки" in extractor_call[1]["content"]
+
+
+def test_facts_extractor_pins_temperature_to_zero_regardless_of_session_temperature():
+    """Extraction has one right answer — sampling at a conversational
+    temperature is the likeliest cause of a degenerate loop that hit
+    FACTS_RESPONSE_TOKENS twice live (hypothesis: t=0 probes never looped,
+    2026-09-12), not something the session's own temperature should apply to.
+    """
+    recorder = _ConfigRecorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})), CallResult(text="ответ")
+    )
+    agent = build_agent(recorder, facts_config(temperature=1.2), facts_prompt="извлеки")
+
+    agent.ask("вопрос", [], facts={}, facts_pinned=(), facts_upto=0)
+
+    assert recorder.configs[0].params.temperature == 0
+    # The actual turn keeps the session's own temperature untouched.
+    assert recorder.configs[1].params.temperature == 1.2
+
+
+# --- P2: window hold-back when the extractor missed the cut (day 10 review) --
+
+
+def test_extractor_failure_holds_the_window_back_instead_of_dropping_the_uncovered_tail():
+    """Cutting to `tail` here would drop [upto_after:cut] for good — the exact
+    loss facts_upto exists to prevent (SPEC-w02d10.md §5.3). A small keep_last
+    makes the cut positive on the very first turn, unlike
+    test_facts_catchup_survives_repeated_extractor_failures (keep_last=6,
+    three turns), which never reaches this branch.
+    """
+
+    class _FailingExtractor(_Recorder):
+        def complete(self, config, messages, capabilities=None) -> CallResult:
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                raise AdventError("сеть отвалилась")
+            return super().complete(config, messages, capabilities)
+
+    recorder = _FailingExtractor(CallResult(text="ответ"))
+    agent = build_agent(recorder, facts_config(keep_last=2), facts_prompt="извлеки")
+
+    reply = agent.ask("вопрос", list(HISTORY_6), facts={}, facts_pinned=(), facts_upto=0)
+
+    assert reply.facts_update is None
+    assert reply.window_dropped == 0
+    assert reply.facts_upto == 0
+    # Nothing lost: the whole uncovered history is still in the returned history.
+    assert [m["content"] for m in reply.history] == [
+        "в1",
+        "о1",
+        "в2",
+        "о2",
+        "в3",
+        "о3",
+        "вопрос",
+        "ответ",
+    ]
+    main_request = recorder.calls[1]
+    assert [m["content"] for m in main_request] == ["в1", "о1", "в2", "о2", "в3", "о3", "вопрос"]
+    assert any("окно придержано" in text for text in agent.warnings)
+
+    # Reachable next turn: what ask() returned as `history` is exactly what
+    # the caller feeds back in — the content travels forward untouched.
+    next_reply = agent.ask(
+        "ещё", reply.history, facts=reply.facts, facts_pinned=(), facts_upto=reply.facts_upto
+    )
+    assert "в1" in [m["content"] for m in next_reply.history]
+
+
+# --- a paid facts call that produced nothing usable (day 10 review) ---------
+
+
+def test_truncated_facts_delta_lands_in_facts_failed_with_usage():
+    """finish_reason=length: OUR ceiling cut the delta, not the model."""
+    recorder = _Recorder(
+        CallResult(
+            text='{"set": [{"key": "цель.основное", "value": "MV',
+            finish_reason="length",
+            usage=Usage(100, 20, 120),
+        ),
+        CallResult(text="ответ"),
+    )
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    reply = agent.ask("вопрос", [], facts={}, facts_pinned=(), facts_upto=0)
+
+    assert reply.facts_update is None
+    assert reply.facts_failed is not None
+    assert reply.facts_failed.reason == "truncated"
+    assert reply.facts_failed.result.usage.prompt_tokens == 100
+    assert agent.pending_facts_failed is None
+
+
+def test_invalid_facts_delta_lands_in_facts_failed_with_usage():
+    """Not truncated, just not JSON at all — the model's own fault, distinctly."""
+    recorder = _Recorder(
+        CallResult(text="это не json вовсе", usage=Usage(50, 5, 55)),
+        CallResult(text="ответ"),
+    )
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    reply = agent.ask("вопрос", [], facts={}, facts_pinned=(), facts_upto=0)
+
+    assert reply.facts_update is None
+    assert reply.facts_failed is not None
+    assert reply.facts_failed.reason == "invalid"
+    assert reply.facts_failed.result.usage.prompt_tokens == 50
+    assert agent.pending_facts_failed is None
+
+
+def test_facts_call_error_does_not_populate_facts_failed():
+    """An errored HTTP call has no CallResult and isn't billed — stays as-is."""
+
+    class _FailingExtractor(_Recorder):
+        def complete(self, config, messages, capabilities=None) -> CallResult:
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                raise AdventError("сеть отвалилась")
+            return super().complete(config, messages, capabilities)
+
+    recorder = _FailingExtractor(CallResult(text="ответ"))
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+
+    reply = agent.ask(
+        "вопрос",
+        [{"role": "user", "content": "в1"}, {"role": "assistant", "content": "о1"}],
+        facts={},
+        facts_pinned=(),
+        facts_upto=0,
+    )
+
+    assert reply.facts_failed is None
+    assert agent.pending_facts_failed is None
+
+
+def test_a_paid_facts_failure_is_parked_when_the_turn_itself_fails():
+    """Mirrors test_a_paid_facts_update_is_parked_when_the_turn_itself_fails:
+    a paid-for failure must survive a subsequent AdventError, and be handed
+    over exactly once."""
+
+    class _FailingTurn(_Recorder):
+        def complete(self, config, messages, capabilities=None) -> CallResult:
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return CallResult(text="not json", model_requested="m", usage=Usage(10, 2, 12))
+            raise AdventError("сеть отвалилась")
+
+    agent = build_agent(_FailingTurn(), facts_config(), facts_prompt="извлеки")
+
+    with pytest.raises(AdventError):
+        agent.ask("вопрос", [], facts={}, facts_pinned=(), facts_upto=0)
+
+    pending = agent.take_pending_facts_failed()
+    assert pending is not None
+    assert pending.reason == "invalid"
+    assert pending.result.usage.prompt_tokens == 10
+    # Handed over exactly once: a second caller would bill the same call twice.
+    assert agent.take_pending_facts_failed() is None
+
+
+# --- /facts backfill: uncapped catch-up (day 10 review) ---------------------
+
+
+def test_catchup_max_none_sends_the_whole_segment_uncapped():
+    """Backfill (SPEC §5.6) has no message-count cap. No counter here, so
+    nothing can prove it "doesn't fit" — the whole segment goes through."""
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})), CallResult(text="ответ")
+    )
+    agent = build_agent(recorder, facts_config(), facts_prompt="извлеки")
+    long_history: list[dict] = []
+    for i in range(30):
+        long_history.append({"role": "user", "content": f"в{i}"})
+        long_history.append({"role": "assistant", "content": f"о{i}"})
+
+    _facts, _upto, update = agent._run_facts({}, (), long_history, "вопрос", 0, catchup_max=None)
+
+    assert update is not None
+    assert update.truncated is False
+    extractor_call = recorder.calls[0]
+    assert "в0" in extractor_call[1]["content"]
+    assert "в29" in extractor_call[1]["content"]
+    assert not any("покрыты последние" in text for text in agent.warnings)
+    assert not any("больше чем на" in text for text in agent.warnings)
+
+
+def test_catchup_max_none_falls_back_to_the_longest_fitting_tail_when_over_budget():
+    """Uncapped ≠ unlimited: a very long backfill can still blow the
+    extractor's own window, and the fallback warning must name both numbers
+    and never reuse the per-turn catch-up wording."""
+    recorder = _Recorder(
+        CallResult(text=json.dumps({"set": [], "delete": []})), CallResult(text="ответ")
+    )
+    agent = build_agent(
+        recorder,
+        facts_config(),
+        facts_prompt="извлеки",
+        counter=_CharCounter(),
+        context_limit=1200,
+    )
+    long_history: list[dict] = []
+    for _ in range(30):
+        long_history.append({"role": "user", "content": "x" * 20})
+        long_history.append({"role": "assistant", "content": "y" * 20})
+
+    _facts, _upto, update = agent._run_facts({}, (), long_history, "вопрос", 0, catchup_max=None)
+
+    assert update is not None
+    assert update.truncated is True
+    # budget = context_limit(1200) - FACTS_RESPONSE_TOKENS(900) = 300;
+    # segment = 60*20-char messages + "вопрос" (6 chars) = 61 messages/1206
+    # chars; the longest fitting suffix is 14 twenty-char messages + the
+    # trailing one = 15 messages at 286 chars.
+    assert any("последние 15 сообщений из 61" in text for text in agent.warnings)
+    per_turn_wording = f"больше чем на {FACTS_CATCHUP_MAX} сообщений"
+    assert not any(per_turn_wording in text for text in agent.warnings)

@@ -99,6 +99,11 @@ NON_CHAT_PARAMS = {
     "compact": "adventagent (неделя 02)",
     "keep_last": "adventagent (неделя 02)",
     "compact_every": "adventagent (неделя 02)",
+    # Context strategies (day 10, SPEC-w02d10.md §3, §12): they pick how the
+    # agent assembles a request — facts block, window, branch or summary.
+    # Week 01 assembles nothing of the sort, so the same rule as above.
+    "context_strategy": "adventagent (неделя 02)",
+    "facts_max_tokens": "adventagent (неделя 02)",
 }
 
 REPL_COMMANDS = [

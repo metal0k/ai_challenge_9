@@ -30,6 +30,14 @@ from advent_core.errors import AdventError
 # понедельные, — и направлена она в одну сторону: week_01 про advent_cli не
 # знает, цикла нет.
 from tools.compact_bench import SCENARIO as COMPACT_SCENARIO
+
+# Day 10's scenario is imported the same way, not retyped: strategy_bench's
+# own bench step measures this exact dialog, and a hand-kept second copy would
+# drift into a demo whose numbers belong to a different conversation (the
+# day-09 lesson stated in tools/strategy_bench.py's own module docstring).
+from tools.strategy_bench import HEAD_TURNS as STRATEGY_HEAD_TURNS
+from tools.strategy_bench import MIN_TURNS as STRATEGY_MIN_TURNS
+from tools.strategy_bench import SCENARIO as STRATEGY_SCENARIO
 from week_01 import strategies
 
 STEP_PAUSE = 2.0
@@ -66,6 +74,8 @@ MODULE_COMMANDS = {
     "tools.make_biginput": "python -m tools.make_biginput",
     # Day 09: the offline off/on comparison — a harness, not an agent command.
     "tools.compact_bench": "python -m tools.compact_bench",
+    # Day 10: the four-strategy comparison — same shape as compact_bench above.
+    "tools.strategy_bench": "python -m tools.strategy_bench",
 }
 
 
@@ -117,6 +127,8 @@ def demo_steps(week: int, day: int) -> list[Step]:
     которой не существует: проверка, чей failure path продолжается, хуже
     отсутствующей проверки, потому что читается как пройденная (CLAUDE.md).
     """
+    if week == 2 and day == 10:
+        return _demo_steps_w02d10()
     if week == 2 and day == 9:
         return _demo_steps_w02d09()
     if week == 2 and day == 8:
@@ -1167,6 +1179,139 @@ def _demo_steps_w02d09() -> list[Step]:
                 _DEMO_BENCH_COMPACT_EVERY,
             ],
             timeout=400,
+        ),
+    ]
+
+
+# Day 10's own session — same reasoning as demo/demo08/demo09 above: step 1
+# starts with /new, which is destructive, so it needs a file nobody else's
+# work lives in.
+_DEMO_SESSION_D10 = "demo10"
+
+# Narrow window for the facts step. Not a fresh guess: it's the same value
+# days 08-09 already confirmed narrow enough to force trim on this model's
+# short-answer turns (SPEC-w02d08.md §3, SPEC-w02d09.md §14) — reusing a
+# proven number is cheaper than re-deriving one that risks the day-09 trap
+# of a window so narrow (or so wide) that nothing in the step measures
+# anything at all.
+_DEMO_D10_LIMIT = "2500"
+
+# Same pause bump as day 09's dialog step and for the same reason: this
+# step's headline is a note printed after each turn plus the final /facts
+# block, and both get scrolled off inside ~0.4s under the shared STEP_PAUSE.
+_DEMO_D10_PAUSE = 4.0
+
+# Bench step thresholds (SPEC-w02d10.md §14 step 3). Confirmed against live
+# runs 2026-09-12, not reasoned about — day 09 got an empty result TWICE on
+# exactly this step by skipping that confirmation. At --limit 2000 the budget
+# safety-net cut `branch` ITSELF (2 turns, 6 messages, 416 tokens), so the
+# step's own lossless baseline stopped being lossless on camera. At 4000
+# nothing is trimmed (branch and window both 0/0/0) and the strategies still
+# separate plainly: window 2/6 details for 6624 tokens against branch 6/6 for
+# 5804 and facts 6/6 for 21491. --turns is pinned at the harness's own floor
+# (7 planted-detail turns + the final ask), the shortest run it accepts at
+# all. 4000 is also strategy_bench's DEFAULT_LIMIT, so the take and the day's
+# headline measurement share one window instead of explaining two numbers.
+_DEMO_D10_BENCH_TURNS = str(STRATEGY_MIN_TURNS)
+_DEMO_D10_BENCH_LIMIT = "4000"
+_DEMO_D10_BENCH_KEEP_LAST = "3"
+
+
+def _demo_steps_w02d10() -> list[Step]:
+    """Day 10 — стратегии контекста: facts живьём, ветвление, офлайн-сравнение.
+
+    Step 1 shows the day's second-payer call in the open: `context_strategy
+    facts` runs an extractor after every turn, and the console note it prints
+    (SPEC-w02d10.md §5.2, §11) is the whole point of the step, together with
+    the replayed budget detail (480 -> 520, turn 7 of STRATEGY_SCENARIO) —
+    `/facts` at the end must show 520 and no trace of 480. The turns played
+    are `STRATEGY_SCENARIO[:STRATEGY_HEAD_TURNS]`, the harness's own
+    "planted details, never pruned" head — importing it rather than retyping
+    the six lines means this take and `tools.strategy_bench`'s measured table
+    (step 3) are provably the same conversation.
+
+    Step 2 is the branching model from SPEC §2: one checkpoint, two branches
+    from it with a CONTRADICTING budget each, and a question in the branch
+    switched back into — its answer has to show that branch's own number,
+    proving facts do not leak across `/branch`. Exact command syntax (order
+    of `/branch <name>`, `--from`, `/switch <parent>` before branching a
+    second time) is checked against week_02/cli.py's `_cmd_branch`/
+    `_cmd_switch`, not invented: `/branch cheap` with no `--from` resolves the
+    lone existing checkpoint on its own, but `/branch rich --from mvp` is
+    still spelled out explicitly because that is what the spec's transcript
+    shows the viewer typing.
+
+    Step 2 gets the same `_DEMO_D10_PAUSE` override as step 1, and for the
+    same reason (day 09's own lesson): the step's headline moment is its
+    LAST line before `/exit` — "Напомни, какой у нас сейчас бюджет?", the
+    answer that proves branch isolation — and the shared STEP_PAUSE (2s)
+    leaves an answer that lands 2.3-4s after the question on screen for well
+    under a second before `/exit` runs. Left at the default, this step would
+    have shown a numeric table's worth of proof and cut the one line a viewer
+    actually has to read.
+
+    Step 3 is the "compare on four axes" table the task asks for, run
+    shortened for time — see the constants above for why the numbers are
+    provisional.
+    """
+    return [
+        Step(
+            title=(
+                "1. Facts живьём: узкое окно, экстрактор ведёт блок памяти, "
+                "переигранная деталь заменяется без следа старой"
+            ),
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION_D10],
+            stdin_lines=[
+                "/new",
+                f"/set context_limit {_DEMO_D10_LIMIT}",
+                "/set context_strategy facts",
+                *STRATEGY_SCENARIO[:STRATEGY_HEAD_TURNS],
+                "/facts",
+                "/tokens",
+                "/exit",
+            ],
+            timeout=300,
+            line_pause=_DEMO_D10_PAUSE,
+        ),
+        Step(
+            title=(
+                "2. Ветвление: checkpoint, две ветки с противоречащим бюджетом — "
+                "каждая помнит своё, ни одна не видит чужой факт"
+            ),
+            module="week_02.cli",
+            args=["--session", _DEMO_SESSION_D10],
+            stdin_lines=[
+                "/checkpoint mvp",
+                "/branch cheap",
+                "Уточнение: бюджет на самом деле не 520, а 300 тысяч рублей "
+                "— используй эту цифру дальше.",
+                "/switch demo10",
+                "/branch rich --from mvp",
+                "Уточнение: бюджет на самом деле не 520, а 900 тысяч рублей "
+                "— используй эту цифру дальше.",
+                "/branches",
+                "/switch demo10--cheap",
+                "Напомни, какой у нас сейчас бюджет?",
+                "/exit",
+            ],
+            line_pause=_DEMO_D10_PAUSE,
+        ),
+        Step(
+            title=(
+                "3. Bench: python -m tools.strategy_bench — четыре стратегии на "
+                "одном сценарии, укороченный прогон"
+            ),
+            module="tools.strategy_bench",
+            args=[
+                "--turns",
+                _DEMO_D10_BENCH_TURNS,
+                "--limit",
+                _DEMO_D10_BENCH_LIMIT,
+                "--keep-last",
+                _DEMO_D10_BENCH_KEEP_LAST,
+            ],
+            timeout=600,
         ),
     ]
 

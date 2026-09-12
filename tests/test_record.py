@@ -20,6 +20,7 @@ import pytest
 
 from advent_cli import record as record_mod
 from advent_core.errors import AdventError
+from tools import strategy_bench
 
 
 @contextmanager
@@ -233,9 +234,9 @@ def test_demo_steps_raises_on_an_unknown_week_and_day():
 
     Пары держим всегда за пределами реализованных сценариев: (2, 7) стоял
     здесь как «несуществующий», и день 7, получив свой сценарий, сломал тест —
-    сам по себе он ничего не проверял о дне 7. То же повторилось с (2, 9)
-    в день 09; заменено на (2, 10)."""
-    for week, day in ((2, 10), (3, 1), (1, 9)):
+    сам по себе он ничего не проверял о дне 7. То же повторилось с (2, 9) в
+    день 09 (заменено на (2, 10)) и с (2, 10) в день 10; заменено на (2, 11)."""
+    for week, day in ((2, 11), (3, 1), (1, 9)):
         with pytest.raises(AdventError):
             record_mod.demo_steps(week, day)
 
@@ -674,3 +675,187 @@ def test_run_step_keeps_the_shared_pause_when_a_step_asks_for_nothing(monkeypatc
     )
 
     assert record_mod.STEP_PAUSE in slept
+
+
+# --------------------------------------------------------------------------
+# Week 02, Day 10 (SPEC-w02d10.md §14): facts живьём, ветвление, bench.
+# --------------------------------------------------------------------------
+
+
+def test_day_10_is_registered_and_has_three_steps():
+    """`demo_steps(2, 10)` must resolve to the day-10 scenario, not fall through
+    to the "unknown pair" error the dispatcher raises for anything else."""
+    steps = record_mod.demo_steps(2, 10)
+
+    assert len(steps) == 3
+    assert all(step.args or step.note for step in steps), "день 10: шаг без действия и без текста"
+
+
+def test_day_10_scenario_uses_its_own_session_not_an_earlier_days():
+    """Each day gets its own file because step 1 starts with a destructive
+    `/new` — reusing demo/demo08/demo09 would wipe someone else's take."""
+    steps = record_mod.demo_steps(2, 10)
+    used_names = {record_mod._DEMO_SESSION_D10}
+    earlier = {
+        record_mod._DEMO_SESSION,
+        record_mod._DEMO_SESSION_OTHER,
+        record_mod._DEMO_SESSION_D08,
+        record_mod._DEMO_SESSION_D09,
+    }
+
+    assert record_mod._DEMO_SESSION_D10 not in earlier
+    for step in steps:
+        if "--session" in step.args:
+            name = step.args[step.args.index("--session") + 1]
+            assert name in used_names or name.startswith(f"{record_mod._DEMO_SESSION_D10}--")
+
+
+def test_day_10_step_1_imports_the_scenario_instead_of_retyping_it():
+    """A hand-kept second copy of the six planted-detail turns would drift
+    from what tools/strategy_bench.py actually measures in step 3 — the same
+    trap day 09's own docstring names for COMPACT_SCENARIO. Checked by
+    identity against the harness's own constants, not by re-typing the text
+    here and comparing strings (that would only prove the copy is accurate
+    TODAY, not that it can't drift tomorrow)."""
+    assert record_mod.STRATEGY_SCENARIO is strategy_bench.SCENARIO
+    assert record_mod.STRATEGY_HEAD_TURNS == strategy_bench.HEAD_TURNS
+
+    live = record_mod.demo_steps(2, 10)[0]
+    expected = list(strategy_bench.SCENARIO[: strategy_bench.HEAD_TURNS])
+    turns_in_step = [line for line in live.stdin_lines if not line.startswith("/")]
+    assert turns_in_step == expected
+
+
+def test_day_10_facts_step_replays_the_budget_and_ends_with_facts_and_tokens():
+    """SPEC §14 step 1: narrow window, `context_strategy facts`, and the block
+    shown via `/facts` after the replay (480 -> 520) — the day's headline."""
+    live = record_mod.demo_steps(2, 10)[0]
+
+    assert live.stdin_lines[0] == "/new"
+    assert f"/set context_limit {record_mod._DEMO_D10_LIMIT}" in live.stdin_lines
+    assert "/set context_strategy facts" in live.stdin_lines
+    assert "/facts" in live.stdin_lines
+    assert "/tokens" in live.stdin_lines
+    assert live.stdin_lines.index("/facts") < live.stdin_lines.index("/exit")
+
+
+def test_day_10_dialog_step_holds_the_screen_longer_than_the_shared_pause():
+    """Same reasoning as day 09's own dialog step: the per-turn facts note and
+    the final /facts block are the headline and get scrolled off within
+    STEP_PAUSE otherwise."""
+    live = record_mod.demo_steps(2, 10)[0]
+
+    assert live.line_pause is not None
+    assert live.line_pause > record_mod.STEP_PAUSE
+
+
+def test_day_10_branching_step_also_holds_the_screen_longer_than_the_shared_pause():
+    """C2: the branching step's OWN headline — the reply to "Напомни, какой у
+    нас сейчас бюджет?" that proves branch isolation — is its very last line
+    before `/exit`. At the shared STEP_PAUSE (2s) an answer landing 2.3-4s
+    after the question (day 09's own measurement) is on screen well under a
+    second before `/exit` fires. Same fix, same override, as step 1."""
+    branching = record_mod.demo_steps(2, 10)[1]
+
+    assert branching.line_pause is not None
+    assert branching.line_pause > record_mod.STEP_PAUSE
+    assert branching.line_pause == record_mod.demo_steps(2, 10)[0].line_pause
+
+
+def test_day_10_branching_steps_last_question_precedes_exit():
+    """The isolation-proving question has to actually be the last thing asked
+    before /exit — otherwise the extra line_pause would hold the WRONG line
+    on screen."""
+    branching = record_mod.demo_steps(2, 10)[1]
+    idx = branching.stdin_lines.index
+
+    assert idx("Напомни, какой у нас сейчас бюджет?") == idx("/exit") - 1
+
+
+def test_day_10_branching_step_uses_the_exact_command_syntax():
+    """Command spelling checked against week_02/cli.py's own handlers
+    (`_cmd_checkpoint`, `_cmd_branch`, `_cmd_switch`, `_cmd_branches`), not
+    invented — a plausible-looking but wrong flag would fail silently as a
+    warning line on camera instead of a test failure here."""
+    branching = record_mod.demo_steps(2, 10)[1]
+
+    assert "/checkpoint mvp" in branching.stdin_lines
+    assert "/branch cheap" in branching.stdin_lines
+    assert "/switch demo10" in branching.stdin_lines
+    assert "/branch rich --from mvp" in branching.stdin_lines
+    assert "/branches" in branching.stdin_lines
+    assert "/switch demo10--cheap" in branching.stdin_lines
+    # Order matters: mvp must exist before either branch is cut from it, and
+    # the switch back to the root must happen before branching a second time
+    # (`/branch rich --from mvp` from inside demo10--cheap would still work,
+    # but the transcript SPEC §14 describes switches back to root first).
+    idx = branching.stdin_lines.index
+    assert idx("/checkpoint mvp") < idx("/branch cheap") < idx("/switch demo10")
+    assert idx("/switch demo10") < idx("/branch rich --from mvp") < idx("/branches")
+    assert idx("/branches") < idx("/switch demo10--cheap")
+
+
+def test_day_10_branching_step_plants_a_contradicting_budget_per_branch():
+    """Each branch gets its OWN budget figure so the final question
+    ("what's our budget now?") can only be answered correctly if facts did
+    not leak from one branch into the other."""
+    branching = record_mod.demo_steps(2, 10)[1]
+    text = " ".join(branching.stdin_lines)
+
+    assert "300" in text
+    assert "900" in text
+    assert "какой у нас сейчас бюджет" in text.lower()
+
+
+def test_day_10_bench_step_args_are_a_literal_list():
+    """Literal, not the module's own constants — an expectation drawn from
+    the same source as the code under test cannot go red (CLAUDE.md)."""
+    bench = record_mod.demo_steps(2, 10)[2]
+
+    assert bench.module == "tools.strategy_bench"
+    assert bench.args == [
+        "--turns",
+        "8",
+        "--limit",
+        "4000",
+        "--keep-last",
+        "3",
+    ]
+
+
+def test_day_10_bench_step_turns_are_at_the_harness_floor():
+    """`--turns` below strategy_bench.MIN_TURNS is refused by the harness
+    itself (parser.error) — the shortened demo run has to sit AT the floor,
+    not guess a number that happens to clear it today."""
+    bench = record_mod.demo_steps(2, 10)[2]
+    turns_value = int(bench.args[bench.args.index("--turns") + 1])
+
+    assert turns_value == strategy_bench.MIN_TURNS
+
+
+def test_day_10_bench_step_gets_more_time_than_the_shared_limit():
+    """Four strategies over the shortened scenario plus the fork-isolation
+    section (default on) is well past STEP_TIMEOUT worth of calls."""
+    bench = record_mod.demo_steps(2, 10)[2]
+
+    assert bench.timeout is not None
+    assert bench.timeout > record_mod.STEP_TIMEOUT
+
+
+def test_day_10_scenario_names_facts_branching_and_bench_aloud():
+    """Same discipline as days 04-09: what the day claims has to be said out
+    loud in the titles, not left for the viewer to infer from output."""
+    titles = " ".join(step.title.lower() for step in record_mod.demo_steps(2, 10))
+
+    assert "facts" in titles
+    assert "ветв" in titles or "бюджет" in titles
+    assert "bench" in titles or "strategy_bench" in titles
+
+
+def test_day_10_scenario_has_no_step_without_an_action():
+    steps = record_mod.demo_steps(2, 10)
+    assert steps, "день 10 остался без сценария"
+    assert all(
+        step.args or step.note or step.stdin_file or step.module != record_mod.DEFAULT_MODULE
+        for step in steps
+    ), "день 10: шаг без действия и без текста"

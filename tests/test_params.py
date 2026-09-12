@@ -9,9 +9,11 @@ import pytest
 
 from advent_core.client import capabilities_of, chat_models, find_model
 from advent_core.params import (
+    AGENT_COMMAND,
     AGENT_PARAMS,
     BENCH_COMMAND,
     CHAT_COMMAND,
+    CONTEXT_STRATEGY_CHOICES,
     SOLVE_COMMAND,
     SPECS,
     STRATEGIES,
@@ -466,3 +468,70 @@ def test_compaction_bounds_are_enforced(bad):
     exchange, and compact_every=1 would compact after every single turn."""
     with pytest.raises(ParamError):
         GenerationParams.build(**bad)
+
+
+# --- context_strategy / facts_max_tokens: Day 10 params ---------------------
+
+
+def test_context_strategy_choices_are_the_four_assemblies():
+    assert CONTEXT_STRATEGY_CHOICES == ("window", "facts", "branch", "summary")
+
+
+def test_context_strategy_default_for_agent_is_summary():
+    """Day 09 must keep behaving as before for a caller that never sets this."""
+    assert defaults_for(AGENT_COMMAND)["context_strategy"] == "summary"
+
+
+def test_context_strategy_has_no_default_outside_the_agent_command():
+    assert defaults_for(CHAT_COMMAND).get("context_strategy") is None
+
+
+def test_context_strategy_parses_a_known_choice():
+    params = GenerationParams.build(context_strategy="window")
+    assert params.context_strategy == "window"
+
+
+def test_unknown_context_strategy_is_rejected():
+    with pytest.raises(ParamError):
+        GenerationParams.build(context_strategy="rag")
+
+
+def test_context_strategy_is_local_and_never_reaches_payload():
+    params = GenerationParams.build(context_strategy="facts", temperature=0.5)
+    payload, skipped = params.as_payload(REASONING)
+    assert payload == {"temperature": 0.5}
+    assert skipped == []
+
+
+def test_context_strategy_is_among_agent_params():
+    """Without a name here, /set context_strategy would be rejected in the
+    agent's REPL as "not read by the agent"."""
+    assert "context_strategy" in AGENT_PARAMS
+
+
+def test_facts_max_tokens_default_for_agent_is_400():
+    assert defaults_for(AGENT_COMMAND)["facts_max_tokens"] == 400
+
+
+def test_facts_max_tokens_parses_into_int():
+    params = GenerationParams.build(facts_max_tokens="250")
+    assert params.facts_max_tokens == 250
+
+
+@pytest.mark.parametrize("bad", [0, 99, -5])
+def test_facts_max_tokens_below_the_minimum_is_rejected(bad):
+    """A facts block extractor call needs room to answer at all — under
+    100 tokens the schema-shaped reply itself wouldn't fit."""
+    with pytest.raises(ParamError):
+        GenerationParams.build(facts_max_tokens=bad)
+
+
+def test_facts_max_tokens_is_local_and_never_reaches_payload():
+    params = GenerationParams.build(facts_max_tokens=500, temperature=0.5)
+    payload, skipped = params.as_payload(REASONING)
+    assert payload == {"temperature": 0.5}
+    assert skipped == []
+
+
+def test_facts_max_tokens_is_among_agent_params():
+    assert "facts_max_tokens" in AGENT_PARAMS

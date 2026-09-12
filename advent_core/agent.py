@@ -20,13 +20,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import json
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 from advent_core import chat as chat_core
 from advent_core import formats
 from advent_core.chat import Message
 from advent_core.compact import (
+    ROLE_LABELS,
     fold_summary,
     should_compact,
     split_history,
@@ -34,6 +37,7 @@ from advent_core.compact import (
 )
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError
+from advent_core.facts import DeltaResult, apply_delta, facts_messages, format_facts
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCounter, reconcile
 
@@ -67,6 +71,36 @@ DEFAULT_COMPACT_EVERY = 10
 # model write longer — a summary that grows to the size of the original
 # history defeats the point of compacting.
 SUMMARY_MAX_TOKENS = 600
+
+# Context strategy (day 10, SPEC-w02d10.md §3). Default matches the registry's
+# own AGENT_COMMAND default: this constant is what a caller gets when NEITHER
+# context_strategy NOR the compact alias were ever set (most unit tests, and
+# any config built without apply_defaults()) — day 09's own behavior.
+DEFAULT_CONTEXT_STRATEGY = "summary"
+
+# Facts (day 10, SPEC-w02d10.md §5). Fallback when facts_max_tokens is unset,
+# mirrors Spec.defaults[AGENT_COMMAND] — see
+# test_thresholds_unset_fall_back_to_the_same_numbers_the_registry_hands_out.
+DEFAULT_FACTS_MAX_TOKENS = 400
+
+# The extractor's own response ceiling — NOT the block cap above; the block is
+# what we STORE, the delta is what the model WRITES to change it. Measured
+# worst case (2026-09-12, ministral-14b-latest, t=0): a full FACTS_CATCHUP_MAX
+# (20 messages, verbose answers) delta costs 376 completion tokens — 900 is
+# ~2.4x headroom, so hitting it means the model looped, not a legitimately
+# large delta.
+FACTS_RESPONSE_TOKENS = 900
+
+# Catch-up bound (SPEC-w02d10.md §5.3): past this many not-yet-extracted
+# messages, the extractor sees only the tail and the truncation is spoken
+# aloud — a silent cut here is exactly the loss this cursor exists to prevent.
+FACTS_CATCHUP_MAX = 20
+
+# Fixed schema for the facts delta — lives in advent_core, not injected by the
+# caller: unlike summary_prompt/dialog_preset (per-week prose), this is a
+# structural contract the extractor call always uses, day 10's PROBE picked
+# the pairs-array shape specifically for this file (PROBE-w02d10-facts.md).
+FACTS_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "facts_delta.json"
 
 # Пометка об обрыве, дописываемая к сохранённой части ответа. Приём взят у
 # gptme (INTERRUPT_CONTENT): следующий ход модели должен видеть, что её
@@ -117,6 +151,36 @@ class Compaction:
 
 
 @dataclass(slots=True, frozen=True)
+class FactsUpdate:
+    """One extractor call's outcome. Mirrors Compaction (SPEC-w02d10.md §5.2-5.3).
+
+    A second paid call per turn must be visible as one, not folded into a bare
+    "facts changed" boolean: `result` carries its own usage for the journal
+    and `/tokens`, `delta` carries added/updated/removed/blocked/rejected for
+    the per-turn note, `covered` is how many not-yet-extracted messages (not
+    counting the new user turn) this call swept up.
+
+    `truncated` — the catch-up window exceeded FACTS_CATCHUP_MAX and only the
+    tail was sent: some exchange in the middle was never seen by the
+    extractor, and the caller must say so, not just show the note.
+    """
+
+    facts: dict[str, str]
+    delta: DeltaResult
+    covered: int
+    result: CallResult
+    truncated: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class FactsFailure:
+    """A paid extractor call that produced nothing usable — must still be billed."""
+
+    result: CallResult
+    reason: str  # "truncated" (hit FACTS_RESPONSE_TOKENS) or "invalid" (bad JSON/schema)
+
+
+@dataclass(slots=True, frozen=True)
 class AgentReply:
     """Результат одного хода агента.
 
@@ -153,6 +217,27 @@ class AgentReply:
     summary: str | None = None
     # Set only when compaction happened on this exact turn.
     compaction: Compaction | None = None
+
+    # Facts in effect AFTER this turn (day 10): the dict to persist as
+    # session.state["facts"], regardless of strategy — echoed back unchanged
+    # when the strategy isn't "facts", same reasoning as `summary` above.
+    facts: dict[str, str] | None = None
+    # Cursor to persist as session.state["facts_upto"] — how much of the
+    # history handed to the NEXT ask() call (this reply's own `history`) is
+    # already reflected in `facts`. Meaningless outside strategy="facts", but
+    # always returned so the caller has one consistent field to carry forward.
+    facts_upto: int = 0
+    # Set only when the extractor call happened on this exact turn.
+    facts_update: FactsUpdate | None = None
+    # Set only when the extractor call happened AND produced nothing usable —
+    # a paid call that must still show up in the token table (§9).
+    facts_failed: FactsFailure | None = None
+    # How many messages the "window"/"facts" strategy cut from its own tail
+    # this turn — the note material for "окно: выпало N сообщений" (SPEC §4).
+    # Distinct from `dropped`/`dropped_tokens`: those are the budget-trim
+    # safety net underneath ALL FOUR strategies, this is the strategy's own,
+    # deliberate forgetting.
+    window_dropped: int = 0
 
 
 def marker_instruction(kind: str, needle: str) -> str:
@@ -262,6 +347,7 @@ class Agent:
         persona: str | None = None,
         dialog_preset: str | None = None,
         summary_prompt: str | None = None,
+        facts_prompt: str | None = None,
         on_warning: Callable[[str], None] | None = None,
     ) -> None:
         self.config = config
@@ -290,10 +376,21 @@ class Agent:
         # and the rule "a day that measures quality must drop the persona"
         # was already paid for in week 01 (CLAUDE.md).
         self.summary_prompt = summary_prompt
+        # System prompt for the facts extractor (advent_core/prompts/facts.md,
+        # read by the caller — core doesn't read week-specific files, and
+        # unlike FACTS_SCHEMA_PATH this prose could plausibly change per
+        # deployment). None — strategy="facts" degrades to a plain window
+        # with a warning, same shape as summary_prompt above.
+        self.facts_prompt = facts_prompt
         # A compaction that has been paid for but whose turn hasn't finished
         # yet. ask() parks it here so a failing model call can't take it down
         # with it — see the comment at the assignment.
         self.pending_compaction: Compaction | None = None
+        # Same idea, for the facts extractor call (SPEC-w02d10.md §5.3).
+        self.pending_facts: FactsUpdate | None = None
+        # A paid extractor call that produced nothing usable — same parking
+        # reasoning, so it still gets billed even if the turn then fails.
+        self.pending_facts_failed: FactsFailure | None = None
         self._on_warning = on_warning
         # Одинаковые предупреждения не повторяются каждый ход: в разговоре на
         # двадцать реплик «лимит окна неизвестен» двадцать раз — это шум, в
@@ -484,6 +581,22 @@ class Agent:
         tokens = self.counter.count(messages) if self.counter is not None else None
         return _Trimmed(trimmed_chars, dropped_chars, tokens)
 
+    # --- context strategy (day 10) -----------------------------------------
+
+    @property
+    def context_strategy(self) -> str:
+        """Effective strategy for request assembly this turn. Defaults to summary.
+
+        Reads only `context_strategy` — the `compact` alias (SPEC-w02d10.md
+        §3) is a `/set compact off|on` translation the CLI performs by
+        writing an explicit `context_strategy` into params; this property
+        must not re-derive it, or a bare `compact=False` (day 09's own
+        "compaction disabled" spelling, still used by every day-06..09 test)
+        would silently reroute into "window" and cut history nobody asked
+        to cut.
+        """
+        return self.config.params.context_strategy or DEFAULT_CONTEXT_STRATEGY
+
     # --- history compaction --------------------------------------------------
 
     def compact_enabled(self) -> bool:
@@ -492,8 +605,12 @@ class Agent:
         The summarizer prompt comes from outside (a file under
         advent_core/prompts, read by the CLI). Without it compaction can't
         run, and pretending it does is worse: the user would see "compact on"
-        while plain trimming runs underneath.
+        while plain trimming runs underneath. Also off outright when an
+        explicit non-summary strategy is in effect — `compact` staying at its
+        old default must not fire the summarizer under "window"/"facts"/"branch".
         """
+        if self.context_strategy != "summary":
+            return False
         if not self.config.params.compact:
             return False
         if not self.summary_prompt:
@@ -516,6 +633,12 @@ class Agent:
         """Scheduled-compaction threshold, in messages. None — default."""
         value = self.config.params.compact_every
         return DEFAULT_COMPACT_EVERY if value is None else value
+
+    @property
+    def facts_max_tokens(self) -> int:
+        """Soft cap on the facts block, in tokens. None — default."""
+        value = self.config.params.facts_max_tokens
+        return DEFAULT_FACTS_MAX_TOKENS if value is None else value
 
     def _count_request(
         self,
@@ -624,11 +747,20 @@ class Agent:
         without it — doesn't affect the comparison, it's the same on both sides.
         """
         if not self.compact_enabled():
-            # Two different reasons, two different remedies. compact_enabled()
-            # also returns False when compaction is ON but the summarizer
-            # prompt failed to load — telling that user to `/set compact on`
-            # sends them to re-toggle a setting that is already on.
-            if not self.config.params.compact:
+            # Three different reasons, three different remedies.
+            # compact_enabled() returns False when: an EXPLICIT
+            # context_strategy overrides summary (checked first — it wins
+            # over the compact alias per SPEC §3, so naming the alias's
+            # remedy here would be wrong); compact is off; or the summarizer
+            # prompt failed to load (`/set compact on` re-toggles a setting
+            # that is already on and fixes nothing).
+            explicit_strategy = self.config.params.context_strategy
+            if explicit_strategy is not None and explicit_strategy != "summary":
+                self._warn(
+                    f"context_strategy={explicit_strategy} — сжатие решает только "
+                    "summary, переключись на него: /set context_strategy summary"
+                )
+            elif not self.config.params.compact:
                 self._warn("сжатие выключено — /set compact on включит его")
             else:
                 self._warn("сжимать нечем: промпт суммаризатора не загрузился")
@@ -644,6 +776,218 @@ class Agent:
         before = self._count_request(summary, history, system, user_input)
         return self._compact(summary, older, tail, before, system, user_input)
 
+    # --- sticky facts (day 10) ----------------------------------------------
+
+    def _probe_tokens(self, messages: Sequence[Message]) -> int | None:
+        """Marginal cost of a message list. None — nothing to count with.
+
+        Probe technique (CLAUDE.md, days 08-09): a bare `count(messages)`
+        would include request-level overhead (chat-template framing) as if it
+        were part of the content's own weight, and the exact tokenizer refuses
+        a list that doesn't end in role=user. Appending an empty user message
+        and subtracting its own cost fixes both: `count([*messages,
+        empty]) - count([empty])` leaves only the content's own weight.
+        """
+        if self.counter is None:
+            return None
+        empty = [{"role": "user", "content": ""}]
+        with_content = self.counter.count([*messages, *empty])
+        overhead = self.counter.count(empty)
+        if with_content is None or overhead is None:
+            return None
+        return max(0, with_content - overhead)
+
+    def _facts_block_tokens(self, facts: dict[str, str], pinned: Iterable[str]) -> int | None:
+        """Size of the current facts block. None — nothing to count with."""
+        block = format_facts(facts, pinned)
+        if not block:
+            return 0
+        return self._probe_tokens([{"role": "user", "content": block}])
+
+    def _facts_budget(self) -> int | None:
+        """Token budget for the extractor's OWN request. None — window unknown.
+
+        Mirrors `_token_budget()` but reserves FACTS_RESPONSE_TOKENS, the
+        extractor's own response ceiling, not the main turn's.
+        """
+        if not self.context_limit:
+            return None
+        return max(self.context_limit - FACTS_RESPONSE_TOKENS, 0)
+
+    def _fit_catchup_segment(self, segment: list[Message]) -> tuple[list[Message], bool]:
+        """Longest tail of an uncapped backfill segment that fits the extractor's
+        own budget (SPEC-w02d10.md §5.6) — message-count caps stop mattering
+        once the model's own window does. None counter/window — nothing to
+        compare against, so the whole segment goes through untouched.
+        """
+        budget = self._facts_budget()
+        if budget is None:
+            return segment, False
+        size = self._probe_tokens(segment)
+        if size is None or size <= budget:
+            return segment, False
+        trimmed = list(segment)
+        while len(trimmed) > 1:
+            del trimmed[0]
+            size = self._probe_tokens(trimmed)
+            if size is not None and size <= budget:
+                break
+        return trimmed, True
+
+    def _facts_call(
+        self, facts: dict[str, str], pinned: Iterable[str], segment: Sequence[Message]
+    ) -> CallResult | None:
+        """The extractor request itself — mirrors _summarize().
+
+        A call error does NOT kill the turn: warn, and the caller keeps the
+        old facts. Config is a COPY (`replace`), same reasoning as the
+        summarizer: format=json would force an object of the wrong shape,
+        stop would cut the delta mid-word, and the user's max_tokens isn't
+        this call's budget.
+        """
+        size = self._facts_block_tokens(facts, pinned)
+        squeeze = size is not None and size > self.facts_max_tokens
+        block = format_facts(facts, pinned) or "(пока пусто)"
+        parts = [f"Текущие facts:\n{block}", "Новый обмен:"]
+        for message in segment:
+            label = ROLE_LABELS.get(message["role"], message["role"])
+            parts.append(f"{label}: {message['content']}")
+        if squeeze:
+            # SPEC-w02d10.md §5.5: code never deletes a fact to make room —
+            # only the extractor (by rewording) or a human (/fact del) does.
+            parts.append(
+                f"Блок facts больше {self.facts_max_tokens} токенов — "
+                "уплотняй формулировки в новых значениях."
+            )
+        messages: list[Message] = [
+            {"role": "system", "content": self.facts_prompt or ""},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ]
+        params = replace(
+            self.config.params,
+            max_tokens=FACTS_RESPONSE_TOKENS,
+            format="schema",
+            schema_file=str(FACTS_SCHEMA_PATH),
+            stop=None,
+            # Extraction has one right answer; sampling at the session's own
+            # temperature is the likeliest cause of the degenerate loop that
+            # hit FACTS_RESPONSE_TOKENS twice on a live run — a hypothesis
+            # (t=0 probes, 2026-09-12, never looped), not a proven cause.
+            temperature=0,
+        )
+        try:
+            return self._complete(replace(self.config, params=params), messages, self.capabilities)
+        except AdventError as error:
+            self._warn(f"извлечение фактов не удалось ({error.message}) — факты прежние")
+            return None
+
+    def _run_facts(
+        self,
+        facts: dict[str, str],
+        pinned: Iterable[str],
+        history: Sequence[Message],
+        user_input: str,
+        facts_upto: int,
+        *,
+        catchup_max: int | None = FACTS_CATCHUP_MAX,
+    ) -> tuple[dict[str, str], int, FactsUpdate | None]:
+        """Extractor side call: covers every exchange since `facts_upto`.
+
+        Both `facts` and `facts_upto` are returned UNCHANGED on any failure
+        (no prompt, call error, unparsable/malformed delta) — SPEC-w02d10.md
+        §5.3: advancing the cursor over a turn that was never actually seen
+        would let that exchange fall out of the window later, silently and
+        for good. The returned cursor is in the coordinate space of `history`
+        PLUS one virtual trailing message for `user_input` — the caller
+        (ask()) remaps it into the next turn's coordinate space once it knows
+        how much of `history` the strategy's own window cut drops.
+
+        `catchup_max=None` is the backfill case (CLI's `/facts backfill`,
+        SPEC §5.6): no message-count cap — the WHOLE session is in scope, not
+        just the per-turn catch-up window.
+        """
+        upto = max(0, min(facts_upto, len(history)))
+        if not self.facts_prompt:
+            self._warn(
+                "стратегия facts включена, но промпт экстрактора не задан — "
+                "блок facts не обновляется",
+                once=True,
+            )
+            return facts, upto, None
+
+        segment: list[Message] = [*history[upto:], {"role": "user", "content": user_input}]
+        truncated = False
+        if catchup_max is not None and len(segment) > catchup_max:
+            segment = segment[-catchup_max:]
+            truncated = True
+            self._warn(
+                f"извлечение фактов отстало больше чем на {catchup_max} сообщений — "
+                "берётся только хвост, часть обмена в facts не попадёт"
+            )
+        elif catchup_max is None:
+            # Uncapped ≠ unlimited: a long session could still blow the
+            # extractor's own window. Size it and fall back to the longest
+            # fitting tail rather than inventing a message-count limit.
+            fitted, budget_truncated = self._fit_catchup_segment(segment)
+            if budget_truncated:
+                truncated = True
+                self._warn(
+                    f"бюджет экстрактора не тянет весь бэкафилл — покрыты последние "
+                    f"{len(fitted)} сообщений из {len(segment)}"
+                )
+                segment = fitted
+
+        result = self._facts_call(facts, pinned, segment)
+        if result is None:
+            return facts, upto, None
+
+        try:
+            raw = json.loads(result.text or "")
+            if not isinstance(raw, dict):
+                raise ValueError("верхний уровень не объект")
+            outcome = apply_delta(facts, pinned, raw)
+        except (ValueError, TypeError) as error:
+            # Truncation is OUR ceiling, not the model misbehaving. Saying
+            # "вернул невалидную дельту" there blames the wrong party and sends
+            # the reader looking at the prompt instead of at max_tokens.
+            # complete() never sets `truncated` — that flag belongs to the
+            # stream path (an interrupted answer already on screen). A
+            # non-stream call says it hit the ceiling through finish_reason.
+            if result.finish_reason == "length" or result.truncated:
+                self._warn(
+                    f"ответ экстрактора обрезан лимитом в {FACTS_RESPONSE_TOKENS} токенов — "
+                    "факты прежние, обмен догонится на следующем ходу"
+                )
+                reason = "truncated"
+            else:
+                self._warn(f"извлечение фактов вернуло невалидную дельту ({error}) — факты прежние")
+                reason = "invalid"
+            # Paid call, nothing usable — must still be billed (SPEC §9), so
+            # it's parked exactly like pending_facts is on the success path.
+            self.pending_facts_failed = FactsFailure(result=result, reason=reason)
+            return facts, upto, None
+
+        update = FactsUpdate(
+            facts=outcome.facts,
+            delta=outcome,
+            covered=len(history) - upto,
+            result=result,
+            truncated=truncated,
+        )
+        return outcome.facts, len(history) + 1, update
+
+    def take_pending_facts(self) -> FactsUpdate | None:
+        """A paid facts update whose turn then failed. Hands it over exactly once."""
+        pending = self.pending_facts
+        self.pending_facts = None
+        return pending
+
+    def take_pending_facts_failed(self) -> FactsFailure | None:
+        """A paid facts failure whose turn then failed. Hands it over exactly once."""
+        pending = self.pending_facts_failed
+        self.pending_facts_failed = None
+        return pending
+
     # --- сам ход -----------------------------------------------------------
 
     def ask(
@@ -652,6 +996,9 @@ class Agent:
         history: list[Message],
         *,
         summary: str | None = None,
+        facts: dict[str, str] | None = None,
+        facts_pinned: Iterable[str] = (),
+        facts_upto: int = 0,
         on_chunk: Callable[[str], None] | None = None,
     ) -> AgentReply:
         """Один ход: собрать, обрезать, спросить, разобрать.
@@ -659,37 +1006,103 @@ class Agent:
         `history` не мутируется — возвращается новый список (см. AgentReply).
         Ошибки вызова не глотаются: AdventError уходит наверх, где CLI
         печатает её и продолжает сессию, как REPL недели 01.
+
+        Which of the four assemblies runs is `self.context_strategy` (SPEC-
+        w02d10.md §3 table): "summary" keeps day 09's own compaction logic
+        untouched; "window"/"facts" cut `history` to `keep_last` themselves
+        and differ only in what goes in `head`; "branch" sends `history`
+        whole. The per-request budget trim (`_trim`) runs underneath ALL
+        FOUR — it's the 400-error safety net, not a strategy.
         """
         self._warn(self.check_done(), once=True)
 
         system = self.system_prompt()
+        strategy = self.context_strategy
         summary_now = summary
         compaction: Compaction | None = None
+        facts_now = dict(facts) if facts else {}
+        facts_update: FactsUpdate | None = None
+        facts_upto_now = facts_upto
+        window_dropped = 0
         working: list[Message] = list(history)
+        head: list[Message] = []
 
-        if self.compact_enabled():
+        if strategy == "summary":
+            if self.compact_enabled():
+                older, tail = split_history(working, self.keep_last)
+                before = self._count_request(summary_now, working, system, user_input)
+                budget = self._token_budget()
+                # Either side can be unknown (no counter, no window) — then the
+                # budget trigger simply doesn't fire, and the scheduled
+                # message-count trigger still works. A made-up "doesn't fit"
+                # would be worse than none at all.
+                over_budget = before is not None and budget is not None and before > budget
+                if should_compact(older, over_budget=over_budget, compact_every=self.compact_every):
+                    compaction = self._compact(summary_now, older, tail, before, system, user_input)
+                    if compaction is not None:
+                        summary_now = compaction.summary
+                        working = list(compaction.tail)
+                        # The summarizer call is already made and already paid
+                        # for. If the turn's own call below raises, ask() never
+                        # returns and this Compaction would vanish with it: no
+                        # journal row, no line in /tokens, and — since the
+                        # history it was built from is unchanged — a second
+                        # summarizer call on the next attempt. Park it where
+                        # the caller can still collect it.
+                        self.pending_compaction = compaction
+            head = summary_messages(summary_now)
+
+        elif strategy == "window":
             older, tail = split_history(working, self.keep_last)
-            before = self._count_request(summary_now, working, system, user_input)
-            budget = self._token_budget()
-            # Either side can be unknown (no counter, no window) — then the
-            # budget trigger simply doesn't fire, and the scheduled
-            # message-count trigger still works. A made-up "doesn't fit"
-            # would be worse than none at all.
-            over_budget = before is not None and budget is not None and before > budget
-            if should_compact(older, over_budget=over_budget, compact_every=self.compact_every):
-                compaction = self._compact(summary_now, older, tail, before, system, user_input)
-                if compaction is not None:
-                    summary_now = compaction.summary
-                    working = list(compaction.tail)
-                    # The summarizer call is already made and already paid for.
-                    # If the turn's own call below raises, ask() never returns
-                    # and this Compaction would vanish with it: no journal row,
-                    # no line in /tokens, and — since the history it was built
-                    # from is unchanged — a second summarizer call on the next
-                    # attempt. Park it where the caller can still collect it.
-                    self.pending_compaction = compaction
+            working = tail
+            window_dropped = len(older)
 
-        head = summary_messages(summary_now)
+        elif strategy == "facts":
+            older, tail = split_history(working, self.keep_last)
+            cut = len(older)
+            facts_now, upto_after, facts_update = self._run_facts(
+                facts_now, facts_pinned, working, user_input, facts_upto_now
+            )
+            if facts_update is not None:
+                # Same reasoning as pending_compaction: the extractor call is
+                # already paid for, and must survive the main call below
+                # raising — see take_pending_facts().
+                self.pending_facts = facts_update
+            if self.facts_prompt and facts_update is None and cut > upto_after:
+                # The extractor did NOT cover [upto_after:cut] this turn —
+                # cutting to `tail` would drop it for good, exactly the loss
+                # facts_upto exists to prevent (SPEC-w02d10.md §5.3). Hold the
+                # window back to the uncovered boundary instead: a superset of
+                # `tail`, so this turn costs more tokens (the budget trim
+                # below still runs underneath and caps the request) — never
+                # loses history.
+                # Gated on a prompt existing: without one the extractor never
+                # runs at all, so holding would not mean "wait for the next
+                # attempt" — it would silently turn `facts` into a strategy
+                # with no window, paying for the whole history every turn for
+                # good. A permanent misconfiguration is not a transient
+                # failure: there this degrades to plain `window`, and the
+                # once-only warning above is what says so.
+                working = working[upto_after:]
+                window_dropped = upto_after
+                facts_upto_now = 0
+                self._warn(
+                    "окно придержано: экстрактор ещё не отразил часть истории — "
+                    "запрос обойдётся дороже токенами, но ничего не потеряно"
+                )
+            else:
+                working = tail
+                window_dropped = cut
+                # `upto_after` is in the coordinate space of `working` BEFORE
+                # this cut; remap into `tail`'s own space (what the caller
+                # will pass back in as `history` next turn) by subtracting
+                # what the cut drops.
+                facts_upto_now = max(0, upto_after - cut)
+            head = facts_messages(facts_now, facts_pinned)
+
+        # "branch": working stays the full history, head stays empty — the
+        # budget trim below is its only limiter (SPEC §3, §7.3).
+
         trimmed = self._trim(working, system, user_input, head=head)
         messages = chat_core.build_messages(
             user_input, system=system, history=[*head, *trimmed.history]
@@ -700,9 +1113,11 @@ class Agent:
         else:
             result = self._complete(self.config, messages, self.capabilities)
 
-        # The turn survived: the compaction now travels in the reply, so the
-        # parked copy is nobody's responsibility any more.
+        # The turn survived: the compaction/facts update now travel in the
+        # reply, so the parked copies are nobody's responsibility any more.
         self.pending_compaction = None
+        self.pending_facts = None
+        facts_failed = self.take_pending_facts_failed()
 
         # Сверять надо с тем, что РЕАЛЬНО ушло в API: слой формата дописывает
         # инструкцию к system внутри chat._payload(), и сверка «до слоя» дала
@@ -737,6 +1152,11 @@ class Agent:
             dropped_tokens=trimmed.dropped_tokens,
             summary=summary_now,
             compaction=compaction,
+            facts=facts_now,
+            facts_upto=facts_upto_now,
+            facts_update=facts_update,
+            facts_failed=facts_failed,
+            window_dropped=window_dropped,
         )
 
     def _detect_done(self, text: str) -> bool:
@@ -759,8 +1179,12 @@ class Agent:
 # неделей 03, которая продолжит того же агента.
 __all__ = [
     "DEFAULT_COMPACT_EVERY",
+    "DEFAULT_CONTEXT_STRATEGY",
+    "DEFAULT_FACTS_MAX_TOKENS",
     "DEFAULT_KEEP_LAST",
     "DEFAULT_MAX_TURNS",
+    "FACTS_CATCHUP_MAX",
+    "FACTS_SCHEMA_PATH",
     "INTERRUPT_NOTE",
     "RESPONSE_RESERVE_TOKENS",
     "SUMMARY_MAX_TOKENS",
@@ -768,6 +1192,8 @@ __all__ = [
     "AgentReply",
     "Compaction",
     "CompleteFn",
+    "FactsFailure",
+    "FactsUpdate",
     "StreamFn",
     "done_conflicts_with_stop",
     "marker_instruction",

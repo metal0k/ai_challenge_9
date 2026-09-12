@@ -16,9 +16,11 @@ SQLite именно из-за порчи сессий (issue #3200, зависа
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -35,7 +37,16 @@ DEFAULT_SESSION = "default"
 # есть. \w покрывает и кириллицу (флага re.ASCII нет намеренно: `/session
 # рецепты` на видео читается), и при этом не пропускает ни "/", ни "\", ни
 # "..", ни двоеточие диска — то есть ни одной формы выхода из каталога сессий.
+# "--" passes it too (two ASCII hyphens are just two of the allowed chars) —
+# SPEC-w02d10.md §7.2 leans on exactly that instead of bumping _NAME_RE.
 _NAME_RE = re.compile(r"^[\w-]{1,64}$")
+
+# Branch/checkpoint naming (SPEC-w02d10.md §7). A branch file is
+# "<parent>--<name>", a checkpoint is "<parent>--cp-<name>" — the prefix is
+# what a name-only parser (build_tree below) tells them apart by, with no
+# file read needed.
+BRANCH_SEP = "--"
+CHECKPOINT_PREFIX = "cp-"
 
 ROLE_USER = "user"
 ROLE_ASSISTANT = "assistant"
@@ -45,7 +56,7 @@ ROLE_ASSISTANT = "assistant"
 # `/new` on purpose (SPEC-w02d09.md §8). The list lives here, next to clear(),
 # because "setting or content" is a fact about storage, not about the
 # interface — a second list in the CLI would drift on the first new key.
-CONTENT_STATE_KEYS = ("summary", "summary_upto")
+CONTENT_STATE_KEYS = ("summary", "summary_upto", "facts", "facts_pinned", "facts_upto")
 
 
 def _now() -> str:
@@ -67,6 +78,119 @@ def validate_name(name: str) -> str:
             "подчёркивание, до 64 символов (имя становится именем файла)"
         )
     return cleaned
+
+
+def _validate_segment(name: str, *, kind: str) -> str:
+    """A branch/checkpoint's OWN segment, before it is joined onto a parent.
+
+    Separate from validate_name(): the combined "<parent>--<segment>" is
+    checked there (length, charset), but "must not start with cp-" and "must
+    not itself contain --" are rules about the segment alone, and only make
+    sense before joining — after joining, both fold indistinguishably into
+    the combined string.
+    """
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise ConfigError(f"имя {kind} не может быть пустым")
+    if BRANCH_SEP in cleaned:
+        raise ConfigError(
+            f"имя {kind} {name!r} не может содержать {BRANCH_SEP!r} — это "
+            "разделитель дерева сессий, а не обычный дефис"
+        )
+    if kind == "ветки" and cleaned.startswith(CHECKPOINT_PREFIX):
+        raise ConfigError(
+            f"имя ветки не может начинаться с {CHECKPOINT_PREFIX!r} — так "
+            "помечаются checkpoint'ы, и след пропал бы неразличимо"
+        )
+    return cleaned
+
+
+def branch_file_name(parent: str, name: str) -> str:
+    """File-name (without .json) for a new branch of `parent`.
+
+    Length/charset of the COMBINED name are checked by validate_name() itself
+    — an over-long "<parent>--<name>" raises ConfigError with the same
+    readable message as any other bad session name, never a silent truncation.
+    """
+    parent = validate_name(parent)
+    segment = _validate_segment(name, kind="ветки")
+    return validate_name(f"{parent}{BRANCH_SEP}{segment}")
+
+
+def checkpoint_file_name(parent: str, name: str) -> str:
+    """File-name (without .json) for a checkpoint snapshot of `parent`."""
+    parent = validate_name(parent)
+    segment = _validate_segment(name, kind="checkpoint'а")
+    return validate_name(f"{parent}{BRANCH_SEP}{CHECKPOINT_PREFIX}{segment}")
+
+
+def parse_name(name: str) -> tuple[str | None, str, bool]:
+    """Split a session name into (parent, own segment, is_checkpoint).
+
+    Pure name algebra, no file read: `parent` is None for a root (no `--` in
+    the name at all). Checkpoint-ness is read off the LAST segment only, via
+    rpartition — so a root literally named "cp-foo" (no `--`) is never
+    mistaken for a checkpoint, and "root--mvp--lite" reports its immediate
+    parent as "root--mvp", not "root".
+    """
+    if BRANCH_SEP not in name:
+        return None, name, False
+    parent, _sep, last = name.rpartition(BRANCH_SEP)
+    return parent, last, last.startswith(CHECKPOINT_PREFIX)
+
+
+def root_of(name: str) -> str:
+    """Topmost ancestor by name shape alone — string algebra, no file reads.
+
+    Used to group `/branches`/`/sessions` by tree even when an intermediate
+    file is missing (orphaned branch): the root string is still derivable.
+    """
+    parent, _segment, _is_checkpoint = parse_name(name)
+    return root_of(parent) if parent else name
+
+
+@dataclass(slots=True, frozen=True)
+class TreeEntry:
+    """One row of the session tree for `/branches` / an indented `/sessions`.
+
+    `parent` is None both for an actual root AND for an orphan (parent name
+    not present in the set the caller passed in) — `orphaned` is what tells
+    those two apart, so the CLI never re-derives the parent string itself.
+    """
+
+    name: str
+    parent: str | None
+    root: str
+    is_checkpoint: bool
+    depth: int
+    orphaned: bool
+
+
+def build_tree(names: Iterable[str]) -> list[TreeEntry]:
+    """Group session names into roots/branches/checkpoints, purely by name.
+
+    A branch whose parent file is gone — deleted, or from before this
+    feature existed — is reported with `orphaned=True`, not raised on: SPEC
+    §7 gives branches no repair story, so a dangling one must stay listable.
+    Segments never contain "--" themselves (validated at creation time), so
+    `name.count(BRANCH_SEP)` is an exact depth, not an estimate.
+    """
+    known = set(names)
+    entries: list[TreeEntry] = []
+    for name in sorted(known):
+        parent, _segment, is_checkpoint = parse_name(name)
+        orphaned = parent is not None and parent not in known
+        entries.append(
+            TreeEntry(
+                name=name,
+                parent=None if orphaned else parent,
+                root=root_of(name),
+                is_checkpoint=is_checkpoint,
+                depth=name.count(BRANCH_SEP),
+                orphaned=orphaned,
+            )
+        )
+    return entries
 
 
 @dataclass(slots=True)
@@ -437,6 +561,88 @@ class Session:
             missing_usage=self.missing_usage(),
             broken=self.broken,
         )
+
+
+def make_checkpoint(session: Session, name: str, *, directory: Path | None = None) -> Session:
+    """Full snapshot of `session` right now — turns AND state, own file.
+
+    Not an index into `session.turns`: SPEC-w02d10.md §7.1 draws this
+    straight from the summary_upto lesson (SPEC-w02d09.md §8) — an index
+    into a living list goes stale silently the moment /new or /reset touches
+    that list. A snapshot costs disk space and nothing else.
+
+    deepcopy, not a fresh list of the same Turn/dict objects: the test that
+    matters is "mutating the parent afterwards does not change the
+    checkpoint", and a shallow copy of `turns` would still share the dict
+    payload of `state`.
+    """
+    directory = directory or session.path.parent
+    cp_name = checkpoint_file_name(session.name, name)
+    checkpoint = Session(
+        name=cp_name,
+        path=Session.path_for(cp_name, directory),
+        turns=copy.deepcopy(session.turns),
+        state=copy.deepcopy(session.state),
+    )
+    checkpoint.state["kind"] = "checkpoint"
+    checkpoint.save()
+    return checkpoint
+
+
+def make_branch(
+    checkpoint_or_parent: Session, name: str, *, directory: Path | None = None
+) -> Session:
+    """New branch, copying turns+state from `checkpoint_or_parent`, saved.
+
+    The new branch's PARENT is the checkpoint's own root, not the checkpoint
+    file's name: `/checkpoint mvp` then `/branch cheap` yields
+    "demo10--cheap", never "demo10--cp-mvp--cheap" (SPEC-w02d10.md §7.2's own
+    demo trace) — a checkpoint is a snapshot to branch FROM, not an address
+    to attach under. Passing a plain (non-checkpoint) session branches
+    directly off it, `fork_at` stays None.
+    """
+    parent_name, _segment, is_checkpoint = parse_name(checkpoint_or_parent.name)
+    parent = parent_name if is_checkpoint else checkpoint_or_parent.name
+    fork_at = checkpoint_or_parent.name if is_checkpoint else None
+    directory = directory or checkpoint_or_parent.path.parent
+    branch_name = branch_file_name(parent, name)
+    branch = Session(
+        name=branch_name,
+        path=Session.path_for(branch_name, directory),
+        turns=copy.deepcopy(checkpoint_or_parent.turns),
+        state=copy.deepcopy(checkpoint_or_parent.state),
+    )
+    branch.state["parent"] = parent
+    branch.state["fork_at"] = fork_at
+    branch.state.pop("kind", None)  # a branch is not itself a checkpoint
+    branch.save()
+    return branch
+
+
+def delete_branch(name: str, *, directory: Path | None = None) -> None:
+    """Delete a branch's file. `/branch --delete` (SPEC-w02d10.md §7.2/§7.3).
+
+    Refuses on a checkpoint-kind file: this command creates and removes what
+    `/branch` creates, and a checkpoint is addressed and reasoned about
+    differently (§7.1 — you can only fork from one, never `/switch` into
+    it). Refuses on a root for the same reason: a root isn't a branch either.
+    Refusing to delete the CURRENTLY OPEN branch is the CLI's job — only it
+    knows which session is active; this function only knows files.
+    """
+    path = Session.path_for(name, directory)
+    if not path.is_file():
+        raise ConfigError(f"ветка {name!r} не найдена")
+
+    parent_name, _segment, _is_checkpoint = parse_name(name)
+    if parent_name is None:
+        raise ConfigError(f"{name!r} — корневая сессия, а не ветка; эта команда её не трогает")
+
+    session = Session.load(name, directory=directory, quarantine=False)
+    if session.state.get("kind") == "checkpoint":
+        raise ConfigError(
+            f"{name!r} — это checkpoint, а не ветка; удаление checkpoint'ов эта команда не делает"
+        )
+    path.unlink()
 
 
 def list_sessions(directory: Path | None = None) -> tuple[list[SessionInfo], list[str]]:

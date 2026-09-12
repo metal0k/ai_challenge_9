@@ -29,11 +29,12 @@ from rich.table import Table
 
 from advent_core import chat as chat_core
 from advent_core import console, tokens
-from advent_core.agent import DEFAULT_COMPACT_EVERY, DEFAULT_KEEP_LAST, Agent, AgentReply
+from advent_core.agent import DEFAULT_COMPACT_EVERY, DEFAULT_KEEP_LAST, Agent
 from advent_core.client import capabilities_of, find_model, list_models
 from advent_core.config import DEFAULT_SYSTEM_PROMPT, PROJECT_ROOT, Config, ConfigError
 from advent_core.errors import AdventError
-from advent_core.params import GenerationParams, ParamError
+from advent_core.params import GenerationParams
+from tools import bench_core
 
 DEFAULT_MODEL = "ministral-14b-latest"
 DEFAULT_LIMIT = 2500
@@ -151,21 +152,12 @@ def _mode_params(
 ) -> GenerationParams:
     """Copy of session params with compact/keep_last/compact_every applied.
 
-    Via `params.set()`, not direct field assignment: only the registry
-    (advent_core/params.py) knows the bounds (`keep_last >= 2`,
-    `compact_every >= 2`); bypassing it would duplicate that rule here, ready
-    to drift out of sync.
+    Thin wrapper over bench_core.apply_param_overrides — see there for why
+    the bounds check goes through params.set() rather than living here.
     """
-    params = replace(base)
-    try:
-        params.set("compact", compact)
-        if keep_last is not None:
-            params.set("keep_last", keep_last)
-        if compact_every is not None:
-            params.set("compact_every", compact_every)
-    except ParamError as exc:
-        raise ConfigError(str(exc)) from exc
-    return params
+    return bench_core.apply_param_overrides(
+        base, compact=compact, keep_last=keep_last, compact_every=compact_every
+    )
 
 
 def _run_mode(
@@ -197,14 +189,9 @@ def _run_mode(
         on_warning=console.warn,
     )
 
-    history: list[chat_core.Message] = []
-    summary: str | None = None
+    replies, _state = bench_core.run_scenario(agent, scenario)
     result = ModeResult()
-    last_text = ""
-    for question in scenario:
-        reply: AgentReply = agent.ask(question, history, summary=summary)
-        history = reply.history
-        summary = reply.summary
+    for reply in replies:
         if reply.compaction is not None:
             result.compactions += 1
             usage = reply.compaction.result.usage
@@ -215,34 +202,16 @@ def _run_mode(
             result.compact_prompt += usage.prompt_tokens or 0
             result.compact_completion += usage.completion_tokens or 0
         result.turn_prompt_tokens.append(reply.result.usage.prompt_tokens)
-        last_text = reply.text
+    last_text = replies[-1].text if replies else ""
     # Case-insensitive: checks the fact of remembering, not spelling — the
     # model needn't echo the codeword in the same case.
     result.remembered = CODEWORD.lower() in last_text.lower()
     return result
 
 
-def _cumulative(values: Sequence[int | None]) -> tuple[list[tuple[str, str]], int | None, int]:
-    """Table rows (prompt, cumulative) plus the total and the missing count.
-
-    A gap (missing usage) prints as a dash in BOTH columns of that turn —
-    same behaviour as `_print_growth_table()` in week_02/cli.py — rather than
-    silently carrying forward the prior cumulative value where the server
-    said nothing.
-    """
-    rows: list[tuple[str, str]] = []
-    cumulative = 0
-    known = False
-    missing = 0
-    for value in values:
-        if value is None:
-            missing += 1
-            rows.append(("—", "—"))
-            continue
-        cumulative += value
-        known = True
-        rows.append((str(value), str(cumulative)))
-    return rows, (cumulative if known else None), missing
+# Same behaviour as `_print_growth_table()` in week_02/cli.py, moved to
+# bench_core so tools/strategy_bench.py doesn't reinvent it (SPEC-w02d10 §13).
+_cumulative = bench_core.cumulative_column
 
 
 def _net_savings(off_total: int | None, on_total: int | None, compact_cost: int) -> int | None:
@@ -346,15 +315,12 @@ def _print_scenario(args: argparse.Namespace) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Оффлайн-сравнение сжатия истории: один сценарий, compact off против on."
-    )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="модель для обоих прогонов")
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=DEFAULT_LIMIT,
-        help=f"заниженный context_limit для обоих прогонов (по умолчанию {DEFAULT_LIMIT})",
+    parser = bench_core.build_parser(
+        "Оффлайн-сравнение сжатия истории: один сценарий, compact off против on.",
+        default_model=DEFAULT_MODEL,
+        default_limit=DEFAULT_LIMIT,
+        limit_help=f"заниженный context_limit для обоих прогонов (по умолчанию {DEFAULT_LIMIT})",
+        model_help="модель для обоих прогонов",
     )
     parser.add_argument(
         "--keep-last",
@@ -375,11 +341,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"сколько ходов сценария прогнать (по умолчанию все {len(SCENARIO)}); "
         "вопрос про кодовое слово всегда остаётся последним",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="напечатать сценарий и настройки прогона, не ходить в сеть",
     )
     return parser
 

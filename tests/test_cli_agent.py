@@ -405,8 +405,13 @@ def test_params_shows_only_what_the_agent_reads(monkeypatch, tmp_path, capsys):
     cli._dispatch("/params", shell)
 
     table = _flat(capsys.readouterr().err)
-    for name in ("problem", "runs", "judge", "temps", "models", "strategy"):
+    for name in ("problem", "runs", "judge", "temps", "models"):
         assert name not in table, f"{name} не читается агентом, но показан в /params"
+    # Word-boundary: week_01's own bare "strategy" param must stay absent,
+    # but "context_strategy" (day 10, agent DOES read it) is legitimate.
+    assert not re.search(r"\bstrategy\b", table), (
+        "strategy не читается агентом, но показан в /params"
+    )
     for name in ("temperature", "session", "mode", "done", "max_turns"):
         assert name in table
 
@@ -414,8 +419,8 @@ def test_params_shows_only_what_the_agent_reads(monkeypatch, tmp_path, capsys):
 # --- журнал -----------------------------------------------------------------
 
 
-def test_journal_is_written_with_week_2_and_day_9(monkeypatch, tmp_path):
-    """Literals 2 and 9, not cli.WEEK/cli.DAY: an expectation taken from the
+def test_journal_is_written_with_week_2_and_day_10(monkeypatch, tmp_path):
+    """Literals 2 and 10, not cli.WEEK/cli.DAY: an expectation taken from the
     same source as the code under test cannot go red (CLAUDE.md)."""
     logged: dict = {}
     monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: logged.update(kwargs))
@@ -424,7 +429,7 @@ def test_journal_is_written_with_week_2_and_day_9(monkeypatch, tmp_path):
     cli._turn(shell, "вопрос")
 
     assert logged["week"] == 2
-    assert logged["day"] == 9
+    assert logged["day"] == 10
 
 
 def test_journal_logs_what_actually_went_to_the_api(monkeypatch, tmp_path):
@@ -521,6 +526,10 @@ def test_defaults_come_from_the_registry_not_from_the_typer_signature():
         "compact": True,
         "keep_last": 6,
         "compact_every": 10,
+        # Day 10: context_strategy replaces compact as the assembly axis;
+        # compact stays as a CLI-level alias onto it (see week_02/cli.py).
+        "context_strategy": "summary",
+        "facts_max_tokens": 400,
     }
 
     signature = inspect.signature(cli.agent)
@@ -1741,7 +1750,7 @@ def test_the_compaction_call_is_journalled_as_a_service_call_not_a_turn(monkeypa
     otherwise the day 08 growth table would count the summary as a user turn,
     and its prompt (the old history!) would skew exactly the curve it shows.
 
-    Literal 9, not cli.DAY: an expectation taken from the same source as the
+    Literal 10, not cli.DAY: an expectation taken from the same source as the
     code under test cannot go red (CLAUDE.md)."""
     rows: list[dict] = []
     monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
@@ -1752,7 +1761,7 @@ def test_the_compaction_call_is_journalled_as_a_service_call_not_a_turn(monkeypa
     compact_rows = [row for row in rows if row.get("extra", {}).get("kind") == "compact"]
     assert len(compact_rows) == 1
     assert compact_rows[0]["week"] == 2
-    assert compact_rows[0]["day"] == 9
+    assert compact_rows[0]["day"] == 10
     assert compact_rows[0]["extra"]["covered"] == 2
     # Ordinary turns stay unmarked: the growth table counts them.
     assert [row.get("extra") for row in rows if row.get("extra") is None] != []
@@ -2024,3 +2033,1140 @@ def test_tokens_says_compaction_is_off_when_it_is(monkeypatch, tmp_path, capsys)
     shell = _shell(monkeypatch, tmp_path, compact=False)
 
     assert "выключено (/set compact on)" in _tokens_table(shell, capsys)
+
+
+# --- day 10: context_strategy, sticky facts, branching (SPEC-w02d10.md) -----
+
+# --- three-case reads: context_strategy --------------------------------
+
+
+def test_context_strategy_absent_from_session_keeps_the_default(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.state = {"mode": "chat"}
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.context_strategy == "summary"
+
+
+def test_context_strategy_valid_value_applies_from_session(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.state["context_strategy"] = "window"
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.context_strategy == "window"
+
+
+def test_context_strategy_garbage_warns_and_keeps_the_default(monkeypatch, tmp_path, capsys):
+    session = Session.new("default", directory=tmp_path)
+    session.state["context_strategy"] = 42
+    session.save()
+    capsys.readouterr()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.context_strategy == "summary"
+    assert "негодное" in _flat(capsys.readouterr().err)
+
+
+# --- three-case reads: facts ---------------------------------------------
+
+
+def test_facts_absent_from_session_starts_empty(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.state = {"mode": "chat"}
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts == {}
+
+
+def test_facts_valid_dict_loads_from_session(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.state["facts"] = {"цель.проект": "кофейня"}
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts == {"цель.проект": "кофейня"}
+
+
+def test_facts_garbage_warns_and_starts_empty(monkeypatch, tmp_path, capsys):
+    session = Session.new("default", directory=tmp_path)
+    session.state["facts"] = "не словарь"
+    session.save()
+    capsys.readouterr()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts == {}
+    assert "facts повреждены" in _flat(capsys.readouterr().err)
+
+
+def test_facts_key_outside_categories_is_dropped_with_a_warning(monkeypatch, tmp_path, capsys):
+    session = Session.new("default", directory=tmp_path)
+    session.state["facts"] = {"погода.сегодня": "дождь", "цель.проект": "кофейня"}
+    session.save()
+    capsys.readouterr()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts == {"цель.проект": "кофейня"}
+    assert "отброшены ключи facts вне категорий: погода.сегодня" in _flat(capsys.readouterr().err)
+
+
+# --- three-case reads: facts_pinned ---------------------------------------
+
+
+def test_facts_pinned_absent_starts_empty(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.state["facts"] = {"цель.проект": "кофейня"}
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts_pinned == []
+
+
+def test_facts_pinned_valid_list_keeps_only_keys_present_in_facts(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.state["facts"] = {"цель.проект": "кофейня"}
+    session.state["facts_pinned"] = ["цель.проект", "решения.стек"]
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts_pinned == ["цель.проект"]
+
+
+def test_facts_pinned_garbage_warns_and_resets(monkeypatch, tmp_path, capsys):
+    session = Session.new("default", directory=tmp_path)
+    session.state["facts_pinned"] = "не список"
+    session.save()
+    capsys.readouterr()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts_pinned == []
+    assert "facts_pinned повреждены" in _flat(capsys.readouterr().err)
+
+
+# --- three-case reads: facts_upto ------------------------------------------
+
+
+def test_facts_upto_absent_is_zero(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.record("в", "о", model="m")
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts_upto == 0
+
+
+def test_facts_upto_valid_value_applies(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.record("в", "о", model="m")
+    session.state["facts_upto"] = 2
+    session.save()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts_upto == 2
+
+
+def test_facts_upto_garbage_falls_back_to_len_turns_not_zero(monkeypatch, tmp_path, capsys):
+    """A corrupted boundary must not fall back to 0: that would trigger a paid
+    re-extraction over the whole history on the very next turn (SPEC §8)."""
+    session = Session.new("default", directory=tmp_path)
+    session.record("в1", "о1", model="m")
+    session.record("в2", "о2", model="m")
+    session.state["facts_upto"] = "мусор"
+    session.save()
+    capsys.readouterr()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts_upto == len(session.turns) == 4
+    stderr = _flat(capsys.readouterr().err)
+    assert "негодный facts_upto" in stderr
+    assert "/facts backfill" in stderr
+
+
+def test_facts_upto_bool_counts_as_garbage_for_int(monkeypatch, tmp_path, capsys):
+    session = Session.new("default", directory=tmp_path)
+    session.record("в", "о", model="m")
+    session.state["facts_upto"] = True
+    session.save()
+    capsys.readouterr()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts_upto == len(session.turns) == 2
+    assert "негодный facts_upto" in _flat(capsys.readouterr().err)
+
+
+def test_facts_upto_out_of_range_falls_back_to_len_turns(monkeypatch, tmp_path, capsys):
+    session = Session.new("default", directory=tmp_path)
+    session.record("в", "о", model="m")
+    session.state["facts_upto"] = 999
+    session.save()
+    capsys.readouterr()
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.facts_upto == 2
+
+
+# --- /set compact off|on as an alias onto context_strategy ------------------
+
+
+def test_set_compact_off_maps_to_context_strategy_window(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/set compact off", shell)
+
+    assert shell.agent.context_strategy == "window"
+    assert "context_strategy → window (алиас /set compact off)" in _flat(capsys.readouterr().err)
+
+
+def test_set_compact_on_maps_to_context_strategy_summary(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/set compact off", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/set compact on", shell)
+
+    assert shell.agent.context_strategy == "summary"
+    assert "context_strategy → summary (алиас /set compact on)" in _flat(capsys.readouterr().err)
+
+
+def test_compact_alias_is_silent_when_the_strategy_already_matches(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)  # default strategy is already summary
+    capsys.readouterr()
+
+    cli._dispatch("/set compact on", shell)
+
+    assert "context_strategy →" not in _flat(capsys.readouterr().err)
+
+
+def test_compact_alias_defers_to_an_explicit_context_strategy(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/set context_strategy branch", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/set compact off", shell)
+
+    assert shell.agent.context_strategy == "branch"
+    assert "уже выбран явно" in _flat(capsys.readouterr().err)
+
+
+# --- /fact set|del|unpin -----------------------------------------------------
+
+
+def test_fact_set_creates_a_new_key_and_pins_it(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/fact set цель.проект кофейня в центре", shell)
+
+    assert shell.facts == {"цель.проект": "кофейня в центре"}
+    assert shell.facts_pinned == ["цель.проект"]
+    assert "facts: +проект (закреплено)" in _flat(capsys.readouterr().err)
+    saved = Session.load("default", directory=tmp_path)
+    assert saved.state["facts"] == {"цель.проект": "кофейня в центре"}
+    assert saved.state["facts_pinned"] == ["цель.проект"]
+
+
+def test_fact_set_rejects_a_key_outside_the_fixed_categories(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/fact set погода.сегодня дождь", shell)
+
+    assert shell.facts == {}
+    assert "неизвестная категория" in _flat(capsys.readouterr().err)
+
+
+def test_fact_del_removes_a_pinned_key_and_its_pin(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/fact set цель.проект кофейня", shell)
+
+    cli._dispatch("/fact del цель.проект", shell)
+
+    assert shell.facts == {}
+    assert shell.facts_pinned == []
+
+
+def test_fact_del_unknown_key_warns_and_changes_nothing(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/fact del решения.стек", shell)
+
+    assert "не найден" in _flat(capsys.readouterr().err)
+
+
+def test_fact_unpin_removes_the_pin_but_keeps_the_value(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/fact set цель.проект кофейня", shell)
+
+    cli._dispatch("/fact unpin цель.проект", shell)
+
+    assert shell.facts == {"цель.проект": "кофейня"}
+    assert shell.facts_pinned == []
+
+
+def test_fact_unpin_not_pinned_warns(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/fact unpin цель.проект", shell)
+
+    assert "не был закреплён" in _flat(capsys.readouterr().err)
+
+
+def test_fact_unknown_subcommand_warns(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/fact frobnicate x", shell)
+
+    assert "неизвестное действие /fact 'frobnicate': set | del | unpin" in _flat(
+        capsys.readouterr().err
+    )
+
+
+# --- /facts (show + backfill) -----------------------------------------------
+
+
+def test_facts_command_shows_the_full_block(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/fact set цель.проект кофейня", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/facts", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "цель:" in stderr
+    assert "проект: кофейня" in stderr
+
+
+def test_facts_command_with_nothing_says_so(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/facts", shell)
+
+    assert "фактов пока нет" in _flat(capsys.readouterr().err)
+
+
+def test_facts_backfill_on_empty_session_says_nothing_to_extract(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/facts backfill", shell)
+
+    assert "сессия пуста — извлекать нечего" in _flat(capsys.readouterr().err)
+
+
+def test_facts_backfill_runs_one_extractor_pass_over_the_whole_session(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос")
+    capsys.readouterr()
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "кофейня"}], "delete": []}'
+    shell.agent._complete = _complete([extractor_reply])
+
+    cli._dispatch("/facts backfill", shell)
+
+    assert shell.facts == {"цель.проект": "кофейня"}
+    assert shell.facts_upto == len(shell.session.history()) == 2
+    stderr = _flat(capsys.readouterr().err)
+    assert "facts: +проект" in stderr
+
+
+def test_facts_backfill_seeds_with_pinned_facts_only(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос")
+    shell.facts = {"цель.проект": "кофейня", "решения.стек": "python"}
+    shell.facts_pinned = ["цель.проект"]
+    seen_prompts: list[str] = []
+
+    def fake_complete(config, messages, capabilities=None):
+        seen_prompts.append(messages[-1]["content"])
+        return _reply('{"set": [], "delete": []}', sent_messages=messages)
+
+    shell.agent._complete = fake_complete
+
+    cli._dispatch("/facts backfill", shell)
+
+    # The extractor's own prompt shows current facts — only the pinned one
+    # survives the seed; the extractor has to re-derive the rest from scratch.
+    assert "кофейня" in seen_prompts[-1]
+    assert "python" not in seen_prompts[-1]
+
+
+def test_facts_backfill_is_journalled_with_the_backfill_flag(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос")
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "кофейня"}], "delete": []}'
+    shell.agent._complete = _complete([extractor_reply])
+
+    cli._dispatch("/facts backfill", shell)
+
+    facts_rows = [row for row in rows if row.get("extra", {}).get("kind") == "facts"]
+    assert len(facts_rows) == 1
+    assert facts_rows[0]["week"] == 2
+    assert facts_rows[0]["day"] == 10
+    assert facts_rows[0]["extra"]["backfill"] is True
+    assert facts_rows[0]["extra"]["covered"] == 2
+
+
+def test_facts_backfill_passes_no_catchup_cap(monkeypatch, tmp_path):
+    """Review finding P3: `/facts backfill` used to go through the same
+    per-turn FACTS_CATCHUP_MAX cap as ordinary catch-up, so "rebuild memory
+    from the whole file" silently read only the tail on any longer session.
+    catchup_max=None must reach _run_facts regardless of what it defaults to
+    internally."""
+    shell = _shell(monkeypatch, tmp_path)
+    for i in range(15):
+        shell.session.record(f"вопрос{i}", f"ответ{i}", model="ministral-14b-latest", usage=None)
+    captured: dict[str, object] = {}
+
+    def fake_run_facts(facts, pinned, history, user_input, upto, *, catchup_max="unset"):
+        captured["catchup_max"] = catchup_max
+        return facts, len(history), None
+
+    shell.agent._run_facts = fake_run_facts
+
+    cli._dispatch("/facts backfill", shell)
+
+    assert captured["catchup_max"] is None
+
+
+# --- auto-backfill on switching to context_strategy=facts (SPEC §5.6) -------
+
+
+def test_switching_to_facts_backfills_from_existing_turns(monkeypatch, tmp_path, capsys):
+    """Review finding C3: `/set context_strategy facts` on a session that
+    already has turns but empty facts used to leave facts empty — the agent
+    looked like it had just met the user mid-conversation."""
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос про кофейню")
+    capsys.readouterr()
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "кофейня"}], "delete": []}'
+    shell.agent._complete = _complete([extractor_reply])
+
+    cli._dispatch("/set context_strategy facts", shell)
+
+    assert shell.facts == {"цель.проект": "кофейня"}
+    assert shell.facts_upto == len(shell.session.history())
+    stderr = _flat(capsys.readouterr().err)
+    assert "авто-backfill" in stderr
+    assert "facts: +проект" in stderr
+
+
+def test_switching_to_facts_on_an_empty_session_does_not_backfill(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/set context_strategy facts", shell)
+
+    assert shell.facts == {}
+    assert "авто-backfill" not in _flat(capsys.readouterr().err)
+
+
+def test_switching_to_facts_again_does_not_rebackfill_when_facts_already_present(
+    monkeypatch, tmp_path, capsys
+):
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "кофейня"}], "delete": []}'
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        context_strategy="facts",
+        complete=_complete([extractor_reply, "ответ"]),
+    )
+    cli._turn(shell, "вопрос")
+    cli._dispatch("/set context_strategy window", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/set context_strategy facts", shell)
+
+    # No second extractor call — facts was already non-empty.
+    assert shell.facts == {"цель.проект": "кофейня"}
+    assert "авто-backfill" not in _flat(capsys.readouterr().err)
+
+
+def test_compact_alias_never_backfills_since_it_never_targets_facts(monkeypatch, tmp_path, capsys):
+    """The alias only ever maps onto summary|window — routed through the same
+    _maybe_backfill_facts check anyway (review finding C3: one check, not one
+    per spelling of "switch to facts"), but it must stay a no-op here."""
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос")
+    capsys.readouterr()
+
+    cli._dispatch("/set compact off", shell)
+
+    assert shell.agent.context_strategy == "window"
+    assert "авто-backfill" not in _flat(capsys.readouterr().err)
+
+
+# --- per-turn facts extraction (context_strategy=facts) ---------------------
+
+
+def test_facts_strategy_updates_the_block_and_prints_a_diff_note(monkeypatch, tmp_path, capsys):
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "кофейня"}], "delete": []}'
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        context_strategy="facts",
+        complete=_complete([extractor_reply, "ответ"]),
+    )
+
+    cli._turn(shell, "вопрос")
+
+    assert shell.facts == {"цель.проект": "кофейня"}
+    assert "facts: +проект" in _flat(capsys.readouterr().err)
+
+
+def test_facts_extractor_touching_a_pinned_key_is_blocked_with_a_note(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(monkeypatch, tmp_path, context_strategy="facts")
+    cli._dispatch("/fact set цель.проект кофейня", shell)
+    capsys.readouterr()
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "другое"}], "delete": []}'
+    shell.agent._complete = _complete([extractor_reply, "ответ"])
+
+    cli._turn(shell, "вопрос")
+
+    assert shell.facts["цель.проект"] == "кофейня"
+    assert "facts: проект — правка пользователя сохранена" in _flat(capsys.readouterr().err)
+
+
+def test_facts_strategy_names_the_window_dropped_count_only_once(monkeypatch, tmp_path, capsys):
+    """Review finding T1: once the window fills, `older` stays the same size
+    every subsequent turn — a truthy-check alone reprints the SAME number on
+    every turn from then on (measured 0,0,2,2,2,2 over six turns). Five turns
+    and a COUNT assertion, not substring presence: a membership check can't
+    see a note that fires five times instead of once."""
+    replies = [
+        '{"set": [], "delete": []}',
+        "о1",
+        '{"set": [], "delete": []}',
+        "о2",
+        '{"set": [], "delete": []}',
+        "о3",
+        '{"set": [], "delete": []}',
+        "о4",
+        '{"set": [], "delete": []}',
+        "о5",
+    ]
+    shell = _shell(
+        monkeypatch, tmp_path, context_strategy="facts", keep_last=2, complete=_complete(replies)
+    )
+
+    for question in ("первый", "второй", "третий", "четвёртый", "пятый"):
+        cli._turn(shell, question)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert stderr.count("окно: выпало 2 сообщений") == 1
+
+
+def test_window_strategy_names_the_dropped_count_only_once(monkeypatch, tmp_path, capsys):
+    """Same T1 bug, isolated from the facts extractor: plain `window` strategy
+    hits the identical split_history() cut every turn once the window fills."""
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        context_strategy="window",
+        keep_last=2,
+        complete=_complete(["о1", "о2", "о3", "о4", "о5"]),
+    )
+
+    for question in ("первый", "второй", "третий", "четвёртый", "пятый"):
+        cli._turn(shell, question)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert stderr.count("окно: выпало 2 сообщений") == 1
+
+
+def test_window_dropped_note_reappears_after_switching_sessions(monkeypatch, tmp_path, capsys):
+    """The remembered value must reset on a conversation-identity change
+    (SPEC-w02d10.md review, T1) — otherwise a fresh session that happens to
+    drop the SAME count as the old one never gets its own note at all."""
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        context_strategy="window",
+        keep_last=2,
+        complete=_complete(["о1", "о2", "о3"]),
+    )
+    for question in ("первый", "второй", "третий"):
+        cli._turn(shell, question)
+    capsys.readouterr()
+    assert shell.window_dropped_reported == 2
+
+    cli._dispatch("/new", shell)
+    shell.agent._complete = _complete(["о1", "о2", "о3"])
+    for question in ("первый", "второй", "третий"):
+        cli._turn(shell, question)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert stderr.count("окно: выпало 2 сообщений") == 1
+
+
+def test_a_paid_facts_update_is_kept_when_the_turn_after_it_fails(monkeypatch, tmp_path, capsys):
+    """Mirrors test_a_paid_compaction_is_kept_when_the_turn_after_it_fails: the
+    extractor call is separate and already paid for (SPEC §5.4, §9)."""
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "кофейня"}], "delete": []}'
+    inner = _complete([extractor_reply, "о1"])
+    calls: list[int] = []
+
+    def complete(config, messages, capabilities=None):
+        calls.append(1)
+        if len(calls) == 2:
+            raise AdventError("сеть отвалилась")
+        return inner(config, messages, capabilities)
+
+    shell = _shell(monkeypatch, tmp_path, complete=complete, context_strategy="facts")
+
+    cli._turn(shell, "первый")
+
+    assert [row.get("extra", {}).get("kind") for row in rows].count("facts") == 1
+    assert shell.facts == {"цель.проект": "кофейня"}
+    assert shell.facts_upto == len(shell.history) == 0
+    saved = Session.load("default", directory=tmp_path)
+    assert saved.state["facts"] == {"цель.проект": "кофейня"}
+    stderr = _flat(capsys.readouterr().err)
+    assert "facts: +проект" in stderr
+    assert "сеть отвалилась" in stderr
+
+
+def test_facts_extractor_call_is_journalled_as_a_service_call(monkeypatch, tmp_path):
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "кофейня"}], "delete": []}'
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        context_strategy="facts",
+        complete=_complete([extractor_reply, "ответ"]),
+    )
+
+    cli._turn(shell, "вопрос")
+
+    facts_rows = [row for row in rows if row.get("extra", {}).get("kind") == "facts"]
+    assert len(facts_rows) == 1
+    assert facts_rows[0]["week"] == 2
+    assert facts_rows[0]["day"] == 10
+    assert facts_rows[0]["extra"]["covered"] == 0
+    assert "backfill" not in facts_rows[0]["extra"]
+
+
+# --- a paid-but-unusable extractor call is journalled (own finding #5) ------
+
+
+def test_a_failed_extractor_call_is_journalled_as_a_distinct_kind(monkeypatch, tmp_path):
+    """The extractor call was paid for and came back unparsable — must not
+    vanish from the journal (that's how the day's spend under-reports)."""
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        context_strategy="facts",
+        complete=_complete(["не json совсем", "ответ"]),
+    )
+
+    cli._turn(shell, "вопрос")
+
+    failed_rows = [row for row in rows if row.get("extra", {}).get("kind") == "facts_failed"]
+    assert len(failed_rows) == 1
+    assert failed_rows[0]["week"] == 2
+    assert failed_rows[0]["day"] == 10
+    assert failed_rows[0]["extra"]["reason"] == "invalid"
+    # Distinct from a successful update — never also logged as kind="facts".
+    assert not [row for row in rows if row.get("extra", {}).get("kind") == "facts"]
+
+
+def test_a_failed_extractor_call_names_a_truncation_reason(monkeypatch, tmp_path):
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    replies = iter(['{"set": [', "ответ"])
+
+    def complete(config, messages, capabilities=None):
+        result = _reply(next(replies), sent_messages=messages)
+        result.finish_reason = "length"
+        return result
+
+    shell = _shell(monkeypatch, tmp_path, complete=complete, context_strategy="facts")
+
+    cli._turn(shell, "вопрос")
+
+    failed_rows = [row for row in rows if row.get("extra", {}).get("kind") == "facts_failed"]
+    assert len(failed_rows) == 1
+    assert failed_rows[0]["extra"]["reason"] == "truncated"
+
+
+def test_tokens_names_failed_extractor_calls_alongside_successful_ones(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        context_strategy="facts",
+        complete=_complete(["не json совсем", "ответ"]),
+    )
+
+    cli._turn(shell, "вопрос")
+
+    table = _tokens_table(shell, capsys)
+    assert "вызовов экстрактора 1, из них неуспешных 1" in table
+
+
+def test_a_failed_extractor_call_is_journalled_even_when_the_turn_after_it_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """Mirrors test_a_paid_facts_update_is_kept_when_the_turn_after_it_fails:
+    a paid failure is still a paid call, and it must survive the turn it was
+    made for exactly the same way a paid success does."""
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    calls: list[int] = []
+
+    def complete(config, messages, capabilities=None):
+        calls.append(1)
+        if len(calls) == 1:
+            return _reply("не json совсем", sent_messages=messages)
+        raise AdventError("сеть отвалилась")
+
+    shell = _shell(monkeypatch, tmp_path, complete=complete, context_strategy="facts")
+
+    cli._turn(shell, "первый")
+
+    failed_rows = [row for row in rows if row.get("extra", {}).get("kind") == "facts_failed"]
+    assert len(failed_rows) == 1
+    assert shell.facts_failures == 1
+    stderr = _flat(capsys.readouterr().err)
+    assert "сеть отвалилась" in stderr
+
+
+# --- token panel / /tokens additions -----------------------------------------
+
+
+def test_token_panel_always_shows_the_strategy(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._turn(shell, "вопрос")
+
+    assert "стратегия summary" in _flat(capsys.readouterr().err)
+
+
+def test_token_panel_shows_branch_only_inside_a_branch(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ1", "ответ2"]))
+    cli._turn(shell, "первый")
+    assert "ветка" not in _flat(capsys.readouterr().err)
+
+    cli._dispatch("/branch cheap", shell)
+    capsys.readouterr()
+    cli._turn(shell, "второй")
+
+    assert "ветка cheap" in _flat(capsys.readouterr().err)
+
+
+def test_tokens_facts_row_not_applicable_outside_facts_strategy(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "неприменимо: context_strategy=summary (не facts)" in table
+
+
+def test_tokens_facts_row_shows_block_size_and_extractor_cost(monkeypatch, tmp_path, capsys):
+    extractor_reply = '{"set": [{"key": "цель.проект", "value": "кофейня"}], "delete": []}'
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        context_strategy="facts",
+        complete=_complete([extractor_reply, "ответ"]),
+    )
+    cli._turn(shell, "вопрос")
+
+    table = _tokens_table(shell, capsys)
+
+    assert "ключей 1, блок" in table
+    assert "вызовов экстрактора 1, стоили 10/5" in table
+
+
+def test_facts_block_size_is_counted_in_a_shape_the_exact_tokenizer_accepts(
+    monkeypatch, tmp_path, capsys
+):
+    """Same refusal as _RefusesUnlessLastIsUser documents for the summary
+    block: a double this strict is the only thing that can catch a shape bug
+    in `_facts_tokens` (see the class docstring above)."""
+    monkeypatch.setattr(
+        cli, "counter_for", lambda model, **kwargs: (_RefusesUnlessLastIsUser(), None)
+    )
+    shell = _shell(monkeypatch, tmp_path, context_strategy="facts")
+    cli._dispatch("/fact set цель.проект кофейня", shell)
+
+    assert cli._facts_tokens(shell) is not None
+    assert cli._facts_tokens(shell) > 0
+
+
+def test_tokens_names_the_size_of_the_facts_block_on_an_exact_counter(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(
+        cli, "counter_for", lambda model, **kwargs: (_RefusesUnlessLastIsUser(), None)
+    )
+    shell = _shell(monkeypatch, tmp_path, context_strategy="facts")
+    cli._dispatch("/fact set цель.проект кофейня", shell)
+
+    table = _tokens_table(shell, capsys)
+
+    assert "ключей 1, блок" in table
+    assert "— токенов" not in table
+
+
+# --- /checkpoint, /branch, /switch, /branches --------------------------------
+
+
+def test_checkpoint_creates_a_named_snapshot(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос")
+    capsys.readouterr()
+
+    cli._dispatch("/checkpoint mvp", shell)
+
+    assert "checkpoint default--cp-mvp: ходов 2" in _flat(capsys.readouterr().err)
+    loaded = Session.load("default--cp-mvp", directory=tmp_path)
+    assert loaded.state.get("kind") == "checkpoint"
+
+
+def test_checkpoint_without_a_name_lists_the_sessions_own_checkpoints(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(monkeypatch, tmp_path)
+    shell.save()  # a checkpoint of an unsaved session would be orphaned in build_tree
+    cli._dispatch("/checkpoint mvp", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/checkpoint", shell)
+
+    assert "default--cp-mvp" in _flat(capsys.readouterr().err)
+
+
+def test_checkpoint_without_a_name_and_none_exist_says_so(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/checkpoint", shell)
+
+    assert "нет checkpoint" in _flat(capsys.readouterr().err)
+
+
+def test_branch_creates_directly_from_the_current_session_without_from(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос")
+    capsys.readouterr()
+
+    cli._dispatch("/branch cheap", shell)
+
+    assert "ветка default--cheap создана от default" in _flat(capsys.readouterr().err)
+    assert shell.session.name == "default--cheap"
+    assert len(shell.session.turns) == 2
+
+
+def test_branch_creates_from_a_named_checkpoint_via_from(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос")
+    cli._dispatch("/checkpoint mvp", shell)
+    cli._dispatch("/fact set цель.проект кофейня", shell)  # mutation AFTER the checkpoint
+    capsys.readouterr()
+
+    cli._dispatch("/branch cheap --from mvp", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "ветка default--cheap создана от default--cp-mvp" in stderr
+    assert shell.session.name == "default--cheap"
+    assert shell.session.state.get("fork_at") == "default--cp-mvp"
+    # Branched off the checkpoint, not the later mutation.
+    assert shell.facts == {}
+
+
+def test_branch_from_names_a_missing_checkpoint(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/branch cheap --from ghost", shell)
+
+    assert "не найден" in _flat(capsys.readouterr().err)
+    assert shell.session.name == "default"
+
+
+def test_branch_without_from_refuses_when_several_checkpoints_exist(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    shell.save()  # a checkpoint of an unsaved session would be orphaned in build_tree
+    cli._dispatch("/checkpoint mvp", shell)
+    cli._dispatch("/checkpoint alt", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/branch cheap", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "несколько checkpoint" in stderr
+    assert shell.session.name == "default"
+
+
+def test_branch_delete_removes_a_branch(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/branch cheap", shell)
+    cli._dispatch("/switch default", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/branch --delete default--cheap", shell)
+
+    assert "ветка default--cheap удалена" in _flat(capsys.readouterr().err)
+    assert not Session.path_for("default--cheap", tmp_path).is_file()
+
+
+def test_branch_delete_refuses_the_current_branch(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/branch cheap", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/branch --delete default--cheap", shell)
+
+    assert "нельзя удалить текущую ветку" in _flat(capsys.readouterr().err)
+    assert Session.path_for("default--cheap", tmp_path).is_file()
+
+
+def test_switch_moves_into_another_session(monkeypatch, tmp_path):
+    Session.new("other", directory=tmp_path).save()
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/switch other", shell)
+
+    assert shell.session.name == "other"
+
+
+def test_switch_moves_into_a_branch(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/branch cheap", shell)
+    cli._dispatch("/switch default", shell)
+
+    cli._dispatch("/switch default--cheap", shell)
+
+    assert shell.session.name == "default--cheap"
+
+
+def test_switch_refuses_a_checkpoint_with_a_hint(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/checkpoint mvp", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/switch default--cp-mvp", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "checkpoint, в него нельзя переключиться" in stderr
+    assert "/branch <имя> --from default--cp-mvp" in stderr
+    assert shell.session.name == "default"
+
+
+def test_set_session_refuses_to_switch_into_a_checkpoint(monkeypatch, tmp_path, capsys):
+    """Review finding P1: `/set session <checkpoint>` used to reach
+    `_switch_session()`/`open_session()` directly, bypassing the guard that
+    only `/switch`'s own command handler used to run."""
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/checkpoint mvp", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/set session default--cp-mvp", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "checkpoint, в него нельзя переключиться" in stderr
+    assert shell.session.name == "default"
+    assert shell.config.params.session == "default"
+
+
+def test_startup_into_a_checkpoint_refuses_to_start(monkeypatch, tmp_path):
+    """Same guard at startup (`--session <checkpoint>`) — nobody to ask, so
+    it's fatal, same class of failure as an unknown model name."""
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/checkpoint mvp", shell)
+
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+    with pytest.raises(ConfigError, match="checkpoint, в него нельзя переключиться"):
+        cli.AgentShell(_config(session="default--cp-mvp"), directory=tmp_path)
+
+
+def test_switch_to_a_missing_session_warns(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/switch ghost", shell)
+
+    assert "не найдена" in _flat(capsys.readouterr().err)
+
+
+def test_switch_settings_note_lists_every_diff():
+    note = cli._switch_settings_note(
+        before=("summary", None, "chat"),
+        after=("window", 2500, "dialog"),
+        target="cheap",
+        is_branch=True,
+    )
+    assert note == (
+        "ветка cheap: context_strategy window (было summary), "
+        "окно 2500 (было из карточки), mode dialog (было chat)"
+    )
+
+
+def test_switch_settings_note_is_none_when_nothing_differs():
+    assert (
+        cli._switch_settings_note(
+            before=("summary", None, "chat"),
+            after=("summary", None, "chat"),
+            target="x",
+            is_branch=False,
+        )
+        is None
+    )
+
+
+def test_switch_prints_a_diff_note_when_the_target_session_differs(monkeypatch, tmp_path, capsys):
+    other = Session.new("other", directory=tmp_path)
+    other.state["context_strategy"] = "window"
+    other.save()
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/switch other", shell)
+
+    assert "context_strategy window (было summary)" in _flat(capsys.readouterr().err)
+
+
+def test_switch_prints_no_note_when_settings_match(monkeypatch, tmp_path, capsys):
+    Session.new("other", directory=tmp_path).save()
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/switch other", shell)
+
+    assert "было" not in _flat(capsys.readouterr().err)
+
+
+def test_switch_names_a_different_context_limit_int_vs_card(monkeypatch, tmp_path, capsys):
+    """T2 (review): the one end-to-end /switch test varied context_strategy
+    alone — context_limit (day 08's own field class, leaked once already) and
+    mode need their own CLI-level coverage of the exact note text."""
+    other = Session.new("other", directory=tmp_path)
+    other.state["context_limit"] = 2500
+    other.save()
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/switch other", shell)
+
+    assert "окно 2500 (было из карточки)" in _flat(capsys.readouterr().err)
+
+
+def test_switch_names_a_context_limit_that_reverts_to_the_card(monkeypatch, tmp_path, capsys):
+    """The other direction: int → None (override explicitly lifted)."""
+    other = Session.new("other", directory=tmp_path)
+    other.state["context_limit"] = None
+    other.save()
+    shell = _shell(monkeypatch, tmp_path, context_limit=2500)
+    capsys.readouterr()
+
+    cli._dispatch("/switch other", shell)
+
+    assert "окно из карточки (было 2500)" in _flat(capsys.readouterr().err)
+
+
+def test_switch_names_a_different_mode(monkeypatch, tmp_path, capsys):
+    other = Session.new("other", directory=tmp_path)
+    other.state["mode"] = "dialog"
+    other.save()
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/switch other", shell)
+
+    assert "mode dialog (было chat)" in _flat(capsys.readouterr().err)
+
+
+def test_branches_renders_the_tree_with_markers(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/branch cheap", shell)
+    cli._dispatch("/checkpoint mvp", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/branches", shell)
+
+    table = _flat(capsys.readouterr().err)
+    assert "Дерево сессии default" in table
+    assert "default--cheap--cp-mvp (checkpoint)" in table
+    assert "default--cheap ← текущая" in table
+    # Title plus one row per session sharing the root — a duplicated row
+    # (day 08's own doubled-header bug, same class) would push this past 4.
+    assert table.count("default") == 4
+
+
+def test_branches_with_no_relatives_says_so(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/branches", shell)
+
+    assert "нет веток" in _flat(capsys.readouterr().err)
+
+
+# --- /new inside a branch, and against a checkpoint --------------------------
+
+
+def test_new_inside_a_branch_clears_only_that_branch_not_the_parent(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["ответ"]))
+    cli._turn(shell, "вопрос")
+    cli._dispatch("/branch cheap", shell)
+    cli._turn(shell, "ещё вопрос")
+    capsys.readouterr()
+
+    cli._dispatch("/new", shell)
+
+    assert shell.session.name == "default--cheap"
+    assert shell.history == []
+    stderr = _flat(capsys.readouterr().err)
+    assert "ветка (родитель default)" in stderr
+    assert "не корень" in stderr
+    parent = Session.load("default", directory=tmp_path)
+    assert len(parent.turns) == 2
+
+
+def test_new_refuses_to_clear_a_checkpoint(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/checkpoint mvp", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/new default--cp-mvp", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "checkpoint" in stderr
+    assert "/new его не стирает" in stderr
+    loaded = Session.load("default--cp-mvp", directory=tmp_path)
+    assert loaded.state.get("kind") == "checkpoint"
