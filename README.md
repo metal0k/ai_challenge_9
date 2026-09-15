@@ -49,6 +49,14 @@ uv run advent w01 bench                    # один запрос на лест
 | 01 | 01 | Первый запрос к LLM через API | [`w01d01`](https://github.com/metal0k/ai_challenge_9/tree/w01d01) | — |
 | 01 | 02 | Формат ответа | [`w01d02`](https://github.com/metal0k/ai_challenge_9/tree/w01d02) | — |
 | 01 | 03 | Разные способы рассуждения | [`w01d03`](https://github.com/metal0k/ai_challenge_9/tree/w01d03) | — |
+| 01 | 04 | Температура | [`w01d04`](https://github.com/metal0k/ai_challenge_9/tree/w01d04) | — |
+| 01 | 05 | Версии моделей | [`w01d05`](https://github.com/metal0k/ai_challenge_9/tree/w01d05) | — |
+| 02 | 06 | Первый агент | [`w02d06`](https://github.com/metal0k/ai_challenge_9/tree/w02d06) | — |
+| 02 | 07 | Сохранение контекста | [`w02d07`](https://github.com/metal0k/ai_challenge_9/tree/w02d07) | — |
+| 02 | 08 | Работа с токенами | [`w02d08`](https://github.com/metal0k/ai_challenge_9/tree/w02d08) | — |
+| 02 | 09 | Управление контекстом: сжатие истории | [`w02d09`](https://github.com/metal0k/ai_challenge_9/tree/w02d09) | — |
+| 02 | 10 | Управление контекстом: разные стратегии | [`w02d10`](https://github.com/metal0k/ai_challenge_9/tree/w02d10) | — |
+| 03 | 11 | Модель памяти агента | [`w03d11`](https://github.com/metal0k/ai_challenge_9/tree/w03d11) | [Yandex Disk](https://yadi.sk/i/Udf4MNU_ocQaAw) |
 
 ## Структура
 
