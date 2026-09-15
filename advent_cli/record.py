@@ -84,6 +84,8 @@ MODULE_COMMANDS = {
     "tools.compact_bench": "python -m tools.compact_bench",
     # Day 10: the four-strategy comparison — same shape as compact_bench above.
     "tools.strategy_bench": "python -m tools.strategy_bench",
+    # Day 11: deterministic memory-layer demo; no agent/API process is involved.
+    "tools.memory_demo": "python -m tools.memory_demo",
 }
 
 
@@ -123,7 +125,7 @@ class Step:
     line_pause: float | None = None
 
 
-def demo_steps(week: int, day: int) -> list[Step]:
+def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
     """Сценарий демо для конкретного дня недели.
 
     Сценарии прошлых дней остаются в коде и выбираются по номеру —
@@ -145,6 +147,10 @@ def demo_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w02d07()
     if week == 2 and day == 6:
         return _demo_steps_w02d06()
+    if week == 3 and day == 11 and live:
+        return _demo_steps_w03d11_live()
+    if week == 3 and day == 11:
+        return _demo_steps_w03d11()
     if week == 1 and day == 5:
         return _demo_steps_w01d05()
     if week == 1 and day == 4:
@@ -1336,6 +1342,105 @@ def _demo_steps_w02d10() -> list[Step]:
     ]
 
 
+def _demo_steps_w03d11() -> list[Step]:
+    """Day 11 — три memory layers, lifecycle и privacy boundary.
+
+    The offline harness is the source of truth for this take. It injects
+    deterministic extractor/model functions and uses the real MemoryStore,
+    routing validation and request assembly, so the recording spends no API
+    credits. Interactive commands are staged through one process so the
+    viewer can see each operation and its resulting state before the next one.
+    """
+    return [
+        Step(
+            title=(
+                "День 11. Модель памяти агента: short-term (диалог), working (задача), "
+                "long-term (профиль); routing → answer, switch, pin, privacy boundary, "
+                "/new и storage"
+            ),
+            module="tools.memory_demo",
+            args=["--interactive"],
+            stdin_lines=[
+                (
+                    "/turn Подготовь migration с zero downtime; отвечай на русском prose "
+                    "с English technical terms; code word ORBIT."
+                ),
+                "/memory",
+                "/switch B",
+                "/switch A",
+                "/pin-conflict",
+                "/credential",
+                "/new",
+                "/storage",
+                "/exit",
+            ],
+            timeout=120,
+            line_pause=6.5,
+        )
+    ]
+
+
+def _demo_steps_w03d11_live() -> list[Step]:
+    """Day 11 live take: real Mistral answers over the real memory shell.
+
+    The offline scenario remains the default and is the credit-free safety
+    net.  This variant deliberately uses one process: switching sessions then
+    makes the global long-term layer and per-session working layer visible in
+    the same terminal window.  There are only three user turns (each can cause
+    one model call plus the memory extractor), so a recording cannot silently
+    become an expensive benchmark.
+    """
+    return [
+        Step(
+            title=(
+                "День 11 LIVE · Mistral 14B: реальный ответ + три memory layers; "
+                "A → B (global long-term) → A, /new чистит только local working"
+            ),
+            module="week_02.cli",
+            args=[
+                "--session",
+                "demo11-live-A",
+                "--model",
+                "ministral-14b-latest",
+                "--max-tokens",
+                "300",
+                "--no-stream",
+            ],
+            env={"ADVENT_RECORD_COLOR": "1"},
+            stdin_lines=[
+                "/strategy memory",
+                (
+                    "Подготовь migration с zero downtime; ответь на русском prose с English "
+                    "technical terms. Запомни code word ORBIT. Дай concise план ровно в "
+                    "2–3 lines."
+                ),
+                (
+                    "/memory set long preferences.answer_language Russian prose with "
+                    "English technical terms"
+                ),
+                "/memory set working goal.primary migration zero downtime",
+                "/memory",
+                "/new demo11-live-B",
+                "/switch demo11-live-A",
+                "/switch demo11-live-B",
+                (
+                    "Назови только global preference answer_language и скажи, есть ли в B "
+                    "local working goal. Ответь в двух коротких lines."
+                ),
+                "/memory",
+                "/switch demo11-live-A",
+                "После возврата в A напомни code word и working goal в двух коротких lines.",
+                "/memory",
+                "/new",
+                "/memory",
+                "/exit",
+            ],
+            timeout=240,
+            line_pause=4.0,
+        )
+    ]
+
+
 def rehearsal_step(week: int) -> Step:
     """Дешёвый прогон той же машинерии, что ведёт демо.
 
@@ -1349,6 +1454,12 @@ def rehearsal_step(week: int) -> Step:
     §17.2). Сессия репетиции — своя: `/params` и заведомо неверная команда
     ходов не пишут, но подставлять сюда демо-сессию всё равно нельзя.
     """
+    if week == 3:
+        return Step(
+            title="репетиция Day 11 offline demo",
+            module="tools.memory_demo",
+            args=["--dry-run"],
+        )
     if week == 2:
         return Step(
             title="репетиция",
@@ -1373,14 +1484,28 @@ def record(
     keep_original: bool = typer.Option(
         False, "--keep-original", help="Не удалять исходный файл OBS."
     ),
+    live: bool = typer.Option(
+        False,
+        "--live",
+        help="Для Day 11 записать отдельный live Mistral take (WWDD-live.mp4).",
+    ),
 ) -> None:
     """Записать демо дня и положить файл как WWDD.mp4."""
+    # Direct Python callers (including the established test seam) receive
+    # Typer's OptionInfo for newly added options when they omit the argument.
+    # Only an actual bool can enable the paid live variant.
+    if not isinstance(live, bool):
+        live = False
+    if live and (week, day) != (3, 11):
+        raise AdventError("Опция --live доступна только для Day 11 (week 3).")
     load_env()
-    target = _target_path(week, day)
+    # Keep the existing target and its monkeypatch/test contract untouched for
+    # every offline day.  A live Day 11 take is always a separate deliverable.
+    target = _target_path(week, day, live=True) if live else _target_path(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")
-        _play(demo_steps(week, day))
+        _play(demo_steps(week, day, live=live))
         return
 
     if rehearse:
@@ -1416,7 +1541,7 @@ def record(
         console.note("запись пошла")
         time.sleep(TITLE_PAUSE)
         try:
-            _play(demo_steps(week, day))
+            _play(demo_steps(week, day, live=live))
         finally:
             time.sleep(STEP_PAUSE)
             source = obs.stop_recording(client)
@@ -1449,7 +1574,10 @@ def _play(steps: list[Step]) -> None:
         console.out.print(f"[dim]$ {entry} {rich_escape(' '.join(step.args))}[/dim]")
         time.sleep(TITLE_PAUSE)
         _run_step(step)
-        time.sleep(STEP_PAUSE)
+        # A no-stdin demo prints its whole result at once; keep its final screen
+        # readable when the step requests a longer pause.
+        tail_pause = step.line_pause if not step.stdin_lines and not step.stdin_file else None
+        time.sleep(tail_pause if tail_pause is not None else STEP_PAUSE)
 
 
 def _run_step(step: Step, pause: float | None = None) -> None:
@@ -1529,13 +1657,14 @@ def _check(step: Step, code: int) -> None:
         raise AdventError(f"Шаг «{step.title}» завершился с кодом {code}.")
 
 
-def _target_path(week: int, day: int) -> Path:
+def _target_path(week: int, day: int, *, live: bool = False) -> Path:
     video_dir = os.getenv("VIDEO_DIR")
     if not video_dir:
         raise AdventError("Не найден VIDEO_DIR в .env")
     directory = Path(video_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{week:02d}{day:02d}.mp4"
+    suffix = "-live" if live else ""
+    return directory / f"{week:02d}{day:02d}{suffix}.mp4"
 
 
 def _deliver(source: Path, target: Path, *, keep_original: bool) -> None:

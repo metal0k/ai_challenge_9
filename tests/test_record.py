@@ -876,3 +876,84 @@ def test_day_10_scenario_has_no_step_without_an_action():
         step.args or step.note or step.stdin_file or step.module != record_mod.DEFAULT_MODULE
         for step in steps
     ), "день 10: шаг без действия и без текста"
+
+
+# --------------------------------------------------------------------------
+# Week 03, Day 11 (SPEC-w03d11.md §12): interactive memory-layer demo.
+# --------------------------------------------------------------------------
+
+
+def test_day_11_uses_one_interactive_process_for_stateful_story():
+    steps = record_mod.demo_steps(3, 11)
+
+    assert len(steps) == 1
+    step = steps[0]
+    assert step.module == "tools.memory_demo"
+    assert step.args == ["--interactive"]
+    assert step.stdin_lines == [
+        (
+            "/turn Подготовь migration с zero downtime; отвечай на русском prose "
+            "с English technical terms; code word ORBIT."
+        ),
+        "/memory",
+        "/switch B",
+        "/switch A",
+        "/pin-conflict",
+        "/credential",
+        "/new",
+        "/storage",
+        "/exit",
+    ]
+
+
+def test_day_11_pause_keeps_each_state_visible_without_long_static_tail():
+    step = record_mod.demo_steps(3, 11)[0]
+
+    assert step.line_pause == 6.5
+    assert step.line_pause < 8.0
+    assert step.timeout == 120
+
+
+def test_day_11_title_names_the_observable_memory_story():
+    title = record_mod.demo_steps(3, 11)[0].title.lower()
+
+    for term in (
+        "модель памяти агента",
+        "short-term",
+        "working",
+        "long-term",
+        "answer",
+        "switch",
+        "privacy boundary",
+        "storage",
+    ):
+        assert term in title
+
+
+def test_day_11_live_is_an_explicit_mistral_variant_with_bounded_turns():
+    steps = record_mod.demo_steps(3, 11, live=True)
+    assert len(steps) == 1
+    step = steps[0]
+    assert step.module == "week_02.cli"
+    assert step.args[:2] == ["--session", "demo11-live-A"]
+    assert "ministral-14b-latest" in step.args
+    assert step.args[step.args.index("--max-tokens") + 1] == "300"
+    assert sum(not line.startswith("/") for line in step.stdin_lines) <= 3
+    assert "/strategy memory" in step.stdin_lines
+    assert "/memory set long preferences.answer_language" in " ".join(step.stdin_lines)
+    assert "/memory set working goal.primary" in " ".join(step.stdin_lines)
+    assert "ORBIT" in " ".join(step.stdin_lines)
+    assert "/switch demo11-live-B" in step.stdin_lines or "/new demo11-live-B" in step.stdin_lines
+    assert "/switch demo11-live-A" in step.stdin_lines
+    recall_turns = [line for line in step.stdin_lines if not line.startswith("/")][1:]
+    assert all("ORBIT" not in line and "zero downtime" not in line for line in recall_turns)
+    assert "global preference answer_language" in recall_turns[0]
+    assert "local working goal" in recall_turns[0]
+    assert "/new" in step.stdin_lines
+    assert step.stdin_lines[-3:] == ["/new", "/memory", "/exit"]
+
+
+def test_day_11_live_target_never_overwrites_offline_video(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIDEO_DIR", str(tmp_path))
+    assert record_mod._target_path(3, 11) == tmp_path / "0311.mp4"
+    assert record_mod._target_path(3, 11, live=True) == tmp_path / "0311-live.mp4"

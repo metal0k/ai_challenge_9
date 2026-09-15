@@ -473,8 +473,8 @@ def test_compaction_bounds_are_enforced(bad):
 # --- context_strategy / facts_max_tokens: Day 10 params ---------------------
 
 
-def test_context_strategy_choices_are_the_four_assemblies():
-    assert CONTEXT_STRATEGY_CHOICES == ("window", "facts", "branch", "summary")
+def test_context_strategy_choices_include_memory():
+    assert CONTEXT_STRATEGY_CHOICES == ("window", "facts", "branch", "summary", "memory")
 
 
 def test_context_strategy_default_for_agent_is_summary():

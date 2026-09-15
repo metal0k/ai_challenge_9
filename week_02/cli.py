@@ -43,6 +43,22 @@ from advent_core.config import DEFAULT_SYSTEM_PROMPT, Config, ConfigError
 from advent_core.errors import AdventError
 from advent_core.facts import format_facts, render_note, validate_key
 from advent_core.journal import log_call
+from advent_core.memory import (
+    MemoryFailure,
+    MemorySnapshot,
+    MemoryStore,
+    MemoryUpdate,
+    ShortTermMemory,
+    StructuredMemory,
+    is_credential_like,
+    manual_set,
+    render_delta,
+    render_memory,
+    split_key,
+)
+from advent_core.memory import (
+    validate_key as validate_memory_key,
+)
 from advent_core.params import (
     AGENT_COMMAND,
     AGENT_PARAMS,
@@ -137,6 +153,7 @@ class Command:
 # Порядок вставки = порядок в /help, поэтому dict, а не отсортированный набор:
 # список команд читается на видео сверху вниз, и алфавит там ни при чём.
 COMMANDS: dict[str, Command] = {}
+_FACTS_ALIAS_SHOWN = False
 
 
 def command(
@@ -233,6 +250,17 @@ class AgentShell:
     # updates" (review finding #5: these calls cost money and were going
     # unjournalled).
     facts_failures: int = 0
+    # Explicit Day 11 memory.  The store is deliberately owned by the shell,
+    # not Agent: Agent remains stateless and can be used by offline tests.
+    memory_store: MemoryStore = field(init=False)
+    memory: MemorySnapshot = field(default_factory=MemorySnapshot)
+    memory_upto: int = 0
+    memory_dirty_working: bool = False
+    memory_dirty_long_term: bool = False
+    memory_calls: int = 0
+    memory_prompt_tokens: int = 0
+    memory_completion_tokens: int = 0
+    memory_failures: int = 0
     # Runtime-only (never persisted): whether `/set context_strategy <value>`
     # was issued explicitly THIS run. Deliberately not derived from the
     # session file — otherwise `/set compact off|on`, day 09's own alias,
@@ -291,6 +319,7 @@ class AgentShell:
         # property mode читает config.params, поэтому порядок безопасен, а
         # анонс — после создания agent, где уже есть max_turns.
         resumed_dialog = self._apply_session_state(self.session, check_explicit=True)
+        self._load_memory()
         # on_notice: скачка токенизатора идёт минуты, и молчащий процесс между
         # строкой про сессию и приглашением читается как зависший — в том
         # числе машинерией записи демо, которая снимает шаг по таймауту и
@@ -312,6 +341,7 @@ class AgentShell:
             dialog_preset=_dialog_preset(),
             summary_prompt=_summary_prompt(),
             facts_prompt=_facts_prompt(),
+            memory_prompt=_memory_prompt(),
             # Агент не печатает — он отдаёт текст сюда (SPEC §5).
             on_warning=console.warn,
         )
@@ -412,6 +442,141 @@ class AgentShell:
         console.note(f"сессия {session.name}: ходов {len(session.turns)}, начата {session.created}")
         self._warn_drift(session)
         return session
+
+    @property
+    def memory_root(self) -> Path:
+        """Root for structured memory, parallel to the session directory.
+
+        Tests pass a temporary session directory, so using it as the root keeps
+        all state isolated.  The normal run uses ``logs`` and therefore writes
+        exactly ``logs/memory/...``.
+        """
+        from advent_core.config import LOG_DIR
+
+        return self.directory or LOG_DIR
+
+    def _memory_snapshot(self) -> MemorySnapshot:
+        return MemorySnapshot(
+            ShortTermMemory(tuple(self.history), 0, len(self.session.turns)),
+            self.memory.working,
+            self.memory.long_term,
+        )
+
+    def _load_memory(self, *, load_working: bool = True) -> None:
+        self.memory_store = MemoryStore(self.memory_root)
+        long_result = self.memory_store.load_long_term()
+        working_result = (
+            self.memory_store.load_working(self.session.name, turns_count=len(self.session.turns))
+            if load_working
+            else None
+        )
+        warnings = long_result.warnings + (working_result.warnings if working_result else ())
+        for warning in warnings:
+            console.warn(warning)
+
+        working = working_result.value if working_result else StructuredMemory()
+        migrated = False
+        if working_result is not None and not working_result.exists:
+            # Legacy facts are session content and never become global memory.
+            mapped: dict[str, str] = {}
+            mapped_pins: set[str] = set()
+            for key, value in self.facts.items():
+                category, _, name = key.partition(".")
+                field_name = {
+                    "цель": "goal",
+                    "ограничения": "constraints",
+                    "предпочтения": "constraints",
+                    "решения": "decisions",
+                    "договорённости": "decisions",
+                }.get(category)
+                if field_name is None or not name:
+                    continue
+                suffix = name
+                if category == "предпочтения":
+                    suffix = f"legacy_preference.{name}"
+                elif category == "договорённости":
+                    suffix = f"legacy_agreement.{name}"
+                canonical = f"{field_name}.{suffix}"
+                mapped[canonical] = value
+                if key in self.facts_pinned:
+                    mapped_pins.add(canonical)
+            working = StructuredMemory(mapped, frozenset(mapped_pins))
+            migrated = bool(mapped) or "facts" in self.session.state
+
+        upto = working_result.upto if working_result else 0
+        if working_result is not None and not working_result.exists:
+            # The Day 10 facts cursor is the only legacy coverage boundary.
+            # Carry it into the new per-session working-memory file, but never
+            # trust a malformed value to trigger a paid catch-up over history.
+            legacy_upto = self.session.state.get("facts_upto", 0)
+            valid_legacy = (
+                isinstance(legacy_upto, int)
+                and not isinstance(legacy_upto, bool)
+                and 0 <= legacy_upto <= len(self.session.turns)
+            )
+            if valid_legacy:
+                upto = legacy_upto
+            elif "facts_upto" in self.session.state:
+                upto = len(self.session.turns)
+                console.warn(
+                    f"в сессии {self.session.name} негодный facts_upto={legacy_upto!r} — "
+                    f"legacy cursor перенесён как {upto}; пересобрать заново: /memory backfill"
+                )
+        if (
+            not isinstance(upto, int)
+            or isinstance(upto, bool)
+            or not 0 <= upto <= len(self.session.turns)
+        ):
+            console.warn(
+                f"в memory working {self.session.name} негодный cursor {upto!r} — "
+                f"считаем покрытым {len(self.session.turns)} сообщений; backfill — явно"
+            )
+            upto = len(self.session.turns)
+        self.memory = MemorySnapshot(
+            ShortTermMemory(tuple(self.history), 0, len(self.session.turns)),
+            working,
+            long_result.value,
+        )
+        self.memory_upto = upto
+        if migrated:
+            self.memory_dirty_working = True
+            self._save_memory()
+
+    def _save_memory(self) -> None:
+        """Persist dirty structured layers independently; failed layers stay dirty."""
+        if self.memory_dirty_long_term:
+            try:
+                self.memory_store.save_long_term(self.memory.long_term)
+                self.memory_dirty_long_term = False
+            except OSError as error:
+                console.warn(f"long-term memory не сохранена ({error})")
+        if self.memory_dirty_working:
+            try:
+                self.memory_store.save_working(
+                    self.session.name, self.memory.working, self.memory_upto
+                )
+                self.memory_dirty_working = False
+            except OSError as error:
+                console.warn(f"working memory не сохранена ({error})")
+
+    def _mark_memory_update(self, update: MemoryUpdate) -> None:
+        old_upto = self.memory_upto
+        self.memory = update.snapshot
+        self.memory_upto = update.memory_upto
+        layers = {layer for layer, _op in update.applied}
+        # A successful extractor call advances the working cursor even when
+        # it produced only long-term changes (or an empty delta).  The cursor
+        # is persisted in the working file, so that file is dirty on cursor
+        # movement as well as on a working operation.
+        self.memory_dirty_working |= "working" in layers or self.memory_upto != old_upto
+        self.memory_dirty_long_term |= "long_term" in layers
+
+    def _mark_memory_failure(self, failure: MemoryFailure) -> None:
+        self.memory_failures += 1
+        usage = getattr(failure.call_result, "usage", None)
+        if usage is not None:
+            self.memory_prompt_tokens += usage.prompt_tokens or 0
+            self.memory_completion_tokens += usage.completion_tokens or 0
 
     def warn_model_drift(self) -> None:
         self._warn_drift(self.session)
@@ -706,6 +871,15 @@ def _facts_prompt() -> str | None:
         return None
 
 
+def _memory_prompt() -> str | None:
+    path = DEFAULT_SYSTEM_PROMPT.parent / "memory.md"
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError as error:
+        console.warn(f"промпт memory extractor не прочитался ({error}) — routing выключен")
+        return None
+
+
 def _warn_text(text: str | None) -> None:
     if text:
         console.warn(text)
@@ -744,6 +918,11 @@ def _turn(shell: AgentShell, question: str) -> None:
     if reply.facts is not None:
         shell.facts = reply.facts
         shell.facts_upto = reply.facts_upto
+    if reply.memory is not None:
+        shell.memory = reply.memory
+        shell.memory_upto = reply.memory_upto
+        if reply.memory_update is not None:
+            shell._mark_memory_update(reply.memory_update)
     _remember(shell, question, reply)
     # Панель — ПОСЛЕ обновления истории и записи хода, иначе оба её числа
     # отстают на ход: «сессия» не считала бы только что полученный usage, а
@@ -767,6 +946,9 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             facts=shell.facts,
             facts_pinned=shell.facts_pinned,
             facts_upto=shell.facts_upto,
+            memory=shell._memory_snapshot(),
+            memory_upto=shell.memory_upto,
+            memory_history=shell.session.history(),
             on_chunk=console.write_chunk if streaming else None,
         )
     except AdventError as error:
@@ -776,6 +958,8 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
         _salvage_compaction(shell)
         _salvage_facts(shell, facts_before)
         _salvage_facts_failure(shell)
+        _salvage_memory(shell)
+        _salvage_memory_failure(shell)
         # Ошибка печатается и НЕ убивает сессию — как в REPL недели 01.
         console.fail(error)
         # messages реального запроса построил и потерял упавший вызов;
@@ -822,6 +1006,10 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
         # Paid but unusable (truncated/invalid delta) — Agent already warned
         # WHY aloud; this only accounts for the cost (review finding #5).
         _report_facts_failure(shell, reply.facts_failed)
+    if reply.memory_update is not None:
+        _report_memory_update(shell, reply.memory_update)
+    if reply.memory_failed is not None:
+        _report_memory_failure(shell, reply.memory_failed)
     if reply.compaction is not None:
         # BEFORE the trim warning: compaction happens earlier, and the
         # on-screen order should match reality — otherwise it reads as if
@@ -946,6 +1134,70 @@ def _salvage_facts_failure(shell: AgentShell) -> None:
     _report_facts_failure(shell, failure)
 
 
+def _salvage_memory(shell: AgentShell) -> None:
+    update = shell.agent.take_pending_memory()
+    if update is None:
+        return
+    persisted_turns = len(shell.session.turns)
+    _mark = shell._mark_memory_update
+    _mark(update)
+    # The extractor includes the failed turn's user message in its own
+    # coordinate space. That message was never recorded, so it must not be
+    # persisted as covered by working memory.
+    shell.memory_upto = min(shell.memory_upto, persisted_turns)
+    _report_memory_update(shell, update)
+    shell._save_memory()
+
+
+def _salvage_memory_failure(shell: AgentShell) -> None:
+    failure = shell.agent.take_pending_memory_failed()
+    if failure is None:
+        return
+    _report_memory_failure(shell, failure)
+
+
+def _report_memory_update(shell: AgentShell, update: MemoryUpdate) -> None:
+    usage = getattr(update.call_result, "usage", None)
+    shell.memory_calls += 1
+    if usage is not None:
+        shell.memory_prompt_tokens += usage.prompt_tokens or 0
+        shell.memory_completion_tokens += usage.completion_tokens or 0
+    note = render_delta(update)
+    if note:
+        console.note(note)
+    for layer, _operation, _reason in update.blocked:
+        console.note(f"memory: {layer} — pinned value сохранено")
+    log_call(
+        update.call_result,
+        getattr(update.call_result, "sent_messages", None) or [],
+        week=3,
+        day=11,
+        extra={
+            "kind": "memory",
+            "covered": update.memory_upto,
+            "applied": len(update.applied),
+            "blocked": len(update.blocked),
+            "rejected": len(update.rejected),
+        },
+    )
+
+
+def _report_memory_failure(shell: AgentShell, failure: MemoryFailure) -> None:
+    shell.memory_calls += 1
+    shell.memory_failures += 1
+    usage = getattr(failure.call_result, "usage", None)
+    if usage is not None:
+        shell.memory_prompt_tokens += usage.prompt_tokens or 0
+        shell.memory_completion_tokens += usage.completion_tokens or 0
+    log_call(
+        failure.call_result,
+        getattr(failure.call_result, "sent_messages", None) or [],
+        week=3,
+        day=11,
+        extra={"kind": "memory_failed", "reason": failure.reason},
+    )
+
+
 def _report_facts_failure(
     shell: AgentShell, failure: FactsFailure, *, backfill: bool = False
 ) -> None:
@@ -1030,6 +1282,12 @@ def _remember(shell: AgentShell, question: str, reply: AgentReply) -> None:
         model=shell.config.model,
         usage=None if usage.is_empty() else usage,
     )
+    # Agent's cursor is measured before this exchange is recorded. After a
+    # successful memory update, the working file must cover the full durable
+    # transcript, including both newly recorded messages.
+    if reply.memory_update is not None:
+        shell.memory_upto = len(shell.session.turns)
+        shell.memory_dirty_working = True
     _save_state(shell)
 
 
@@ -1067,6 +1325,10 @@ def _save_state(shell: AgentShell) -> None:
     shell.session.state["facts"] = shell.facts
     shell.session.state["facts_pinned"] = list(shell.facts_pinned)
     shell.session.state["facts_upto"] = shell.facts_upto
+    # Structured Day 11 layers have independent atomic files.  Save them
+    # before the transcript so a successful session write never falsely claims
+    # that a dirty memory layer was persisted.
+    shell._save_memory()
     shell.save()
 
 
@@ -1615,6 +1877,10 @@ def _cmd_again(shell: AgentShell, args: list[str]) -> bool:
 @command("/reset", "очистить рабочий контекст запуска (файл сессии остаётся)")
 def _cmd_reset(shell: AgentShell, args: list[str]) -> bool:
     shell.history = []
+    shell.summary = None
+    # Short-term is the in-process view of history; working/long-term are
+    # durable structured layers and intentionally survive /reset.
+    shell.memory = MemorySnapshot(ShortTermMemory(), shell.memory.working, shell.memory.long_term)
     shell.dialog_turns = 0
     # Счётчик обнулился — сразу и в файл: иначе перезапуск воскресил бы его
     # из протухшего слепка state.
@@ -1706,7 +1972,14 @@ def _cmd_checkpoint(shell: AgentShell, args: list[str]) -> bool:
         return False
     name = args[0]
     _warn_extra_args("/checkpoint", args[1:])
+    if not _flush_memory_for_identity_change(shell):
+        return False
+    _save_state(shell)
     checkpoint = make_checkpoint(shell.session, name, directory=shell.directory)
+    try:
+        shell.memory_store.copy_working(shell.session.name, checkpoint.name)
+    except OSError as error:
+        console.warn(f"working memory checkpoint не скопирована ({error})")
     console.note(f"checkpoint {checkpoint.name}: ходов {len(checkpoint.turns)}")
     return False
 
@@ -1745,6 +2018,9 @@ def _cmd_branch(shell: AgentShell, args: list[str]) -> bool:
         rest = rest[2:]
     _warn_extra_args("/branch", rest)
 
+    if not _flush_memory_for_identity_change(shell):
+        return False
+
     if from_arg is not None:
         cp_name = (
             from_arg
@@ -1780,6 +2056,10 @@ def _cmd_branch(shell: AgentShell, args: list[str]) -> bool:
         )
 
     branch = make_branch(source, name, directory=shell.directory)
+    try:
+        shell.memory_store.copy_working(source.name, branch.name)
+    except OSError as error:
+        console.warn(f"working memory branch не скопирована ({error})")
     console.note(f"ветка {branch.name} создана от {source.name}")
     _switch_session(shell, branch.name, announce_diff=True)
     return False
@@ -1886,6 +2166,7 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
         table.add_row("ветка", branch)
     table.add_row("сжатие истории", _compact_label(shell))
     table.add_row("facts", _facts_label(shell))
+    table.add_row("memory", _memory_label(shell))
     override = shell.config.params.context_limit
     if override is not None:
         # Override обязан быть виден и здесь: «окно 2500» без второго числа
@@ -1963,7 +2244,10 @@ def _facts_tokens(shell: AgentShell) -> int | None:
     """
     if shell.counter is None or not shell.facts:
         return None
-    block = format_facts(shell.facts, shell.facts_pinned)
+    if shell.agent.context_strategy == "memory":
+        block = render_memory(shell._memory_snapshot(), layer="working")
+    else:
+        block = format_facts(shell.facts, shell.facts_pinned)
     if not block:
         return 0
     empty = [{"role": "user", "content": ""}]
@@ -1991,6 +2275,23 @@ def _facts_label(shell: AgentShell) -> str:
             f"{shell.facts_prompt_tokens}/{shell.facts_completion_tokens}"
         )
     return "; ".join(parts)
+
+
+def _memory_label(shell: AgentShell) -> str:
+    if shell.agent.context_strategy != "memory":
+        return f"неприменимо: context_strategy={shell.agent.context_strategy} (не memory)"
+    working_size = len(shell.memory.working.entries)
+    long_size = len(shell.memory.long_term.entries)
+    dirty = (
+        " (есть unsaved layers)"
+        if shell.memory_dirty_working or shell.memory_dirty_long_term
+        else ""
+    )
+    return (
+        f"working {working_size}, long-term {long_size}, short-term {len(shell.history)}; "
+        f"extractor {shell.memory_calls} calls, failed {shell.memory_failures}, "
+        f"cost {shell.memory_prompt_tokens}/{shell.memory_completion_tokens}{dirty}"
+    )
 
 
 def _compact_label(shell: AgentShell) -> str:
@@ -2065,6 +2366,196 @@ def _cmd_summary(shell: AgentShell, args: list[str]) -> bool:
     return False
 
 
+def _memory_layer_name(raw: str) -> str:
+    value = raw.strip().lower()
+    aliases = {
+        "short-term": "short",
+        "short_term": "short",
+        "long-term": "long",
+        "long_term": "long",
+    }
+    return aliases.get(value, value)
+
+
+def _memory_value(shell: AgentShell, layer: str) -> StructuredMemory:
+    if layer == "working":
+        return shell.memory.working
+    if layer == "long":
+        return shell.memory.long_term
+    raise ValueError("memory operations доступна только для working или long")
+
+
+def _replace_memory_layer(shell: AgentShell, layer: str, value: StructuredMemory) -> None:
+    if layer == "working":
+        shell.memory = MemorySnapshot(shell.memory.short_term, value, shell.memory.long_term)
+        shell.memory_dirty_working = True
+    else:
+        shell.memory = MemorySnapshot(shell.memory.short_term, shell.memory.working, value)
+        shell.memory_dirty_long_term = True
+    _save_state(shell)
+
+
+@command(
+    "/memory",
+    "показать или изменить short-term, working и long-term memory",
+    usage="/memory [short|working|long|set|del|pin|unpin|move|backfill|retry]",
+)
+def _cmd_memory(shell: AgentShell, args: list[str]) -> bool:
+    if not args:
+        working_path = shell.memory_store.working_path(shell.session.name)
+        long_term_path = shell.memory_store.long_term_path
+        console.err.print(
+            rich_escape(
+                "memory: short-term "
+                f"{len(shell.history)} messages; "
+                f"working {len(shell.memory.working.entries)} entries "
+                f"({len(shell.memory.working.pinned)} pinned); long-term "
+                f"{len(shell.memory.long_term.entries)} entries "
+                f"({len(shell.memory.long_term.pinned)} pinned); "
+                f"working path: {working_path}; long-term path: {long_term_path}"
+            )
+        )
+        return False
+    sub = _memory_layer_name(args[0])
+    if sub in ("short", "working", "long"):
+        if len(args) > 1:
+            _warn_extra_args(f"/memory {args[0]}", args[1:])
+        if sub == "short":
+            console.err.print(rich_escape(f"short-term: {len(shell.history)} messages"))
+        else:
+            layer = "long_term" if sub == "long" else "working"
+            console.err.print(rich_escape(render_memory(shell._memory_snapshot(), layer=layer)))
+        return False
+    if sub == "retry":
+        shell._save_memory()
+        if not shell.memory_dirty_working and not shell.memory_dirty_long_term:
+            console.note("memory: dirty layers отсутствуют")
+        return False
+    if sub == "backfill":
+        _memory_backfill(shell)
+        return False
+    if sub not in ("set", "del", "pin", "unpin", "move"):
+        console.warn("нужно: /memory [short|working|long|set|del|pin|unpin|move|backfill|retry]")
+        return False
+    try:
+        if sub == "set":
+            if len(args) < 4:
+                raise ValueError("нужно: /memory set working|long <field.key> <value>")
+            layer, key, value = _memory_layer_name(args[1]), args[2], " ".join(args[3:])
+            if layer == "long" and is_credential_like(key, value):
+                raise ValueError("credential-like data нельзя сохранять в long-term")
+            snapshot = manual_set(
+                shell._memory_snapshot(), "long_term" if layer == "long" else layer, key, value
+            )
+            _replace_memory_layer(
+                shell, layer, snapshot.long_term if layer == "long" else snapshot.working
+            )
+        elif sub in ("del", "pin", "unpin"):
+            if len(args) != 3:
+                raise ValueError(f"нужно: /memory {sub} working|long <field.key>")
+            layer, key = _memory_layer_name(args[1]), args[2]
+            target = _memory_value(shell, layer)
+            field_name, name = split_key(key)
+            canonical = validate_memory_key(
+                "long_term" if layer == "long" else "working", field_name, name
+            )
+            entries, pins = dict(target.entries), set(target.pinned)
+            if sub == "del":
+                if canonical not in entries:
+                    raise ValueError(f"memory key {canonical!r} не найден")
+                entries.pop(canonical)
+                pins.discard(canonical)
+            elif canonical not in entries:
+                raise ValueError(f"memory key {canonical!r} не найден")
+            elif sub == "pin":
+                pins.add(canonical)
+            else:
+                pins.discard(canonical)
+            _replace_memory_layer(shell, layer, StructuredMemory(entries, frozenset(pins)))
+        else:  # move
+            if len(args) != 5:
+                raise ValueError(
+                    "нужно: /memory move working|long working|long <source-key> <target-key>"
+                )
+            source_layer, target_layer, source_key, target_key = map(_memory_layer_name, args[1:3])
+            source_key, target_key = args[3], args[4]
+            source = _memory_value(shell, source_layer)
+            source_field, source_name = split_key(source_key)
+            source_canonical = validate_memory_key(
+                "long_term" if source_layer == "long" else "working", source_field, source_name
+            )
+            if source_canonical not in source.entries:
+                raise ValueError(f"memory key {source_canonical!r} не найден")
+            target_field, target_name = split_key(target_key)
+            target_canonical = validate_memory_key(
+                "long_term" if target_layer == "long" else "working", target_field, target_name
+            )
+            value = source.entries[source_canonical]
+            if target_layer == "long" and is_credential_like(target_canonical, value):
+                raise ValueError("credential-like data нельзя сохранять в long-term")
+            src_entries, src_pins = dict(source.entries), set(source.pinned)
+            src_entries.pop(source_canonical)
+            src_pins.discard(source_canonical)
+            dst = _memory_value(shell, target_layer)
+            dst_entries, dst_pins = dict(dst.entries), set(dst.pinned)
+            dst_entries[target_canonical] = value
+            dst_pins.add(target_canonical)
+            if source_layer == target_layer:
+                _replace_memory_layer(
+                    shell,
+                    source_layer,
+                    StructuredMemory(dst_entries | src_entries, frozenset(dst_pins | src_pins)),
+                )
+            else:
+                _replace_memory_layer(
+                    shell, source_layer, StructuredMemory(src_entries, frozenset(src_pins))
+                )
+                _replace_memory_layer(
+                    shell, target_layer, StructuredMemory(dst_entries, frozenset(dst_pins))
+                )
+        console.note(f"memory: {sub} выполнено")
+    except (ValueError, KeyError) as error:
+        console.warn(str(error))
+    return False
+
+
+def _memory_backfill(shell: AgentShell) -> None:
+    history = shell.session.history()
+    if not history:
+        console.note("сессия пуста — memory backfill не нужен")
+        return
+    seed = StructuredMemory(
+        {
+            key: value
+            for key, value in shell.memory.working.entries.items()
+            if key in shell.memory.working.pinned
+        },
+        shell.memory.working.pinned,
+    )
+    snapshot = MemorySnapshot(ShortTermMemory(), seed, shell.memory.long_term)
+    try:
+        _snapshot, _upto, update, failure = shell.agent._run_memory(
+            snapshot, history, "", 0, catchup_max=None
+        )
+    except TypeError:
+        # Compatibility with a test double implementing the older private seam.
+        _snapshot, _upto, update, failure = shell.agent._run_memory(snapshot, history, "", 0)
+    if failure is not None:
+        _report_memory_failure(shell, failure)
+        return
+    if update is None:
+        console.warn("memory backfill не вернул update")
+        return
+    shell.memory = update.snapshot
+    shell.memory_upto = len(history)
+    shell.memory_dirty_working = True
+    shell.memory_dirty_long_term = bool(
+        update.applied and any(layer == "long_term" for layer, _ in update.applied)
+    )
+    _report_memory_update(shell, update)
+    _save_state(shell)
+
+
 def _facts_backfill(shell: AgentShell) -> None:
     """One extractor pass over the WHOLE session (SPEC-w02d10.md §5.6).
 
@@ -2111,18 +2602,30 @@ def _facts_backfill(shell: AgentShell) -> None:
     usage="/facts [backfill]",
 )
 def _cmd_facts(shell: AgentShell, args: list[str]) -> bool:
+    global _FACTS_ALIAS_SHOWN
+    if not _FACTS_ALIAS_SHOWN:
+        console.note("/facts — compatibility alias для /memory working")
+        _FACTS_ALIAS_SHOWN = True
     if args and args[0] == "backfill":
         _warn_extra_args("/facts backfill", args[1:])
         _facts_backfill(shell)
         return False
     _warn_extra_args("/facts", args)
-    block = format_facts(shell.facts, shell.facts_pinned)
-    if not block:
+    blocks: list[str] = []
+    working_block = render_memory(shell._memory_snapshot(), layer="working")
+    if shell.memory.working.entries:
+        blocks.append(working_block)
+    # Keep the legacy block visible for old sessions and scripts while the
+    # alias itself is now backed by working memory for every strategy.
+    legacy_block = format_facts(shell.facts, shell.facts_pinned)
+    if legacy_block:
+        blocks.append(legacy_block)
+    if not blocks:
         console.note("фактов пока нет")
         return False
     # rich_escape: facts values come from the extractor/model, [что-то] would
     # otherwise be eaten by Rich as markup — same reasoning as /summary.
-    console.err.print(rich_escape(block))
+    console.err.print(rich_escape("\n".join(blocks)))
     return False
 
 
@@ -2133,6 +2636,77 @@ def _cmd_facts(shell: AgentShell, args: list[str]) -> bool:
     usage="/fact set|del|unpin <ключ> [значение]",
 )
 def _cmd_fact(shell: AgentShell, args: list[str]) -> bool:
+    # Keep the old surface while routing every edit to session-scoped working
+    # memory. Legacy facts are mirrored for tagged scripts and old sessions;
+    # the canonical target is working memory regardless of strategy.
+    if args:
+        if args and args[0] == "set" and len(args) >= 3:
+            raw_key, value = args[1], " ".join(args[2:])
+            category, _, name = raw_key.partition(".")
+            field_name = {
+                "цель": "goal",
+                "ограничения": "constraints",
+                "предпочтения": "constraints",
+                "решения": "decisions",
+                "договорённости": "decisions",
+            }.get(category)
+            if field_name is None:
+                console.warn(
+                    f"неизвестная категория {category!r}: legacy /fact key должен "
+                    "начинаться с цель., ограничения., решения. или договорённости."
+                )
+                return False
+            suffix = name
+            if category == "предпочтения":
+                suffix = f"legacy_preference.{name}"
+            elif category == "договорённости":
+                suffix = f"legacy_agreement.{name}"
+            try:
+                legacy_key = validate_key(raw_key)
+            except ValueError as error:
+                console.warn(str(error))
+                return False
+            before = dict(shell.facts)
+            shell.facts[legacy_key] = value
+            if legacy_key not in shell.facts_pinned:
+                shell.facts_pinned.append(legacy_key)
+            note = render_note(before, shell.facts)
+            if note:
+                console.note(f"{note} (закреплено)")
+            return _cmd_memory(shell, ["set", "working", f"{field_name}.{suffix}", value])
+        if args and args[0] in ("del", "unpin") and len(args) >= 2:
+            raw_key = args[1]
+            category, _, name = raw_key.partition(".")
+            field_name = {
+                "цель": "goal",
+                "ограничения": "constraints",
+                "предпочтения": "constraints",
+                "решения": "decisions",
+                "договорённости": "decisions",
+            }.get(category)
+            if field_name is not None:
+                if category == "предпочтения":
+                    name = f"legacy_preference.{name}"
+                elif category == "договорённости":
+                    name = f"legacy_agreement.{name}"
+                try:
+                    legacy_key = validate_key(raw_key)
+                except ValueError as error:
+                    console.warn(str(error))
+                    return False
+                if legacy_key not in shell.facts:
+                    if args[0] == "unpin":
+                        console.warn(f"{legacy_key!r} не был закреплён")
+                        return False
+                    console.warn(f"ключ {legacy_key!r} не найден")
+                    return False
+                if args[0] == "del":
+                    shell.facts.pop(legacy_key, None)
+                    if legacy_key in shell.facts_pinned:
+                        shell.facts_pinned.remove(legacy_key)
+                elif legacy_key in shell.facts_pinned:
+                    shell.facts_pinned.remove(legacy_key)
+                return _cmd_memory(shell, [args[0], "working", f"{field_name}.{name}"])
     if not args:
         console.warn("нужно: /fact set|del|unpin <ключ> ...")
         return False
@@ -2311,6 +2885,22 @@ def _switch_settings_note(
     return f"{kind} {target}: " + ", ".join(diffs)
 
 
+def _flush_memory_for_identity_change(shell: AgentShell) -> bool:
+    """Persist all dirty memory before changing the session identity.
+
+    A failed working save must never be hidden by loading another session, and
+    the same is true for the process-global long-term layer: reloading it from
+    disk would silently discard a dirty in-memory value.
+    """
+    if not (shell.memory_dirty_working or shell.memory_dirty_long_term):
+        return True
+    shell._save_memory()
+    if shell.memory_dirty_working or shell.memory_dirty_long_term:
+        console.warn("memory не сохранена — смена session отменена")
+        return False
+    return True
+
+
 def _switch_session(
     shell: AgentShell, name: str, *, fresh: bool = False, announce_diff: bool = False
 ) -> None:
@@ -2334,6 +2924,8 @@ def _switch_session(
         # branch before this function ran — undo it so /params doesn't claim
         # a session that was never actually entered.
         shell.config.params.session = shell.session.name
+        return
+    if not _flush_memory_for_identity_change(shell):
         return
     before = (
         (shell.agent.context_strategy, shell.config.params.context_limit, shell.agent.mode)
@@ -2364,6 +2956,21 @@ def _switch_session(
     # Это состояние ТОГО разговора: применяем оптом, explicit-флаги не чекая —
     # они были про старт запуска, а переключение = «продолжить как оставили».
     resumed_dialog = shell._apply_session_state(session, check_explicit=False)
+    # A fresh session must not load the old session-scoped working file: its
+    # cursor necessarily refers to the conversation that `/new` is clearing.
+    # Loading it first would emit a false stale-cursor warning and, more
+    # importantly, leave the old entries on disk until a later memory update.
+    shell._load_memory(load_working=not fresh)
+    if fresh:
+        # `/new` resets session-scoped working memory but leaves global
+        # long-term memory intact.
+        shell.memory = MemorySnapshot(ShortTermMemory(), StructuredMemory(), shell.memory.long_term)
+        shell.memory_upto = 0
+        shell.memory_dirty_working = True
+        # Persist the lifecycle boundary now.  If the write fails,
+        # `_save_memory` deliberately keeps the dirty flag for `/memory retry`;
+        # silently leaving the old file would resurrect memory after restart.
+        shell._save_memory()
     # state подхвачен — и лимит пересчитываем: у сессии, на которую переключились,
     # override в файле может отличаться от текущего (или отсутствовать), а trim
     # со следующего хода идёт по тому, что в агенте.

@@ -27,7 +27,7 @@ STRATEGY_CHOICES = (*STRATEGIES, "all")
 # Context-assembly strategies of week 02 day 10 (SPEC-w02d10.md §3). One axis,
 # four values — "window+facts both on" would mean nothing (facts already
 # implies "facts + last N"), so this is a choice, not a set of flags.
-CONTEXT_STRATEGY_CHOICES = ("window", "facts", "branch", "summary")
+CONTEXT_STRATEGY_CHOICES = ("window", "facts", "branch", "summary", "memory")
 
 # Команды CLI, у которых есть собственные значения по умолчанию (Spec.defaults).
 CHAT_COMMAND = "chat"
@@ -70,6 +70,9 @@ AGENT_PARAMS: tuple[str, ...] = (
     # the size cap on the facts block the "facts" strategy maintains.
     "context_strategy",
     "facts_max_tokens",
+    "working_max_tokens",
+    "long_term_max_tokens",
+    "memory_max_tokens",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -226,8 +229,7 @@ SPECS: tuple[Spec, ...] = (
     Spec(
         "context_strategy",
         "choice",
-        "Стратегия сборки контекста: window (окно) / facts (память фактов) / "
-        "branch (вся история ветки) / summary (пересказ, как в дне 09).",
+        "Стратегия сборки контекста: window / facts / branch / summary / memory.",
         choices=CONTEXT_STRATEGY_CHOICES,
         local=True,
         defaults={AGENT_COMMAND: "summary"},
@@ -243,6 +245,33 @@ SPECS: tuple[Spec, ...] = (
         None,
         local=True,
         defaults={AGENT_COMMAND: 400},
+    ),
+    Spec(
+        "working_max_tokens",
+        "int",
+        "Мягкий local cap working memory в токенах.",
+        1,
+        None,
+        local=True,
+        defaults={AGENT_COMMAND: 400},
+    ),
+    Spec(
+        "long_term_max_tokens",
+        "int",
+        "Мягкий local cap long-term memory в токенах.",
+        1,
+        None,
+        local=True,
+        defaults={AGENT_COMMAND: 300},
+    ),
+    Spec(
+        "memory_max_tokens",
+        "int",
+        "Потолок ответа memory extractor в токенах.",
+        1,
+        None,
+        local=True,
+        defaults={AGENT_COMMAND: 1200},
     ),
     Spec(
         "session",
@@ -477,6 +506,12 @@ class GenerationParams:
     # compact/keep_last/compact_every above.
     context_strategy: str | None = None
     facts_max_tokens: int | None = None
+
+    # Day 11 explicit memory strategy. All are local: structured blocks and
+    # extractor budget are assembled client-side and never sent as API params.
+    working_max_tokens: int | None = None
+    long_term_max_tokens: int | None = None
+    memory_max_tokens: int | None = None
 
     # Параметр агента (день 06): имя сессии на диске. Тоже локальный — в
     # payload не идёт, но живёт в общем реестре, потому что `/set session

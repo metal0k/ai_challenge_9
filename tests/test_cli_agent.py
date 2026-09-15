@@ -22,6 +22,7 @@ from advent_core import console
 from advent_core.agent import INTERRUPT_NOTE
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError
+from advent_core.memory import MemoryStore, StructuredMemory
 from advent_core.params import AGENT_COMMAND, defaults_for
 from advent_core.session import Session
 from advent_core.telemetry import CallResult, Usage
@@ -530,6 +531,9 @@ def test_defaults_come_from_the_registry_not_from_the_typer_signature():
         # compact stays as a CLI-level alias onto it (see week_02/cli.py).
         "context_strategy": "summary",
         "facts_max_tokens": 400,
+        "working_max_tokens": 400,
+        "long_term_max_tokens": 300,
+        "memory_max_tokens": 1200,
     }
 
     signature = inspect.signature(cli.agent)
@@ -742,6 +746,51 @@ def test_reset_clears_the_working_context_but_keeps_the_session_file(monkeypatch
 
     assert shell.history == []
     assert Session.load("default", directory=tmp_path).turns  # файл на месте
+
+
+def test_new_persists_empty_working_memory_and_zero_cursor(monkeypatch, tmp_path, capsys):
+    """`/new` clears session-scoped memory on disk, not only in the shell."""
+    shell = _shell(monkeypatch, tmp_path)
+    shell.memory_store.save_working("default", StructuredMemory({"goal.primary": "old"}), upto=4)
+    capsys.readouterr()
+
+    cli._dispatch("/new", shell)
+
+    loaded = MemoryStore(tmp_path).load_working("default", turns_count=0)
+    assert loaded.value == StructuredMemory()
+    assert loaded.upto == 0
+    assert "invalid upto" not in _flat(capsys.readouterr().err)
+
+    restarted = _shell(monkeypatch, tmp_path)
+    assert restarted.memory.working == StructuredMemory()
+    assert restarted.memory_upto == 0
+
+
+def test_new_keeps_dirty_working_memory_for_retry_when_clear_write_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """A failed clear must not be hidden or lose the retryable dirty state."""
+    shell = _shell(monkeypatch, tmp_path)
+    shell.memory_store.save_working("default", StructuredMemory({"goal.primary": "old"}), upto=4)
+    original = MemoryStore.save_working
+
+    def fail_working(*args, **kwargs):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(MemoryStore, "save_working", fail_working)
+    cli._dispatch("/new", shell)
+
+    assert shell.memory_dirty_working is True
+    assert MemoryStore(tmp_path).load_working("default", turns_count=0).value.entries
+    assert "working memory не сохранена" in _flat(capsys.readouterr().err)
+
+    monkeypatch.setattr(MemoryStore, "save_working", original)
+    cli._dispatch("/memory retry", shell)
+
+    loaded = MemoryStore(tmp_path).load_working("default", turns_count=0)
+    assert shell.memory_dirty_working is False
+    assert loaded.value == StructuredMemory()
+    assert loaded.upto == 0
 
 
 def test_new_starts_an_empty_session_and_keeps_topics_apart(monkeypatch, tmp_path, capsys):

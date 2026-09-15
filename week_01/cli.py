@@ -104,6 +104,9 @@ NON_CHAT_PARAMS = {
     # Week 01 assembles nothing of the sort, so the same rule as above.
     "context_strategy": "adventagent (неделя 02)",
     "facts_max_tokens": "adventagent (неделя 02)",
+    "working_max_tokens": "adventagent (неделя 03)",
+    "long_term_max_tokens": "adventagent (неделя 03)",
+    "memory_max_tokens": "adventagent (неделя 03)",
 }
 
 REPL_COMMANDS = [

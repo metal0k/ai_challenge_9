@@ -2,7 +2,7 @@
 
 echo_input появилось в день 08: гигантский ввод (~700 КБ одной строкой) при
 полном эхе прокручивал терминал на тысячи строк — в кадре важен факт
-огромности ввода, а не его текст (SPEC-w02d08.md §7, шаг 4б).
+огромного ввода, а не его текст (SPEC-w02d08.md §7, шаг 4б).
 """
 
 from advent_core import console
@@ -15,19 +15,12 @@ def test_echo_short_passes_through(capsys):
 
 
 def test_echo_long_is_truncated_with_length(capsys):
-    # Литерал 200, а не console.ECHO_LIMIT: ожидание, построенное из той же
-    # константы, что и код, не покраснеет при случайном изменении порога
-    # (правило проекта — тест не должен брать эталон из источника под тестом).
     assert console.ECHO_LIMIT == 200
     text = "а" * (console.ECHO_LIMIT + 500)
     console.echo_input(text)
-    # rich переносит длинную строку по ширине консоли — сравниваем без \n:
-    # перенос дисплея не часть содержимого.
     out = capsys.readouterr().err.replace("\n", "")
-    # Обрезанный кусок, многоточие и полная длина ввода — «неизвестно»
-    # не становится молчанием даже в эхе.
     assert out == f"{'а' * console.ECHO_LIMIT}… (всего {len(text)} символов)"
-    assert len(text) > console.ECHO_LIMIT  # сам тест не на коротком вводе
+    assert len(text) > console.ECHO_LIMIT
 
 
 def _plain(text: str) -> str:
@@ -38,9 +31,6 @@ def _plain(text: str) -> str:
 
 
 def test_footer_partial_usage_puts_estimate_in_the_middle(capsys):
-    # {"total_tokens": N} без completion — форма usage от локальных серверов
-    # (SPEC-w02d08.md §6): completion_estimate должен встать в среднюю позицию
-    # тройки, а не печататься отдельной строкой.
     result = CallResult(
         text="ok",
         model_requested="m",
@@ -54,9 +44,6 @@ def test_footer_partial_usage_puts_estimate_in_the_middle(capsys):
 
 
 def test_footer_partial_usage_without_estimate_is_a_dash(capsys):
-    # Usage(total_tokens=51) без prompt/completion — раньше здесь печаталось
-    # буквальное "tokens None/None/51"; правило проекта — «неизвестно» это
-    # прочерк, а не выдуманное значение и не слово None.
     result = CallResult(
         text="ok",
         model_requested="m",
@@ -68,3 +55,17 @@ def test_footer_partial_usage_without_estimate_is_a_dash(capsys):
     err = _plain(capsys.readouterr().err)
     assert "tokens —/—/51" in err
     assert "None" not in err
+
+
+def test_record_console_kwargs_are_empty_by_default(monkeypatch):
+    monkeypatch.delenv("ADVENT_RECORD_COLOR", raising=False)
+    assert console._record_console_kwargs() == {}
+
+
+def test_record_console_kwargs_force_rich_colour(monkeypatch):
+    monkeypatch.setenv("ADVENT_RECORD_COLOR", "1")
+    assert console._record_console_kwargs() == {
+        "force_terminal": True,
+        "color_system": "standard",
+        "legacy_windows": False,
+    }

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from contextlib import suppress
 
@@ -51,8 +52,26 @@ def force_utf8() -> None:
                 reconfigure(encoding="utf-8", errors="replace")
 
 
-out = Console(soft_wrap=True)
-err = Console(stderr=True)
+def _record_console_kwargs() -> dict[str, object]:
+    """Return the explicit Rich settings needed by the Windows video take.
+
+    Windows Terminal can expose an inherited pipe to a child process, which
+    makes Rich decide that colour is unavailable even though OBS captures the
+    rendered terminal window.  Keep the normal auto-detection untouched and
+    opt in only for the recording subprocess.
+    """
+    if os.environ.get("ADVENT_RECORD_COLOR") != "1":
+        return {}
+    return {
+        "force_terminal": True,
+        "color_system": "standard",
+        "legacy_windows": False,
+    }
+
+
+_record_color_kwargs = _record_console_kwargs()
+out = Console(soft_wrap=True, **_record_color_kwargs)
+err = Console(stderr=True, **_record_color_kwargs)
 
 
 def clear_screen() -> None:

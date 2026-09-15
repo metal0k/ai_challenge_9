@@ -38,6 +38,19 @@ from advent_core.compact import (
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError
 from advent_core.facts import DeltaResult, apply_delta, facts_messages, format_facts
+from advent_core.memory import (
+    MemoryDelta,
+    MemoryFailure,
+    MemoryOperation,
+    MemorySnapshot,
+    MemoryUpdate,
+    ShortTermMemory,
+    StructuredMemory,
+    memory_messages,
+)
+from advent_core.memory import (
+    apply_delta as apply_memory_delta,
+)
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCounter, reconcile
 
@@ -91,6 +104,13 @@ DEFAULT_FACTS_MAX_TOKENS = 400
 # large delta.
 FACTS_RESPONSE_TOKENS = 900
 
+# Day 11 memory extractor and request block caps. These are local settings;
+# they must never leak into the Mistral payload.
+MEMORY_RESPONSE_TOKENS = 1200
+MEMORY_CATCHUP_MAX = 20
+DEFAULT_WORKING_MAX_TOKENS = 400
+DEFAULT_LONG_TERM_MAX_TOKENS = 300
+
 # Catch-up bound (SPEC-w02d10.md §5.3): past this many not-yet-extracted
 # messages, the extractor sees only the tail and the truncation is spoken
 # aloud — a silent cut here is exactly the loss this cursor exists to prevent.
@@ -101,6 +121,7 @@ FACTS_CATCHUP_MAX = 20
 # structural contract the extractor call always uses, day 10's PROBE picked
 # the pairs-array shape specifically for this file (PROBE-w02d10-facts.md).
 FACTS_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "facts_delta.json"
+MEMORY_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "memory_delta.json"
 
 # Пометка об обрыве, дописываемая к сохранённой части ответа. Приём взят у
 # gptme (INTERRUPT_CONTENT): следующий ход модели должен видеть, что её
@@ -181,6 +202,14 @@ class FactsFailure:
 
 
 @dataclass(slots=True, frozen=True)
+class MemoryFailureResult:
+    """Paid memory extractor call that did not produce an applicable delta."""
+
+    result: CallResult
+    reason: str
+
+
+@dataclass(slots=True, frozen=True)
 class AgentReply:
     """Результат одного хода агента.
 
@@ -238,6 +267,12 @@ class AgentReply:
     # safety net underneath ALL FOUR strategies, this is the strategy's own,
     # deliberate forgetting.
     window_dropped: int = 0
+    # Day 11 explicit memory strategy. Safe defaults keep all older callers
+    # compatible and leave these fields empty outside context_strategy=memory.
+    memory: MemorySnapshot | None = None
+    memory_upto: int = 0
+    memory_update: MemoryUpdate | None = None
+    memory_failed: MemoryFailure | None = None
 
 
 def marker_instruction(kind: str, needle: str) -> str:
@@ -348,6 +383,7 @@ class Agent:
         dialog_preset: str | None = None,
         summary_prompt: str | None = None,
         facts_prompt: str | None = None,
+        memory_prompt: str | None = None,
         on_warning: Callable[[str], None] | None = None,
     ) -> None:
         self.config = config
@@ -382,6 +418,7 @@ class Agent:
         # deployment). None — strategy="facts" degrades to a plain window
         # with a warning, same shape as summary_prompt above.
         self.facts_prompt = facts_prompt
+        self.memory_prompt = memory_prompt
         # A compaction that has been paid for but whose turn hasn't finished
         # yet. ask() parks it here so a failing model call can't take it down
         # with it — see the comment at the assignment.
@@ -391,6 +428,8 @@ class Agent:
         # A paid extractor call that produced nothing usable — same parking
         # reasoning, so it still gets billed even if the turn then fails.
         self.pending_facts_failed: FactsFailure | None = None
+        self.pending_memory: MemoryUpdate | None = None
+        self.pending_memory_failed: MemoryFailure | None = None
         self._on_warning = on_warning
         # Одинаковые предупреждения не повторяются каждый ход: в разговоре на
         # двадцать реплик «лимит окна неизвестен» двадцать раз — это шум, в
@@ -639,6 +678,21 @@ class Agent:
         """Soft cap on the facts block, in tokens. None — default."""
         value = self.config.params.facts_max_tokens
         return DEFAULT_FACTS_MAX_TOKENS if value is None else value
+
+    @property
+    def working_max_tokens(self) -> int:
+        value = self.config.params.working_max_tokens
+        return DEFAULT_WORKING_MAX_TOKENS if value is None else value
+
+    @property
+    def long_term_max_tokens(self) -> int:
+        value = self.config.params.long_term_max_tokens
+        return DEFAULT_LONG_TERM_MAX_TOKENS if value is None else value
+
+    @property
+    def memory_max_tokens(self) -> int:
+        value = self.config.params.memory_max_tokens
+        return MEMORY_RESPONSE_TOKENS if value is None else value
 
     def _count_request(
         self,
@@ -997,6 +1051,213 @@ class Agent:
         self.pending_facts_failed = None
         return pending
 
+    def _memory_call(
+        self,
+        snapshot: MemorySnapshot,
+        segment: Sequence[Message],
+    ) -> CallResult | None:
+        """Run the side extractor with an isolated, deterministic config."""
+        if not self.memory_prompt:
+            self._warn(
+                "стратегия memory включена, но промпт экстрактора не задан — memory не обновляется",
+                once=True,
+            )
+            return None
+        blocks = memory_messages(snapshot)
+        body = [
+            "Текущая working/long-term memory:",
+            *(m["content"] for m in blocks if m.get("role") == "user"),
+            "Новые сообщения для routing:",
+        ]
+        body.extend(f"{m['role']}: {m['content']}" for m in segment)
+        params = replace(
+            self.config.params,
+            max_tokens=self.memory_max_tokens,
+            format="schema",
+            schema_file=str(MEMORY_SCHEMA_PATH),
+            stop=None,
+            temperature=0,
+        )
+        try:
+            return self._complete(
+                replace(self.config, params=params),
+                [
+                    {"role": "system", "content": self.memory_prompt},
+                    {"role": "user", "content": "\n\n".join(body)},
+                ],
+                self.capabilities,
+            )
+        except AdventError as error:
+            self._warn(f"извлечение memory не удалось ({error.message}) — memory прежняя")
+            # The request reached the provider but did not produce a response.
+            # Keep a result-shaped paid-call seam so the CLI can account and
+            # journal it just like invalid/truncated extractor output.
+            return CallResult(
+                model_requested=self.config.model,
+                finish_reason="error",
+            )
+
+    def _memory_head_parts(
+        self, snapshot: MemorySnapshot, summary: str | None
+    ) -> dict[str, int | None]:
+        """Return marginal token costs for protected memory layers.
+
+        A memory block is measured as a real pseudo-pair, with request-level
+        chat-template overhead removed by ``_probe_tokens``.  ``None`` means
+        the configured counter cannot measure this request.
+        """
+        parts: dict[str, int | None] = {}
+        for name, value in (
+            ("long-term", snapshot.long_term),
+            ("working", snapshot.working),
+        ):
+            block = memory_messages(MemorySnapshot(ShortTermMemory(), value, StructuredMemory()))
+            parts[name] = self._probe_tokens(block) if block else 0
+        summary_messages = memory_messages(MemorySnapshot(), summary=summary)
+        parts["summary"] = self._probe_tokens(summary_messages) if summary else 0
+        return parts
+
+    def _check_memory_head(
+        self,
+        snapshot: MemorySnapshot,
+        summary: str | None,
+        system: str | None,
+        user_input: str,
+    ) -> None:
+        """Warn on soft layer caps and fail before a main request can overflow.
+
+        Structured layers are protected: the generic history trim may remove
+        only raw short-term messages.  If the protected head plus system and
+        current input cannot fit in the context budget, sending it anyway
+        would turn a deterministic local condition into a paid 400.
+        """
+        parts = self._memory_head_parts(snapshot, summary)
+        for name, limit in (
+            ("working", self.working_max_tokens),
+            ("long-term", self.long_term_max_tokens),
+        ):
+            size = parts[name]
+            if size is not None and size > limit:
+                self._warn(
+                    f"{name} memory превышает local cap {limit} токенов ({size}); "
+                    "значения не удаляются автоматически"
+                )
+
+        budget = self._token_budget()
+        if self.counter is None or budget is None:
+            return
+        head = memory_messages(
+            MemorySnapshot(ShortTermMemory(), snapshot.working, snapshot.long_term),
+            summary=summary,
+        )
+        request = chat_core.build_messages(user_input, system=system, history=head)
+        tokens = self.counter.count(request)
+        if tokens is None or tokens <= budget:
+            return
+        breakdown = ", ".join(
+            f"{name}={value if value is not None else '—'}" for name, value in parts.items()
+        )
+        raise AdventError(
+            "защищённая часть memory не помещается в context window: "
+            f"{breakdown}, request={tokens}, budget={budget}"
+        )
+
+    @staticmethod
+    def _memory_delta(raw: object) -> MemoryDelta:
+        if not isinstance(raw, dict) or set(raw) != {"working", "long_term"}:
+            raise ValueError("memory delta должен содержать только working и long_term")
+        sections: dict[str, tuple[MemoryOperation, ...]] = {}
+        for destination in ("working", "long_term"):
+            section = raw.get(destination)
+            if not isinstance(section, dict) or set(section) != {"set", "delete"}:
+                raise ValueError(f"секция {destination} должна содержать set и delete")
+            operations: list[MemoryOperation] = []
+            for item in section["set"]:
+                if not isinstance(item, dict) or set(item) != {"field", "key", "value", "evidence"}:
+                    raise ValueError("memory set operation имеет неверную форму")
+                operations.append(
+                    MemoryOperation(
+                        "set", item["field"], item["key"], item["value"], item["evidence"]
+                    )
+                )
+            for item in section["delete"]:
+                if not isinstance(item, dict) or set(item) != {"field", "key", "evidence"}:
+                    raise ValueError("memory delete operation имеет неверную форму")
+                operations.append(
+                    MemoryOperation("delete", item["field"], item["key"], None, item["evidence"])
+                )
+            sections[destination] = tuple(operations)
+        return MemoryDelta(working=sections["working"], long_term=sections["long_term"])
+
+    def _run_memory(
+        self,
+        snapshot: MemorySnapshot,
+        history: Sequence[Message],
+        user_input: str,
+        memory_upto: int,
+        *,
+        catchup_max: int | None = MEMORY_CATCHUP_MAX,
+    ) -> tuple[MemorySnapshot, int, MemoryUpdate | None, MemoryFailure | None]:
+        upto = max(0, min(memory_upto, len(history)))
+        segment: list[Message] = [*history[upto:], {"role": "user", "content": user_input}]
+        if catchup_max is not None and len(segment) > catchup_max:
+            segment = segment[-catchup_max:]
+            self._warn(
+                f"извлечение memory отстало больше чем на {catchup_max} сообщений — "
+                "берётся только хвост"
+            )
+        # The extractor needs structured layers plus the uncovered segment;
+        # passing the runtime short-term view here duplicated every covered
+        # message in its prompt and defeated ``memory_upto``.
+        structured = MemorySnapshot(ShortTermMemory(), snapshot.working, snapshot.long_term)
+        result = self._memory_call(structured, segment)
+        if result is None:
+            return snapshot, upto, None, None
+        try:
+            if result.finish_reason == "error":
+                raise ValueError("memory extractor request failed")
+            raw = json.loads(result.text or "")
+            delta = self._memory_delta(raw)
+            update = apply_memory_delta(
+                snapshot,
+                delta,
+                user_messages=tuple(segment),
+                memory_upto=len(history),
+                call_result=result,
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            reason = (
+                "request_failed"
+                if result.finish_reason == "error"
+                else (
+                    "truncated"
+                    if result.finish_reason == "length" or result.truncated
+                    else "invalid"
+                )
+            )
+            failure = MemoryFailure(result, reason, str(error))
+            self.pending_memory_failed = failure
+            if reason != "request_failed":
+                self._warn(
+                    f"извлечение memory вернуло невалидную дельту ({error}) — memory прежняя"
+                )
+            return snapshot, upto, None, failure
+        self.pending_memory = update
+        # The extractor saw a virtual new user message, but it is not persisted
+        # yet.  Keep pending update's cursor inside the current transcript;
+        # ask() promotes it after the main call succeeds.
+        return update.snapshot, len(history), update, None
+
+    def take_pending_memory(self) -> MemoryUpdate | None:
+        pending = self.pending_memory
+        self.pending_memory = None
+        return pending
+
+    def take_pending_memory_failed(self) -> MemoryFailure | None:
+        pending = self.pending_memory_failed
+        self.pending_memory_failed = None
+        return pending
+
     # --- сам ход -----------------------------------------------------------
 
     def ask(
@@ -1008,6 +1269,9 @@ class Agent:
         facts: dict[str, str] | None = None,
         facts_pinned: Iterable[str] = (),
         facts_upto: int = 0,
+        memory: MemorySnapshot | None = None,
+        memory_upto: int = 0,
+        memory_history: Sequence[Message] | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> AgentReply:
         """Один ход: собрать, обрезать, спросить, разобрать.
@@ -1032,6 +1296,10 @@ class Agent:
         facts_now = dict(facts) if facts else {}
         facts_update: FactsUpdate | None = None
         facts_upto_now = facts_upto
+        memory_now = memory or MemorySnapshot()
+        memory_update: MemoryUpdate | None = None
+        memory_failed: MemoryFailure | None = None
+        memory_upto_now = memory_upto
         window_dropped = 0
         working: list[Message] = list(history)
         head: list[Message] = []
@@ -1109,6 +1377,30 @@ class Agent:
                 facts_upto_now = max(0, upto_after - cut)
             head = facts_messages(facts_now, facts_pinned)
 
+        elif strategy == "memory":
+            # Fail locally before paying for an extractor when the current
+            # protected head already cannot fit.  A second check below covers
+            # a delta that grows either structured layer.
+            self._check_memory_head(
+                memory_now,
+                summary_now,
+                system,
+                user_input,
+            )
+            memory_now, memory_upto_now, memory_update, memory_failed = self._run_memory(
+                memory_now,
+                memory_history if memory_history is not None else working,
+                user_input,
+                memory_upto_now,
+            )
+            self._check_memory_head(memory_now, summary_now, system, user_input)
+            # Summary and structured blocks are protected; _trim can only
+            # remove raw short-term messages from ``working``.
+            head = memory_messages(
+                MemorySnapshot(ShortTermMemory(), memory_now.working, memory_now.long_term),
+                summary=summary_now,
+            )
+
         # "branch": working stays the full history, head stays empty — the
         # budget trim below is its only limiter (SPEC §3, §7.3).
 
@@ -1123,20 +1415,41 @@ class Agent:
         dropped_by_trim = len(working) - len(trimmed.history)
         if dropped_by_trim > 0:
             facts_upto_now = max(0, facts_upto_now - dropped_by_trim)
-        messages = chat_core.build_messages(
-            user_input, system=system, history=[*head, *trimmed.history]
-        )
+        if strategy == "memory":
+            structured = memory_messages(
+                MemorySnapshot(ShortTermMemory(), memory_now.working, memory_now.long_term),
+                summary=summary_now,
+            )
+            messages = chat_core.build_messages(
+                user_input, system=system, history=[*structured, *trimmed.history]
+            )
+        else:
+            messages = chat_core.build_messages(
+                user_input, system=system, history=[*head, *trimmed.history]
+            )
 
         if on_chunk is not None and chat_core.should_stream(self.config):
             result = self._stream(self.config, messages, on_chunk, self.capabilities)
         else:
             result = self._complete(self.config, messages, self.capabilities)
 
+        if strategy == "memory" and memory_update is not None:
+            # ``_run_memory`` extracted the virtual user message before the
+            # main call.  Once that call succeeds, the exchange is persisted
+            # as user plus assistant (or user only for an empty response), so
+            # return the cursor in the same coordinate space as Session.turns.
+            transcript_len = len(memory_history) if memory_history is not None else len(history)
+            persisted_len = transcript_len + 1 + bool(result.text)
+            memory_update = replace(memory_update, memory_upto=persisted_len)
+            memory_upto_now = persisted_len
+
         # The turn survived: the compaction/facts update now travel in the
         # reply, so the parked copies are nobody's responsibility any more.
         self.pending_compaction = None
         self.pending_facts = None
+        self.pending_memory = None
         facts_failed = self.take_pending_facts_failed()
+        memory_failed = self.take_pending_memory_failed() or memory_failed
 
         # Сверять надо с тем, что РЕАЛЬНО ушло в API: слой формата дописывает
         # инструкцию к system внутри chat._payload(), и сверка «до слоя» дала
@@ -1176,6 +1489,10 @@ class Agent:
             facts_update=facts_update,
             facts_failed=facts_failed,
             window_dropped=window_dropped,
+            memory=memory_now if strategy == "memory" else None,
+            memory_upto=memory_upto_now if strategy == "memory" else 0,
+            memory_update=memory_update if strategy == "memory" else None,
+            memory_failed=memory_failed if strategy == "memory" else None,
         )
 
     def _detect_done(self, text: str) -> bool:
@@ -1204,6 +1521,9 @@ __all__ = [
     "DEFAULT_MAX_TURNS",
     "FACTS_CATCHUP_MAX",
     "FACTS_SCHEMA_PATH",
+    "MEMORY_CATCHUP_MAX",
+    "MEMORY_RESPONSE_TOKENS",
+    "MEMORY_SCHEMA_PATH",
     "INTERRUPT_NOTE",
     "RESPONSE_RESERVE_TOKENS",
     "SUMMARY_MAX_TOKENS",
@@ -1213,6 +1533,7 @@ __all__ = [
     "CompleteFn",
     "FactsFailure",
     "FactsUpdate",
+    "MemoryFailureResult",
     "StreamFn",
     "done_conflicts_with_stop",
     "marker_instruction",
