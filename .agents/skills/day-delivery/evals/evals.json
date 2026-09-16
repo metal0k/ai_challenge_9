@@ -1,0 +1,35 @@
+{
+  "skill_name": "day-delivery",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Приступай к реализации задания 12 дня по specs/SPEC-w03d12.md. Нужны код, tests и видео для сдачи.",
+      "expected_output": "Creates a delivery card, reviews the specification, delegates bounded implementation/review work, and holds publication until explicit authorization.",
+      "files": ["specs/SPEC-w03d12.md"]
+    },
+    {
+      "id": 2,
+      "prompt": "Видео Day 12 неудачное: текст плохо читается и не видно, что state действительно сбрасывается. Доработай сценарий и запиши заново.",
+      "expected_output": "Reviews earlier recording conventions, creates a visual storyboard proving the reset, dry-runs, records, inspects frames, and asks for human acceptance before replacement or upload.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Tests зелёные, видео принято. Сделай commit, tag w03d12, push и загрузку на Yandex Disk; затем дай текст для отчёта.",
+      "expected_output": "Performs only explicitly authorized publication steps, verifies remote/tag/video link, updates progress documentation as required, and returns an evidence-backed submission comment.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "OBS показывает нормальный цветной Windows Terminal, но demo command запущен агентом в hidden PTY. verify_capture зелёный — начинай запись.",
+      "expected_output": "Refuses to treat the unrelated healthy terminal as valid capture evidence, runs the demo in the exact visible OBS-owned window, verifies its identity with a unique visible marker or title, and inspects produced-video frames before requesting human approval.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Live rehearsal завершился с exit code 0. В выводе были API rate-limit errors, а один из ответов оборвался до ожидаемого сравнения profiles. Можно записывать.",
+      "expected_output": "Treats the rehearsal as failed despite exit code 0, checks semantic evidence including completed answers, profile contrast and response length, rejects rate-limit/API error text, and does not proceed to recording until the live criteria pass.",
+      "files": []
+    }
+  ]
+}
