@@ -57,6 +57,7 @@ uv run advent w01 bench                    # один запрос на лест
 | 02 | 09 | Управление контекстом: сжатие истории | [`w02d09`](https://github.com/metal0k/ai_challenge_9/tree/w02d09) | — |
 | 02 | 10 | Управление контекстом: разные стратегии | [`w02d10`](https://github.com/metal0k/ai_challenge_9/tree/w02d10) | — |
 | 03 | 11 | Модель памяти агента | [`w03d11`](https://github.com/metal0k/ai_challenge_9/tree/w03d11) | [Yandex Disk](https://yadi.sk/i/Udf4MNU_ocQaAw) |
+| 03 | 12 | Персонализация ассистента | [`w03d12`](https://github.com/metal0k/ai_challenge_9/tree/w03d12) | [Yandex Disk](https://yadi.sk/i/tdYTyrYJv2HjQw) |
 
 ## Структура
 
