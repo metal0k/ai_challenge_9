@@ -1,32 +1,32 @@
-# Week 03, Day 11 — explicit memory layers
+# Неделя 03, день 11 — явные memory layers
 
-Day 11 continues the `adventagent` from Week 02. The default remains
-`context_strategy=summary`; memory is opt-in:
+День 11 продолжает `adventagent` из недели 02. `default` по-прежнему —
+`context_strategy=summary`; memory работает в режиме opt-in:
 
 ```powershell
 uv run adventagent --session demo11
 ```
 
-Then select the strategy in the REPL:
+Затем выберите strategy в REPL:
 
 ```text
 /strategy memory
 ```
 
-The agent keeps three distinct layers:
+Agent хранит три отдельных layers:
 
-- `short-term` — the current session transcript (`logs/sessions/<name>.json`);
-- `working` — task-local goal, constraints, decisions and open items
+- `short-term` — transcript текущей session (`logs/sessions/<name>.json`);
+- `working` — task-local goal, constraints, decisions и open items
   (`logs/memory/working/<name>.json`);
-- `long-term` — explicit profile, preferences and knowledge shared by all
-  sessions (`logs/memory/long_term.json`).
+- `long-term` — explicit profile, preferences и knowledge, общие для всех sessions
+  (`logs/memory/long_term.json`).
 
-Automatic routing requires exact evidence from a user message. Manual edits
-are available through `/memory set|del|pin|unpin|move`; manual `set` pins the
-value. `/memory retry` retries dirty file writes, while `/facts` and `/fact`
-remain compatibility aliases for the session-scoped working layer.
+Для automatic routing нужны точные данные из user message. Manual edits
+доступны через `/memory set|del|pin|unpin|move`; manual `set` закрепляет value.
+`/memory retry` повторяет dirty file writes, а `/facts` и `/fact` остаются
+compatibility aliases для session-scoped working layer.
 
-Useful commands:
+Полезные команды:
 
 ```text
 /memory
@@ -41,49 +41,49 @@ Useful commands:
 /new other-session
 ```
 
-`summary` is still a short-term optimization, not a fourth layer. `/new`
-clears short-term and working memory but leaves long-term memory intact;
-`/switch`, checkpoints and branches load/copy working memory without copying
-long-term memory.
+`summary` по-прежнему остаётся short-term optimization, а не четвёртым layer.
+`/new` очищает short-term и working memory, но сохраняет long-term memory;
+`/switch`, checkpoints и branches загружают или копируют working memory, не
+копируя long-term memory.
 
-The offline demo uses the real routing, storage and request assembly code and
-never calls the Mistral API:
+Offline demo использует реальный код routing, storage и request assembly и
+никогда не вызывает Mistral API:
 
 ```powershell
 uv run python tools/memory_demo.py --dry-run
 ```
 
-The deterministic recording walks through one complete lifecycle: session A
-routes a goal and constraint to `working`, a language preference to
-`long-term`, and a code word to `short-term`; session B keeps only the global
-preference; returning to A restores its session-local layers. The same run
-also shows a pinned manual value blocking an automatic conflict, a
-credential-like value being rejected, and `/new` clearing only session-local
-memory. The final lines name all three physical storage locations.
+Deterministic recording показывает полный lifecycle: session A направляет goal
+и constraint в `working`, language preference — в `long-term`, а code word — в
+`short-term`; session B сохраняет только global preference; возврат в A
+восстанавливает его session-local layers. Тот же run также показывает, как
+закреплённое manual value блокирует automatic conflict, credential-like value
+отклоняется, а `/new` очищает только session-local memory. Последние строки
+называют все три физических storage locations.
 
-The demo has two complementary takes. `logs/videos/0311.mp4`
-is the deterministic offline demo: it uses the real memory operations with
-fixed fake model replies, so every layer and lifecycle transition is visible
-without API calls. `logs/videos/0311-live.mp4` is an optional live Mistral
-take, recorded with:
+У demo есть два взаимодополняющих takes. `logs/videos/0311.mp4` — это
+deterministic offline demo: оно использует реальные memory operations с
+фиксированными fake model replies, поэтому каждый layer и lifecycle transition
+видны без API calls. `logs/videos/0311-live.mp4` — optional live Mistral take,
+записанный командой:
 
 ```powershell
 uv run advent record --week 3 --day 11 --live
 ```
 
-The live take uses the real Mistral model and demonstrates manual `/memory`
-updates, session A/B switching, recall after returning to A, and `/new`.
-During that take the extractor proposed invalid deltas; the strict validation
-guard rejected them safely. This is shown as a safe failure, not presented as
-successful automatic routing.
+Live take использует реальную Mistral model и показывает manual `/memory`
+updates, переключение sessions A/B, recall после возврата в A и `/new`. Во
+время этого take extractor предложил invalid deltas; strict validation guard
+безопасно их отклонил. Это показано как safe failure, а не как успешный
+automatic routing.
 
-# Week 03, Day 12 — named profiles
+# Неделя 03, день 12 — named profiles
 
-Named global profiles live in `logs/profiles/<name>.json` as flexible
-`key=value` preferences. The active profile is persisted additively in
-`Session.state.active_profile`, while profile context is injected into each
-request and counted separately. Current request settings have priority over
-the active profile; no active profile preserves the previous request behavior.
+Named global profiles хранятся в `logs/profiles/<name>.json` как гибкие
+`key=value` preferences. Active profile с additive semantics сохраняется в
+`Session.state.active_profile`, а profile context внедряется в каждый request и
+учитывается отдельно. Current request settings имеют приоритет над active
+profile; отсутствие active profile сохраняет прежнее request behavior.
 
 ```text
 /profile create developer style=technical format=code-first
@@ -96,19 +96,19 @@ the active profile; no active profile preserves the previous request behavior.
 /tokens
 ```
 
-Credential-like keys and values are rejected (and unsafe legacy fields are
-omitted on load); profile context is not written to the conversation journal.
-The deterministic offline utility remains available for development checks:
+Credential-like keys и values отклоняются, а unsafe legacy fields пропускаются
+при load; profile context не записывается в conversation journal.
+Deterministic offline utility остаётся доступной для development checks:
 
 ```powershell
 uv run python -m tools.profile_demo
 ```
 
 Implementation: `advent_core/profiles.py`, `advent_core/agent.py`,
-`week_02/cli.py`, `advent_cli/record.py`, with focused tests in
-`tests/test_profiles.py` and `tests/test_agent.py`. The submission recording is
-the real `adventagent` REPL with the project-default Mistral model, streaming,
-two profile-conditioned answers and `--max-tokens 220`:
+`week_02/cli.py`, `advent_cli/record.py`; focused tests находятся в
+`tests/test_profiles.py` и `tests/test_agent.py`. Submission recording — это
+реальный `adventagent` REPL с project-default Mistral model, streaming, двумя
+profile-conditioned answers и `--max-tokens 220`:
 
 ```powershell
 uv run advent record --week 3 --day 12
