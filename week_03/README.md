@@ -76,3 +76,40 @@ updates, session A/B switching, recall after returning to A, and `/new`.
 During that take the extractor proposed invalid deltas; the strict validation
 guard rejected them safely. This is shown as a safe failure, not presented as
 successful automatic routing.
+
+# Week 03, Day 12 — named profiles
+
+Named global profiles live in `logs/profiles/<name>.json` as flexible
+`key=value` preferences. The active profile is persisted additively in
+`Session.state.active_profile`, while profile context is injected into each
+request and counted separately. Current request settings have priority over
+the active profile; no active profile preserves the previous request behavior.
+
+```text
+/profile create developer style=technical format=code-first
+/profile create manager style=brief format=bullets
+/profile use developer
+/profile show
+/profile set style=concise
+/profile del style
+/profile delete manager
+/tokens
+```
+
+Credential-like keys and values are rejected (and unsafe legacy fields are
+omitted on load); profile context is not written to the conversation journal.
+The deterministic offline utility remains available for development checks:
+
+```powershell
+uv run python -m tools.profile_demo
+```
+
+Implementation: `advent_core/profiles.py`, `advent_core/agent.py`,
+`week_02/cli.py`, `advent_cli/record.py`, with focused tests in
+`tests/test_profiles.py` and `tests/test_agent.py`. The submission recording is
+the real `adventagent` REPL with the project-default Mistral model, streaming,
+two profile-conditioned answers and `--max-tokens 220`:
+
+```powershell
+uv run advent record --week 3 --day 12
+```

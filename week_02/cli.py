@@ -28,7 +28,7 @@ from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from advent_core import chat as chat_core
-from advent_core import console, formats, tokens
+from advent_core import console, formats, profiles, tokens
 from advent_core.agent import Agent, AgentReply, Compaction, FactsFailure, FactsUpdate
 from advent_core.client import (
     capabilities_of,
@@ -275,6 +275,8 @@ class AgentShell:
     # (_switch_session, covering /new, /switch, /branch, /set session),
     # otherwise a stale number would suppress a genuine new drop.
     window_dropped_reported: int | None = None
+    active_profile: str | None = None
+    profile_values: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         try:
@@ -319,6 +321,7 @@ class AgentShell:
         # property mode читает config.params, поэтому порядок безопасен, а
         # анонс — после создания agent, где уже есть max_turns.
         resumed_dialog = self._apply_session_state(self.session, check_explicit=True)
+        self._load_profile()
         self._load_memory()
         # on_notice: скачка токенизатора идёт минуты, и молчащий процесс между
         # строкой про сессию и приглашением читается как зависший — в том
@@ -442,6 +445,22 @@ class AgentShell:
         console.note(f"сессия {session.name}: ходов {len(session.turns)}, начата {session.created}")
         self._warn_drift(session)
         return session
+
+    def _load_profile(self) -> None:
+        """Load the session's optional global profile without breaking a run."""
+        raw = self.session.state.get("active_profile")
+        self.active_profile = raw if isinstance(raw, str) and raw else None
+        self.profile_values = {}
+        if self.active_profile:
+            try:
+                self.profile_values = profiles.load(
+                    self.active_profile, self.memory_root / "profiles"
+                )
+            except ConfigError as error:
+                console.warn(str(error) + " — запросы идут без profile")
+
+    def _save_profile_state(self) -> None:
+        self.session.state["active_profile"] = self.active_profile
 
     @property
     def memory_root(self) -> Path:
@@ -949,6 +968,7 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             memory=shell._memory_snapshot(),
             memory_upto=shell.memory_upto,
             memory_history=shell.session.history(),
+            profile=shell.profile_values,
             on_chunk=console.write_chunk if streaming else None,
         )
     except AdventError as error:
@@ -1036,11 +1056,23 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
     )
     log_call(
         reply.result,
-        reply.result.sent_messages or [{"role": "user", "content": question}],
+        _journal_messages(reply.result.sent_messages) or [{"role": "user", "content": question}],
         week=WEEK,
         day=DAY,
     )
     return reply
+
+
+def _journal_messages(messages: list[chat_core.Message] | None) -> list[chat_core.Message]:
+    """Exclude private profile pseudo-messages from the durable call journal."""
+    if not messages:
+        return []
+    return [
+        message
+        for message in messages
+        if not str(message.get("content", "")).startswith("Профиль пользователя (учитывай")
+        and not str(message.get("content", "")).startswith("Профиль учтён")
+    ]
 
 
 def _salvage_compaction(shell: AgentShell) -> None:
@@ -1304,6 +1336,7 @@ def _save_state(shell: AgentShell) -> None:
     # None — честное «карточка»: перечитывание файла вернёт лимит из карточки,
     # и ключ не нужно удалять, достаточно пустого значения.
     shell.session.state["context_limit"] = shell.config.params.context_limit
+    shell.session.state["active_profile"] = shell.active_profile
     # Summary and its coverage boundary are conversation CONTENT, not a
     # setting: Session.clear() wipes them along with the turns
     # (CONTENT_STATE_KEYS), unlike mode/done/context_limit above.
@@ -2138,6 +2171,87 @@ def _component_label(turns: list[Turn], field_name: str) -> str:
     return f"{total} (+{unknown} неизвестно)" if unknown else str(total)
 
 
+@command("/profile", "создать, выбрать и изменить user profile")
+def _cmd_profile(shell: AgentShell, args: list[str]) -> bool:
+    if not args:
+        console.warn("использование: /profile create|list|use|show|set|del|delete <...>")
+        return False
+    action, *rest = args
+    directory = shell.memory_root / "profiles"
+    if action == "list":
+        names = profiles.list_names(directory)
+        console.err.print("\n".join(names) if names else "profile list пуст")
+        return False
+    if action in {"del", "delete"}:
+        if len(rest) != 1:
+            raise ConfigError("использование: /profile del|delete <name>")
+        name = profiles.validate_name(rest[0])
+        profiles.delete(name, directory)
+        if shell.active_profile == name:
+            shell.active_profile = None
+            shell.profile_values = {}
+            _save_state(shell)
+        console.note(f"profile {name} удалён")
+        return False
+    if action == "create":
+        if not rest:
+            raise ConfigError("использование: /profile create <name> [key=value ...]")
+        name, *pairs = rest
+        values = _profile_pairs(pairs)
+        profiles.save(name, values, directory)
+        shell.active_profile = profiles.validate_name(name)
+        shell.profile_values = values
+        _save_state(shell)
+        console.note(f"profile {name} создан и активирован")
+        return False
+    if action == "use":
+        if len(rest) != 1:
+            raise ConfigError("использование: /profile use <name>")
+        name = profiles.validate_name(rest[0])
+        shell.profile_values = profiles.load(name, directory)
+        shell.active_profile = name
+        _save_state(shell)
+        console.note(f"profile {name} активирован")
+        return False
+    if action == "show":
+        name = rest[0] if rest else shell.active_profile
+        if not name:
+            console.err.print("active profile отсутствует")
+            return False
+        values = profiles.load(name, directory)
+        console.err.print(f"profile {name}")
+        for key, value in sorted(values.items()):
+            console.err.print(f"  {key} = {value}")
+        return False
+    if action == "set":
+        if not shell.active_profile:
+            raise ConfigError("нет active profile; сначала /profile create")
+        if not rest:
+            raise ConfigError("использование: /profile set <key=value> ...")
+        values = dict(shell.profile_values)
+        values.update(_profile_pairs(rest))
+        profiles.save(shell.active_profile, values, directory)
+        shell.profile_values = values
+        _save_state(shell)
+        return False
+    raise ConfigError("неизвестное действие profile")
+
+
+def _profile_pairs(pairs: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise ConfigError(f"ожидалось key=value, получено {pair!r}")
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ConfigError("ключ preference не может быть пустым")
+        # validate through save's same privacy gate before returning.
+        profiles.validate_value(value)
+        values[key] = value
+    return values
+
+
 @command("/tokens", "разбивка по токенам: сессия, окно контекста, сверка с сервером")
 def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
     prompt_label = _component_label(shell.session.turns, "prompt_tokens")
@@ -2157,6 +2271,10 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
         # точный счёт хуже, чем не показать вовсе (SPEC-w02d06.md §7.2).
         table.add_row("счёт токенов", f"{counter.name} (~), калибруется по usage сервера")
     table.add_row("сессия", f"{shell.session.name}, ходов {len(shell.session.turns)}")
+    table.add_row("active profile", shell.active_profile or "нет")
+    if shell.profile_values:
+        profile_tokens = _profile_tokens(shell)
+        table.add_row("profile tokens", _num(profile_tokens))
     table.add_row("prompt/completion", f"{prompt_label}/{completion_label}")
     table.add_row("всего за сессию", _session_tokens_label(shell))
     table.add_row("следующий запрос", _context_label(shell))
@@ -2211,6 +2329,18 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
     console.err.print(table)
     _print_growth_table(shell)
     return False
+
+
+def _profile_tokens(shell: AgentShell) -> int | None:
+    if shell.counter is None or not shell.profile_values:
+        return None
+    fragment = profiles.messages(shell.profile_values)
+    empty = [{"role": "user", "content": ""}]
+    total = shell.counter.count([*fragment, *empty])
+    overhead = shell.counter.count(empty)
+    if total is None or overhead is None:
+        return None
+    return max(0, total - overhead)
 
 
 def _summary_tokens(shell: AgentShell) -> int | None:
@@ -2932,9 +3062,11 @@ def _switch_session(
         if announce_diff
         else None
     )
+    previous_profile = shell.active_profile
     shell.save()
     session = shell.open_session(name)
     if fresh:
+        session.state["active_profile"] = previous_profile
         dropped = len(session.turns)
         session.clear()
         if dropped:
@@ -2961,6 +3093,7 @@ def _switch_session(
     # Loading it first would emit a false stale-cursor warning and, more
     # importantly, leave the old entries on disk until a later memory update.
     shell._load_memory(load_working=not fresh)
+    shell._load_profile()
     if fresh:
         # `/new` resets session-scoped working memory but leaves global
         # long-term memory intact.

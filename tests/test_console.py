@@ -68,4 +68,24 @@ def test_record_console_kwargs_force_rich_colour(monkeypatch):
         "force_terminal": True,
         "color_system": "standard",
         "legacy_windows": False,
+        "no_color": False,
     }
+
+
+def test_record_console_kwargs_overrides_no_color(monkeypatch):
+    monkeypatch.setenv("ADVENT_RECORD_COLOR", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert console._record_console_kwargs()["no_color"] is False
+
+
+def test_enable_record_color_rebuilds_shared_consoles(monkeypatch):
+    monkeypatch.delenv("ADVENT_RECORD_COLOR", raising=False)
+    old_out, old_err = console.out, console.err
+    try:
+        console.enable_record_color()
+        assert console.out._force_terminal is True
+        assert console.out.color_system == "standard"
+        assert console.err._force_terminal is True
+        assert console.err.color_system == "standard"
+    finally:
+        console.out, console.err = old_out, old_err

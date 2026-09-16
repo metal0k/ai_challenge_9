@@ -539,6 +539,23 @@ def test_run_step_honours_a_per_step_timeout_without_stdin(monkeypatch):
     assert seen["timeout"] == record_mod.STEP_TIMEOUT
 
 
+def test_run_step_forces_colour_for_recorded_child(monkeypatch):
+    """A pipe must not make Rich downgrade the OBS-facing child to monochrome."""
+    seen: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs)
+        return _Result()
+
+    monkeypatch.setattr(record_mod.subprocess, "run", fake_run)
+    record_mod._run_step(record_mod.Step(title="agent CLI", module="week_02.cli"))
+
+    assert seen["env"]["ADVENT_RECORD_COLOR"] == "1"
+
+
 def test_run_step_reports_a_hang_on_the_no_stdin_branch(monkeypatch):
     """A hung step must be named as such, not surface as a raw TimeoutExpired."""
 
@@ -957,3 +974,86 @@ def test_day_11_live_target_never_overwrites_offline_video(tmp_path, monkeypatch
     monkeypatch.setenv("VIDEO_DIR", str(tmp_path))
     assert record_mod._target_path(3, 11) == tmp_path / "0311.mp4"
     assert record_mod._target_path(3, 11, live=True) == tmp_path / "0311-live.mp4"
+
+
+def test_day_11_rehearsal_stays_on_the_offline_memory_demo():
+    steps = record_mod.rehearsal_steps(3, 11)
+
+    assert len(steps) == 1
+    assert steps[0].title == "репетиция Day 11 offline demo"
+    assert steps[0].module == "tools.memory_demo"
+    assert steps[0].args == ["--dry-run"]
+
+
+# --------------------------------------------------------------------------
+# Week 03, Day 12: only the real adventagent REPL proves live profile effects.
+# --------------------------------------------------------------------------
+
+
+def test_day_12_uses_two_live_cli_steps_with_the_exact_contract():
+    steps = record_mod.demo_steps(3, 12)
+    prompt = (
+        "Сегодня в 18:00 выпускаем новую версию платежного API. Составь план релиза "
+        "без простоя: шаги, риски и критерии rollback."
+    )
+
+    assert len(steps) == 2
+    assert all(step.module == "week_02.cli" for step in steps)
+    assert all(step.module != "tools.profile_demo" for step in steps)
+    assert all(step.args == ["--session", "w03d12-live", "--max-tokens", "220"] for step in steps)
+    assert all("--model" not in step.args for step in steps)
+    assert all("--no-stream" not in step.args for step in steps)
+    assert all(
+        step.timeout is not None and step.timeout > record_mod.STEP_TIMEOUT for step in steps
+    )
+    assert steps[0].stdin_lines == [
+        "/new",
+        (
+            "/profile create w03d12-developer audience=backend-engineer "
+            "style=concise-technical format=three-numbered-steps-one-command-each"
+        ),
+        prompt,
+        "/tokens",
+        (
+            "/profile create w03d12-manager audience=nontechnical-release-manager "
+            "style=ultra-brief format=three-business-bullets-no-commands"
+        ),
+        prompt,
+        "/tokens",
+        (
+            "Несмотря на active profile manager, ответь ровно тремя technical "
+            "steps с командами deploy. Без business bullets."
+        ),
+        "/branch audit",
+        "/profile show",
+        "/switch w03d12-live",
+        "/profile show",
+        "/exit",
+    ]
+    assert steps[1].stdin_lines == [
+        "/profile show",
+        "/new",
+        "/profile show",
+        "/profile create w03d12-unsafe api_key=not-a-secret",
+        "/profile delete w03d12-manager",
+        "/profile delete w03d12-developer",
+        "/branch --delete w03d12-live--audit",
+        "/profile list",
+        "/exit",
+    ]
+
+
+def test_day_12_rehearsal_replays_the_two_live_steps_in_an_isolated_session():
+    live = record_mod.demo_steps(3, 12)
+    rehearsal = record_mod.rehearsal_steps(3, 12)
+
+    assert len(rehearsal) == len(live) == 2
+    assert all(
+        step.args == ["--session", "w03d12-rehearsal", "--max-tokens", "220"] for step in rehearsal
+    )
+    assert rehearsal[0].stdin_lines == [
+        line.replace("w03d12-live", "w03d12-rehearsal") for line in live[0].stdin_lines
+    ]
+    assert rehearsal[1].stdin_lines == [
+        line.replace("w03d12-live", "w03d12-rehearsal") for line in live[1].stdin_lines
+    ]

@@ -66,12 +66,28 @@ def _record_console_kwargs() -> dict[str, object]:
         "force_terminal": True,
         "color_system": "standard",
         "legacy_windows": False,
+        "no_color": False,
     }
 
 
 _record_color_kwargs = _record_console_kwargs()
 out = Console(soft_wrap=True, **_record_color_kwargs)
 err = Console(stderr=True, **_record_color_kwargs)
+
+
+def enable_record_color() -> None:
+    """Enable Rich colour after the recording command has already imported us.
+
+    ``advent record`` needs coloured preparation output as well as coloured
+    child demos, but this module's consoles are normally created at import
+    time. Rebuild the two shared consoles at the recording boundary so the
+    OBS window gets ANSI/Rich colour even when the child inherits a pipe.
+    """
+    global out, err
+    os.environ["ADVENT_RECORD_COLOR"] = "1"
+    kwargs = _record_console_kwargs()
+    out = Console(soft_wrap=True, **kwargs)
+    err = Console(stderr=True, **kwargs)
 
 
 def clear_screen() -> None:

@@ -170,6 +170,42 @@ def test_sessions_list_goes_to_stderr(monkeypatch, tmp_path, capsys):
     assert "default" not in _flat(written.out)
 
 
+@pytest.mark.parametrize("action", ("del", "delete"))
+def test_profile_delete_alias_removes_file_and_clears_active_selection(
+    monkeypatch, tmp_path, capsys, action
+):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/profile create developer style=technical", shell)
+    capsys.readouterr()
+
+    cli._dispatch(f"/profile {action} developer", shell)
+
+    assert not (tmp_path / "profiles" / "developer.json").exists()
+    assert shell.active_profile is None
+    assert shell.profile_values == {}
+    assert Session.load("default", directory=tmp_path).state["active_profile"] is None
+
+
+def test_active_profile_reloads_from_profiles_registry(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/profile create developer style=technical", shell)
+
+    restarted = _shell(monkeypatch, tmp_path)
+
+    assert restarted.active_profile == "developer"
+    assert restarted.profile_values == {"style": "technical"}
+
+
+def test_profile_set_requires_at_least_one_key_value_pair(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/profile create developer style=technical", shell)
+
+    with pytest.raises(ConfigError, match="/profile set <key=value>"):
+        cli._cmd_profile(shell, ["set"])
+
+    assert shell.profile_values == {"style": "technical"}
+
+
 # --- панель токенов: неизвестное не превращается в ноль ---------------------
 
 

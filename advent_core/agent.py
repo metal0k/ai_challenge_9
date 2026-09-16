@@ -51,6 +51,7 @@ from advent_core.memory import (
 from advent_core.memory import (
     apply_delta as apply_memory_delta,
 )
+from advent_core.profiles import messages as profile_messages
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCounter, reconcile
 
@@ -1272,6 +1273,7 @@ class Agent:
         memory: MemorySnapshot | None = None,
         memory_upto: int = 0,
         memory_history: Sequence[Message] | None = None,
+        profile: dict[str, str] | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> AgentReply:
         """Один ход: собрать, обрезать, спросить, разобрать.
@@ -1404,6 +1406,9 @@ class Agent:
         # "branch": working stays the full history, head stays empty — the
         # budget trim below is its only limiter (SPEC §3, §7.3).
 
+        profile_head = profile_messages(profile) if profile else []
+        if profile_head:
+            head = [*profile_head, *head]
         trimmed = self._trim(working, system, user_input, head=head)
         # The safety-net trim cuts from the FRONT of `working` — exactly the
         # messages the cursor counts as already extracted. Left uncorrected,
@@ -1421,7 +1426,7 @@ class Agent:
                 summary=summary_now,
             )
             messages = chat_core.build_messages(
-                user_input, system=system, history=[*structured, *trimmed.history]
+                user_input, system=system, history=[*profile_head, *structured, *trimmed.history]
             )
         else:
             messages = chat_core.build_messages(

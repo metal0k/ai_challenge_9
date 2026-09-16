@@ -86,6 +86,7 @@ MODULE_COMMANDS = {
     "tools.strategy_bench": "python -m tools.strategy_bench",
     # Day 11: deterministic memory-layer demo; no agent/API process is involved.
     "tools.memory_demo": "python -m tools.memory_demo",
+    "tools.profile_demo": "python -m tools.profile_demo",
 }
 
 
@@ -151,6 +152,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d11_live()
     if week == 3 and day == 11:
         return _demo_steps_w03d11()
+    if week == 3 and day == 12:
+        return _demo_steps_w03d12()
     if week == 1 and day == 5:
         return _demo_steps_w01d05()
     if week == 1 and day == 4:
@@ -1380,6 +1383,67 @@ def _demo_steps_w03d11() -> list[Step]:
     ]
 
 
+def _demo_steps_w03d12(*, session: str = "w03d12-live") -> list[Step]:
+    prompt = (
+        "Сегодня в 18:00 выпускаем новую версию платежного API. Составь план релиза "
+        "без простоя: шаги, риски и критерии rollback."
+    )
+    return [
+        Step(
+            title=(
+                "День 12 LIVE · real Mistral A/B: developer → manager, request override "
+                "и branch inheritance"
+            ),
+            module="week_02.cli",
+            args=["--session", session, "--max-tokens", "220"],
+            stdin_lines=[
+                "/new",
+                (
+                    "/profile create w03d12-developer audience=backend-engineer "
+                    "style=concise-technical format=three-numbered-steps-one-command-each"
+                ),
+                prompt,
+                "/tokens",
+                (
+                    "/profile create w03d12-manager audience=nontechnical-release-manager "
+                    "style=ultra-brief format=three-business-bullets-no-commands"
+                ),
+                prompt,
+                "/tokens",
+                (
+                    "Несмотря на active profile manager, ответь ровно тремя technical "
+                    "steps с командами deploy. Без business bullets."
+                ),
+                "/branch audit",
+                "/profile show",
+                f"/switch {session}",
+                "/profile show",
+                "/exit",
+            ],
+            timeout=360,
+            line_pause=2.0,
+        ),
+        Step(
+            title="День 12 LIVE · restart: profile persistence, privacy и cleanup",
+            module="week_02.cli",
+            args=["--session", session, "--max-tokens", "220"],
+            stdin_lines=[
+                "/profile show",
+                "/new",
+                "/profile show",
+                "/profile create w03d12-unsafe api_key=not-a-secret",
+                "/profile delete w03d12-manager",
+                "/profile delete w03d12-developer",
+                f"/branch --delete {session}--audit",
+                "/profile list",
+                "/exit",
+            ],
+            timeout=360,
+            line_pause=2.0,
+        ),
+    ]
+
+
 def _demo_steps_w03d11_live() -> list[Step]:
     """Day 11 live take: real Mistral answers over the real memory shell.
 
@@ -1474,6 +1538,13 @@ def rehearsal_step(week: int) -> Step:
     )
 
 
+def rehearsal_steps(week: int, day: int) -> list[Step]:
+    """Return the pre-recording checks for a concrete coursework day."""
+    if (week, day) == (3, 12):
+        return _demo_steps_w03d12(session="w03d12-rehearsal")
+    return [rehearsal_step(week)]
+
+
 def record(
     day: int = typer.Option(..., "--day", "-d", help="Номер дня внутри недели."),
     week: int = typer.Option(1, "--week", "-w", help="Номер недели."),
@@ -1499,6 +1570,9 @@ def record(
     if live and (week, day) != (3, 11):
         raise AdventError("Опция --live доступна только для Day 11 (week 3).")
     load_env()
+    # OBS captures the terminal window, not the inherited pipe. Force Rich's
+    # colour mode for preparation output and for every recorded child demo.
+    console.enable_record_color()
     # Keep the existing target and its monkeypatch/test contract untouched for
     # every offline day.  A live Day 11 take is always a separate deliverable.
     target = _target_path(week, day, live=True) if live else _target_path(week, day)
@@ -1511,7 +1585,8 @@ def record(
     if rehearse:
         # Дешевле поймать поломку здесь, чем обнаружить её в записанном файле.
         console.note("репетиция: проверяю запуск, пайп и кодировку…")
-        _run_step(rehearsal_step(week), pause=0.1)
+        for step in rehearsal_steps(week, day):
+            _run_step(step, pause=0.1)
         console.note("репетиция прошла")
 
     client = obs.connect()
@@ -1588,7 +1663,12 @@ def _run_step(step: Step, pause: float | None = None) -> None:
         step_pause = step.line_pause
     else:
         step_pause = STEP_PAUSE
-    env = {**os.environ, **step.env, "PYTHONIOENCODING": "utf-8"}
+    env = {
+        **os.environ,
+        **step.env,
+        "PYTHONIOENCODING": "utf-8",
+        "ADVENT_RECORD_COLOR": "1",
+    }
     command = [sys.executable, "-m", step.module, *step.args]
 
     if not step.stdin_lines and not step.stdin_file:

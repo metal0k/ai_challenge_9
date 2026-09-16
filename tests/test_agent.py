@@ -89,6 +89,27 @@ def build_agent(recorder: _Recorder, config: Config | None = None, **kwargs) -> 
     return agent
 
 
+@pytest.mark.parametrize("strategy", ("summary", "window", "facts", "branch", "memory"))
+def test_profile_is_injected_for_every_context_strategy(strategy: str):
+    recorder = _Recorder(CallResult(text="ok", model_requested="m"))
+    agent = build_agent(recorder, make_config(context_strategy=strategy), counter=_CharCounter())
+    agent.ask("вопрос", [], profile={"style": "formal"})
+    sent = recorder.calls[-1]
+    assert any("style: formal" in message["content"] for message in sent)
+    assert sent[-1]["content"] == "вопрос"
+    assert any(
+        "текущий запрос пользователя при конфликте приоритетнее" in message["content"]
+        for message in sent
+    )
+
+
+def test_no_profile_does_not_change_request_assembly():
+    recorder = _Recorder(CallResult(text="ok", model_requested="m"))
+    agent = build_agent(recorder, make_config(context_strategy="memory"), counter=_CharCounter())
+    agent.ask("вопрос", [])
+    assert not any("Профиль пользователя" in message["content"] for message in recorder.calls[0])
+
+
 # --- явная история --------------------------------------------------------
 
 
