@@ -113,3 +113,40 @@ profile-conditioned answers и `--max-tokens 220`:
 ```powershell
 uv run advent record --week 3 --day 12
 ```
+
+# Неделя 03, день 13 — Task State Machine
+
+Одна session хранит одну formal task с lifecycle
+`planning → execution → validation → done`. Из `validation` разрешён retry в
+`execution`. Только explicit `/task` commands меняют state; model answer может
+предложить следующий transition, но не выполняет его автоматически.
+
+```text
+/task start Выпустить API :: Составить release plan :: Подтвердить риски
+/task show
+/task update Уточнить rollback plan :: Получить approval
+/task advance execution Выполнить canary deploy :: Проверить metrics
+/task pause Ожидаем metrics
+/task resume
+/task advance validation Проверить metrics :: Решить, нужен ли rollback
+/task complete Production stable
+/task clear
+```
+
+Active unpaused task добавляется в каждый model request как protected counted
+context: goal, phase, current step и expected action. Current user request имеет
+priority. Paused task является hard gate — ordinary prompts, `/again`, model и
+context mutations блокируются до `/task resume` или `/task clear`; read-only
+status/navigation commands остаются доступны.
+
+Task переживает restart, `/reset`, checkpoint и branch. `/new` очищает task
+вместе с dialog content. Branch получает snapshot и дальше изменяется
+независимо. Done-state остаётся видимым через `/task show`, но больше не
+injected в requests.
+
+Live demo использует project-default Mistral model, streaming и два процесса,
+чтобы показать restart continuity:
+
+```powershell
+uv run advent record --week 3 --day 13
+```

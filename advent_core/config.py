@@ -44,6 +44,15 @@ def _env(name: str) -> str | None:
     return value.strip() if value and value.strip() else None
 
 
+def configured_secrets() -> tuple[str, ...]:
+    """Return configured secret values that are long enough to protect safely."""
+    return tuple(
+        dict.fromkeys(
+            value for key in SECRET_KEYS if (value := _env(key)) is not None and len(value) >= 8
+        )
+    )
+
+
 def normalize_base_url(value: str | None) -> str | None:
     """Приводит base_url к корню сервера — без хвостового `/` и без `/v1`.
 
@@ -76,10 +85,8 @@ def redact(text: str) -> str:
     Вызывается перед печатью любого текста ошибки и перед записью в лог:
     traceback SDK или тело HTTP-ответа могут содержать ключ.
     """
-    for key in SECRET_KEYS:
-        value = _env(key)
-        if value and len(value) >= 8:
-            text = text.replace(value, "***")
+    for value in configured_secrets():
+        text = text.replace(value, "***")
     return text
 
 

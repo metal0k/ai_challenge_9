@@ -8,6 +8,7 @@ from advent_core.config import (
     DEFAULT_MODEL,
     Config,
     ConfigError,
+    configured_secrets,
     normalize_base_url,
     redact,
 )
@@ -104,6 +105,14 @@ def test_redact_ignores_short_values(monkeypatch):
     """Короткий 'секрет' мог бы вырезать куски обычного текста."""
     monkeypatch.setenv("MISTRAL_API_KEY", "abc")
     assert redact("abcdefg") == "abcdefg"
+
+
+def test_configured_secrets_returns_all_long_secret_key_values(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "mistral-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("OBS_WS_PASSWORD", "short")
+
+    assert configured_secrets() == ("mistral-secret", "github-secret")
 
 
 def test_generation_params_come_from_env(monkeypatch):

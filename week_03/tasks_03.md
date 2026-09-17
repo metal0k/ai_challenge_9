@@ -85,6 +85,12 @@ P.S. Дублируем видео ссылкой - https://disk.yandex.ru/i/PB0
 
 Агент с формализованным состоянием задачи
 
+В этой реализации formal state меняют только explicit `/task`
+commands. Task переживает restart, checkpoint и branch; pause блокирует
+model calls до resume, а `validation → execution` даёт explicit retry перед
+terminal `done`. Live demo показывает restart continuity в двух CLI
+processes, token accounting и cleanup.
+
 Формат:
 
 Видео + Код / Текст

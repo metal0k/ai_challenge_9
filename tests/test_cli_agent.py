@@ -25,6 +25,7 @@ from advent_core.errors import AdventError
 from advent_core.memory import MemoryStore, StructuredMemory
 from advent_core.params import AGENT_COMMAND, defaults_for
 from advent_core.session import Session
+from advent_core.task_state import TaskState, task_messages
 from advent_core.telemetry import CallResult, Usage
 from advent_core.tokens import EstimateCounter
 
@@ -127,6 +128,474 @@ def _complete(replies=None, seen=None, **result_kwargs):
 def _shell(monkeypatch, tmp_path, complete=None, **params) -> cli.AgentShell:
     monkeypatch.setattr(cli.chat_core, "complete", complete or _complete())
     return cli.AgentShell(_config(**params), directory=tmp_path)
+
+
+# --- Day 13: Task State Machine --------------------------------------------
+
+
+def _start_task(shell: cli.AgentShell) -> None:
+    cli._dispatch("/task start Release API :: Write plan :: Approve risks", shell)
+
+
+def test_task_commands_persist_full_lifecycle_and_restart(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/task advance execution Deploy canary :: Read metrics", shell)
+    cli._dispatch("/task advance validation Check metrics :: Decide rollback", shell)
+    cli._dispatch("/task advance execution Rollback canary :: Confirm recovery", shell)
+    cli._dispatch("/task advance validation Recheck metrics :: Record result", shell)
+    cli._dispatch("/task complete Production stable", shell)
+
+    restarted = _shell(monkeypatch, tmp_path)
+    assert restarted.task is not None
+    assert restarted.task.phase == "done"
+    assert restarted.task.result == "Production stable"
+    assert restarted.task.expected_action == "none"
+    cli._dispatch("/task show", restarted)
+    assert "Production stable" in _flat(capsys.readouterr().err)
+
+
+def test_successful_task_mutations_are_silent(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+    commands = [
+        "/task start Release API :: Write plan :: Approve risks",
+        "/task update Plan canary :: Approve plan",
+        "/task advance execution Deploy canary :: Read metrics",
+        "/task pause waiting",
+        "/task resume",
+        "/task advance validation Check metrics :: Record result",
+        "/task complete Production stable",
+        "/task clear",
+    ]
+
+    for command in commands:
+        cli._dispatch(command, shell)
+        written = capsys.readouterr()
+        assert written.out == ""
+        assert written.err == ""
+
+
+def test_illegal_task_transition_and_extra_delimiter_do_not_mutate(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    before = shell.task
+    cli._dispatch("/task advance validation skip :: no", shell)
+    cli._dispatch("/task update one :: two :: three", shell)
+    assert shell.task == before
+    stderr = _flat(capsys.readouterr().err)
+    assert "transition planning → validation запрещён" in stderr
+    assert "delimiter" in stderr
+
+
+def test_pause_blocks_prompt_before_last_question_history_journal_and_model(
+    monkeypatch, tmp_path, capsys
+):
+    seen = []
+    logged = []
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(seen=seen))
+    monkeypatch.setattr(cli, "log_call", lambda *args, **kwargs: logged.append((args, kwargs)))
+    _start_task(shell)
+    cli._dispatch("/task pause waiting for metrics", shell)
+    inputs = iter(["continue deploy", "/exit"])
+    monkeypatch.setattr(cli, "_read_input", lambda: next(inputs))
+
+    cli._loop(shell)
+
+    assert seen == []
+    assert logged == []
+    assert shell.last_question is None
+    assert shell.session.turns == []
+    assert "prompt blocked" in _flat(capsys.readouterr().err)
+
+
+def test_turn_itself_blocks_paused_task_before_last_question_and_model(monkeypatch, tmp_path):
+    seen = []
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(seen=seen))
+    _start_task(shell)
+    cli._dispatch("/task pause waiting", shell)
+
+    cli._turn(shell, "must not run")
+
+    assert shell.last_question is None
+    assert shell.session.turns == []
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/again",
+        "/compact",
+        "/model ministral-3b-latest",
+        "/set context_strategy facts",
+        "/strategy facts",
+        "/memory backfill",
+        "/facts backfill",
+        "/profile create blocked style=brief",
+    ],
+)
+def test_pause_blocks_mutating_or_model_commands(monkeypatch, tmp_path, capsys, command):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/task pause waiting", shell)
+    cli._dispatch(command, shell)
+    assert shell.task is not None and shell.task.paused
+    assert "blocked" in _flat(capsys.readouterr().err)
+
+
+def test_pause_allows_show_tokens_navigation_resume_and_clear(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/task pause waiting", shell)
+    for command in (
+        "/task show",
+        "/tokens",
+        "/sessions",
+        "/summary",
+        "/facts",
+        "/memory",
+        "/memory short",
+    ):
+        cli._dispatch(command, shell)
+    cli._dispatch("/task resume", shell)
+    assert shell.task is not None and not shell.task.paused
+    cli._dispatch("/task clear", shell)
+    assert shell.task is None
+    assert "command blocked" not in _flat(capsys.readouterr().err)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "/checkpoint snap extra",
+        "/switch target extra",
+        "/new target extra",
+    ),
+)
+def test_pause_rejects_malformed_navigation_commands(monkeypatch, tmp_path, capsys, command):
+    target = Session.new("target", directory=tmp_path)
+    target.record("old", "answer")
+    target.save()
+    before = target.path.read_bytes()
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/task pause waiting", shell)
+
+    cli._dispatch(command, shell)
+
+    assert shell.session.name == "default"
+    assert shell.task is not None and shell.task.paused
+    assert target.path.read_bytes() == before
+    assert "команда blocked" in _flat(capsys.readouterr().err)
+
+
+@pytest.mark.parametrize(
+    ("line", "allowed"),
+    (
+        ("/exit", True),
+        ("/exit now", False),
+        ("/quit", False),
+        ("/profile list", True),
+        ("/profile list extra", False),
+        ("/profile show", True),
+        ("/profile show reviewer", True),
+        ("/profile show reviewer extra", False),
+        ("/memory", True),
+        ("/memory short", True),
+        ("/memory working", True),
+        ("/memory long", True),
+        ("/memory long-term", False),
+        ("/memory short extra", False),
+        ("/checkpoint", True),
+        ("/checkpoint stable", True),
+        ("/checkpoint stable extra", False),
+        ("/switch other", True),
+        ("/switch other extra", False),
+        ("/new", True),
+        ("/new other", True),
+        ("/new other extra", False),
+        ("/branch audit", True),
+        ("/branch audit --from stable", True),
+        ("/branch --delete audit", True),
+        ("/branch", False),
+        ("/branch --delete", False),
+        ("/branch audit --from", False),
+        ("/branch audit --from stable extra", False),
+    ),
+)
+def test_paused_command_allowlist_uses_literal_registered_forms(
+    monkeypatch, tmp_path, line, allowed
+):
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert cli._paused_command_allowed(line.split(), shell) is allowed
+
+
+def test_dialog_and_task_are_mutually_exclusive_before_mutation(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/mode dialog", shell)
+    assert shell.agent.mode == "chat"
+    assert "несовместим" in _flat(capsys.readouterr().err)
+
+    other = _shell(monkeypatch, tmp_path / "other", mode="dialog")
+    cli._dispatch("/task start g :: s :: a", other)
+    assert other.task is None
+
+
+def test_reset_keeps_task_but_new_clears_it(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/reset", shell)
+    assert shell.task is not None
+    cli._dispatch("/new", shell)
+    assert shell.task is None
+    assert "task" not in Session.load("default", directory=tmp_path).state
+
+
+def test_branch_inherits_independent_task_snapshot(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/branch audit", shell)
+    assert shell.session.name == "default--audit"
+    cli._dispatch("/task update Audit branch :: Report", shell)
+    assert shell.task is not None and shell.task.current_step == "Audit branch"
+    cli._dispatch("/switch default", shell)
+    assert shell.task is not None and shell.task.current_step == "Write plan"
+
+
+def test_checkpoint_keeps_its_task_snapshot_for_a_later_branch(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/checkpoint baseline", shell)
+    cli._dispatch("/task update Parent changed :: Parent approval", shell)
+
+    cli._dispatch("/branch audit --from baseline", shell)
+    assert shell.task is not None and shell.task.current_step == "Write plan"
+    cli._dispatch("/task update Branch changed :: Branch approval", shell)
+    cli._dispatch("/switch default", shell)
+    assert shell.task is not None and shell.task.current_step == "Parent changed"
+
+
+def test_switch_to_session_without_task_clears_runtime_task(monkeypatch, tmp_path):
+    clean = Session.new("clean", directory=tmp_path)
+    clean.save()
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+
+    cli._dispatch("/switch clean", shell)
+
+    assert shell.session.name == "clean"
+    assert shell.task is None
+
+
+def test_paused_persisted_dialog_collision_allows_recovery_commands(monkeypatch, tmp_path, capsys):
+    session = Session.new("default", directory=tmp_path)
+    session.state["mode"] = "dialog"
+    session.state["task"] = (
+        TaskState.start("Release API", "Write plan", "Approve").pause("waiting").to_json()
+    )
+    session.save()
+    seen = []
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(seen=seen))
+    inputs = iter(
+        [
+            "must be blocked",
+            "/set mode chat",
+            "/task resume",
+            "continue after recovery",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "_read_input", lambda: next(inputs))
+
+    cli._loop(shell)
+
+    assert shell.agent.mode == "chat"
+    assert shell.task is not None and not shell.task.paused
+    assert len(seen) == 1
+    assert seen[0][-1]["content"] == "continue after recovery"
+    stderr = _flat(capsys.readouterr().err)
+    assert "prompt blocked" in stderr
+    assert "Persisted task несовместима с mode=dialog" in stderr
+
+
+def test_non_mistral_configured_secret_is_rejected_on_start_and_load(monkeypatch, tmp_path, capsys):
+    secret = "github-private-value"
+    monkeypatch.setenv("GITHUB_TOKEN", secret)
+    start_shell = _shell(monkeypatch, tmp_path / "start")
+    cli._dispatch(f"/task start Release {secret} :: Plan :: Approve", start_shell)
+    assert start_shell.task is None
+
+    persisted = Session.new("default", directory=tmp_path / "load")
+    persisted.state["task"] = TaskState.start(f"Release {secret}", "Plan", "Approve").to_json()
+    persisted.save()
+    loaded = _shell(monkeypatch, tmp_path / "load")
+    assert loaded.task is None
+    assert loaded.task_needs_healing
+    assert _flat(capsys.readouterr().err).count("configured secret") >= 2
+
+
+def test_invalid_persisted_task_is_disabled_and_clear_heals_file(monkeypatch, tmp_path, capsys):
+    session = Session.new("default", directory=tmp_path)
+    session.state["task"] = {"version": 99}
+    session.save()
+    shell = _shell(monkeypatch, tmp_path)
+    assert shell.task is None
+    assert shell.task_needs_healing
+    assert "task" not in shell.session.state
+    cli._dispatch("/task start replacement :: step :: expected", shell)
+    assert shell.task is None
+    assert Session.load("default", directory=tmp_path).state["task"] == {"version": 99}
+    cli._dispatch("/task clear", shell)
+    assert "task" not in Session.load("default", directory=tmp_path).state
+    stderr = _flat(capsys.readouterr().err)
+    assert "повреждена" in stderr
+    assert "explicit /task clear" in stderr
+
+
+def test_ordinary_save_clears_healing_only_after_success(monkeypatch, tmp_path):
+    session = Session.new("default", directory=tmp_path)
+    session.state["task"] = {"version": 99}
+    session.save()
+    shell = _shell(monkeypatch, tmp_path)
+    original_save = Session.save
+
+    def fail_save(self):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Session, "save", fail_save)
+    cli._save_state(shell)
+    assert shell.task_needs_healing
+
+    monkeypatch.setattr(Session, "save", original_save)
+    cli._save_state(shell)
+    assert not shell.task_needs_healing
+    assert "task" not in Session.load("default", directory=tmp_path).state
+
+
+def test_task_mutation_rolls_back_runtime_and_nested_state_on_save_failure(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(monkeypatch, tmp_path)
+    before = dict(shell.session.state)
+
+    def fail_save(self):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Session, "save", fail_save)
+    _start_task(shell)
+    assert shell.task is None
+    assert shell.session.state == before
+    stderr = _flat(capsys.readouterr().err)
+    assert "mutation отменена" in stderr
+    assert "task создана" not in stderr
+
+
+def test_new_save_failure_keeps_current_runtime_and_target_file(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    target = Session.new("target", directory=tmp_path)
+    target.record("old", "answer")
+    target.save()
+    before_bytes = target.path.read_bytes()
+    original_save = Session.save
+
+    def fail_target(self):
+        if self.name == "target":
+            raise OSError("target locked")
+        return original_save(self)
+
+    monkeypatch.setattr(Session, "save", fail_target)
+    cli._dispatch("/new target", shell)
+    assert shell.session.name == "default"
+    assert shell.task is not None
+    assert target.path.read_bytes() == before_bytes
+    stderr = _flat(capsys.readouterr().err)
+    assert "/new отменена" in stderr
+    assert "удалено ходов" not in stderr
+
+
+def test_new_malformed_target_save_failure_does_not_quarantine_or_replace_target(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    target_path = Session.path_for("target", tmp_path)
+    target_path.write_bytes(b"{malformed target")
+    before_bytes = target_path.read_bytes()
+    original_save = Session.save
+
+    def fail_target(self):
+        if self.name == "target":
+            raise OSError("target locked")
+        return original_save(self)
+
+    monkeypatch.setattr(Session, "save", fail_target)
+    cli._dispatch("/new target", shell)
+
+    assert shell.session.name == "default"
+    assert shell.task is not None
+    assert target_path.read_bytes() == before_bytes
+    assert list(tmp_path.glob("target.json.*.bak")) == []
+    assert "/new отменена" in _flat(capsys.readouterr().err)
+
+
+def test_task_show_resume_and_clear_reject_extra_arguments(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/task pause wait", shell)
+    paused = shell.task
+    cli._dispatch("/task show extra", shell)
+    cli._dispatch("/task resume extra", shell)
+    cli._dispatch("/task clear extra", shell)
+    assert shell.task == paused
+
+
+def test_tokens_distinguish_running_paused_done_and_absent_task(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/tokens", shell)
+    assert "task нет" in _flat(capsys.readouterr().err)
+    _start_task(shell)
+    cli._dispatch("/tokens", shell)
+    running = _flat(capsys.readouterr().err)
+    assert "planning, running" in running
+    assert "task tokens" in running and "not injected" not in running
+    cli._dispatch("/task pause wait", shell)
+    cli._dispatch("/tokens", shell)
+    assert "not injected" in _flat(capsys.readouterr().err)
+
+
+def test_journal_filters_only_exact_task_pair():
+    state = TaskState.start("g", "s", "a")
+    pair = task_messages(state)
+    identical_real_user = dict(pair[0])
+    lookalike = {"role": "user", "content": pair[0]["content"] + " user text"}
+    kept = cli._journal_messages([pair[0], pair[1], identical_real_user, lookalike], task=state)
+    assert kept == [identical_real_user, lookalike]
+
+
+def test_journal_preserves_genuine_adjacent_task_lookalike_pair_outside_protected_head():
+    state = TaskState.start("g", "s", "a")
+    pair = task_messages(state)
+    separator = {"role": "user", "content": "ordinary"}
+
+    assert cli._journal_messages([separator, pair[0], pair[1]], task=state) == [
+        separator,
+        pair[0],
+        pair[1],
+    ]
+
+
+def test_journal_finds_task_pair_after_system_and_exact_profile_head():
+    state = TaskState.start("g", "s", "a")
+    profile = {"style": "brief"}
+    system = {"role": "system", "content": "system"}
+    user = {"role": "user", "content": "question"}
+    messages = [system, *cli.profiles.messages(profile), *task_messages(state), user]
+
+    assert cli._journal_messages(messages, task=state, profile=profile) == [system, user]
 
 
 # --- контракт stdout/stderr -------------------------------------------------

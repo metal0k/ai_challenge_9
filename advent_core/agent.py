@@ -36,7 +36,7 @@ from advent_core.compact import (
     summary_messages,
 )
 from advent_core.config import Config, ConfigError
-from advent_core.errors import AdventError
+from advent_core.errors import AdventError, ConfigurationError
 from advent_core.facts import DeltaResult, apply_delta, facts_messages, format_facts
 from advent_core.memory import (
     MemoryDelta,
@@ -52,6 +52,7 @@ from advent_core.memory import (
     apply_delta as apply_memory_delta,
 )
 from advent_core.profiles import messages as profile_messages
+from advent_core.task_state import TaskState, task_messages
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCounter, reconcile
 
@@ -1274,6 +1275,7 @@ class Agent:
         memory_upto: int = 0,
         memory_history: Sequence[Message] | None = None,
         profile: dict[str, str] | None = None,
+        task: TaskState | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> AgentReply:
         """Один ход: собрать, обрезать, спросить, разобрать.
@@ -1407,9 +1409,28 @@ class Agent:
         # budget trim below is its only limiter (SPEC §3, §7.3).
 
         profile_head = profile_messages(profile) if profile else []
-        if profile_head:
-            head = [*profile_head, *head]
-        trimmed = self._trim(working, system, user_input, head=head)
+        task_head = task_messages(task)
+        strategy_head = head
+        protected_head = [*profile_head, *task_head, *strategy_head]
+        trimmed = self._trim(working, system, user_input, head=protected_head)
+        if task_head and self.counter is not None:
+            budget = self._token_budget()
+            if budget is not None and trimmed.tokens is not None and trimmed.tokens > budget:
+                baseline_final = chat_core.build_messages(
+                    user_input,
+                    system=system,
+                    history=[*profile_head, *strategy_head, *trimmed.history],
+                )
+                baseline_final_tokens = self.counter.count(baseline_final)
+                if baseline_final_tokens is not None and baseline_final_tokens <= budget:
+                    raise ConfigurationError(
+                        "Task context не помещается в request budget",
+                        hint=(
+                            f"baseline={baseline_final_tokens}, с task={trimmed.tokens}, "
+                            f"budget={budget}; используй /task update или /task clear, "
+                            "либо увеличь context_limit"
+                        ),
+                    )
         # The safety-net trim cuts from the FRONT of `working` — exactly the
         # messages the cursor counts as already extracted. Left uncorrected,
         # facts_upto claims coverage of history that no longer exists, and next
@@ -1426,11 +1447,13 @@ class Agent:
                 summary=summary_now,
             )
             messages = chat_core.build_messages(
-                user_input, system=system, history=[*profile_head, *structured, *trimmed.history]
+                user_input,
+                system=system,
+                history=[*profile_head, *task_head, *structured, *trimmed.history],
             )
         else:
             messages = chat_core.build_messages(
-                user_input, system=system, history=[*head, *trimmed.history]
+                user_input, system=system, history=[*protected_head, *trimmed.history]
             )
 
         if on_chunk is not None and chat_core.should_stream(self.config):

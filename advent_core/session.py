@@ -56,7 +56,14 @@ ROLE_ASSISTANT = "assistant"
 # `/new` on purpose (SPEC-w02d09.md §8). The list lives here, next to clear(),
 # because "setting or content" is a fact about storage, not about the
 # interface — a second list in the CLI would drift on the first new key.
-CONTENT_STATE_KEYS = ("summary", "summary_upto", "facts", "facts_pinned", "facts_upto")
+CONTENT_STATE_KEYS = (
+    "summary",
+    "summary_upto",
+    "facts",
+    "facts_pinned",
+    "facts_upto",
+    "task",
+)
 
 
 def _now() -> str:

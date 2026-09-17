@@ -19,6 +19,7 @@ from contextlib import contextmanager
 import pytest
 
 from advent_cli import record as record_mod
+from advent_core import console
 from advent_core.errors import AdventError
 from tools import strategy_bench
 
@@ -26,6 +27,19 @@ from tools import strategy_bench
 @contextmanager
 def _noop_context(*args, **kwargs):
     yield
+
+
+@pytest.fixture(autouse=True)
+def restore_record_console(monkeypatch):
+    """record() rebuilds global Rich consoles; no test may leak that into the suite."""
+    previous_out, previous_err = console.out, console.err
+    previous_color = console.os.environ.get("ADVENT_RECORD_COLOR")
+    yield
+    console.out, console.err = previous_out, previous_err
+    if previous_color is None:
+        monkeypatch.delenv("ADVENT_RECORD_COLOR", raising=False)
+    else:
+        monkeypatch.setenv("ADVENT_RECORD_COLOR", previous_color)
 
 
 @pytest.fixture
@@ -1057,3 +1071,89 @@ def test_day_12_rehearsal_replays_the_two_live_steps_in_an_isolated_session():
     assert rehearsal[1].stdin_lines == [
         line.replace("w03d12-live", "w03d12-rehearsal") for line in live[1].stdin_lines
     ]
+
+
+# --------------------------------------------------------------------------
+# Week 03, Day 13: real CLI proves formal state, pause, restart and retry.
+# --------------------------------------------------------------------------
+
+
+def test_day_13_uses_two_live_cli_steps_with_exact_sessions_and_limits():
+    steps = record_mod.demo_steps(3, 13)
+    assert len(steps) == 2
+    assert all(step.module == "week_02.cli" for step in steps)
+    assert all(step.args == ["--session", "w03d13-live", "--max-tokens", "500"] for step in steps)
+    assert all("--model" not in step.args and "--no-stream" not in step.args for step in steps)
+    assert all(step.timeout == 480 and step.timeout > record_mod.STEP_TIMEOUT for step in steps)
+    assert all(step.line_pause == 3.0 for step in steps)
+
+
+def test_day_13_first_process_proves_no_auto_transition_and_pause_gate():
+    step = record_mod.demo_steps(3, 13)[0]
+    assert step.stdin_lines == [
+        "/new",
+        (
+            "/task start Выпустить платёжный API без downtime :: "
+            "Составить безопасный release plan :: Подтвердить риски и rollback criteria"
+        ),
+        "/task show",
+        (
+            "Составь release plan: ровно 4 коротких bullet points, до 90 слов, "
+            "без code blocks. В последней строке обязательно: "
+            "Рекомендация: /task advance execution …"
+        ),
+        "/task show",
+        ("/task advance execution Выполнить canary deploy :: Сообщить error rate и latency"),
+        (
+            "Дай ровно 3 shell commands для canary deploy и 2 metric thresholds, "
+            "до 90 слов, без code blocks."
+        ),
+        "/task pause Ожидаем metrics",
+        "Продолжай deploy без ожидания.",
+        "/task show",
+        "/exit",
+    ]
+    assert step.stdin_lines.count("/task show") == 3
+
+
+def test_day_13_second_process_proves_restart_retry_done_and_cleanup():
+    step = record_mod.demo_steps(3, 13)[1]
+    assert step.stdin_lines == [
+        "/task show",
+        "/tokens",
+        "/task resume",
+        "/tokens",
+        ("Продолжай с текущего шага: ровно 3 коротких bullet points, до 80 слов, без code blocks."),
+        ("/task advance validation Проверить error rate и latency :: Решить, нужен ли rollback"),
+        (
+            "Error rate вырос до 3%. Ответь ровно 3 коротких bullet points: "
+            "stop, rollback, verify; до 70 слов, без code blocks. "
+            "В последней строке обязательно: "
+            "Рекомендация: /task advance execution …"
+        ),
+        "/task show",
+        ("/task advance execution Выполнить rollback canary :: Подтвердить восстановление metrics"),
+        (
+            "/task advance validation Повторно проверить metrics :: "
+            "Зафиксировать результат validation"
+        ),
+        "/task complete Release validation прошла, production stable",
+        "/task show",
+        "/tokens",
+        "/task clear",
+        "/task show",
+        "/exit",
+    ]
+
+
+def test_day_13_rehearsal_replays_live_contract_in_isolated_session():
+    live = record_mod.demo_steps(3, 13)
+    rehearsal = record_mod.rehearsal_steps(3, 13)
+    assert len(rehearsal) == len(live) == 2
+    assert all(
+        step.args == ["--session", "w03d13-rehearsal", "--max-tokens", "500"] for step in rehearsal
+    )
+    for rehearsed, recorded in zip(rehearsal, live, strict=True):
+        assert rehearsed.stdin_lines == [
+            line.replace("w03d13-live", "w03d13-rehearsal") for line in recorded.stdin_lines
+        ]

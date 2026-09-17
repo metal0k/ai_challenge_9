@@ -30,9 +30,10 @@ from advent_core.agent import (
 )
 from advent_core.compact import SUMMARY_ACK, SUMMARY_PREFIX
 from advent_core.config import Config
-from advent_core.errors import AdventError
+from advent_core.errors import AdventError, ConfigurationError
 from advent_core.facts import FACTS_ACK, FACTS_PREFIX
 from advent_core.params import AGENT_COMMAND, GenerationParams, defaults_for
+from advent_core.task_state import TaskState
 from advent_core.telemetry import CallResult, Usage
 
 
@@ -108,6 +109,71 @@ def test_no_profile_does_not_change_request_assembly():
     agent = build_agent(recorder, make_config(context_strategy="memory"), counter=_CharCounter())
     agent.ask("вопрос", [])
     assert not any("Профиль пользователя" in message["content"] for message in recorder.calls[0])
+
+
+@pytest.mark.parametrize("strategy", ("summary", "window", "facts", "branch", "memory"))
+def test_task_is_counted_and_injected_after_profile_for_every_strategy(strategy: str):
+    recorder = _Recorder(CallResult(text="ok", model_requested="m"))
+    agent = build_agent(recorder, make_config(context_strategy=strategy), counter=_CharCounter())
+    state = TaskState.start("Release API", "Deploy canary", "Read metrics")
+
+    agent.ask("current request", [], profile={"style": "brief"}, task=state)
+
+    sent = recorder.calls[-1]
+    profile_index = next(
+        i for i, message in enumerate(sent) if "Профиль пользователя" in message["content"]
+    )
+    task_index = next(
+        i for i, message in enumerate(sent) if "FORMAL TASK STATE" in message["content"]
+    )
+    assert profile_index < task_index < len(sent) - 1
+    assert sent[-1]["content"] == "current request"
+    assert len(recorder.calls) == 1
+
+
+@pytest.mark.parametrize("state", [None, TaskState.start("g", "s", "a").pause("wait")])
+def test_absent_or_paused_task_does_not_change_request(state):
+    recorder = _Recorder(CallResult(text="ok", model_requested="m"))
+    agent = build_agent(recorder, counter=_CharCounter())
+    agent.ask("question", [], task=state)
+    assert not any("FORMAL TASK STATE" in message["content"] for message in recorder.calls[0])
+
+
+def test_task_specific_budget_crossing_fails_before_model_call():
+    recorder = _Recorder(CallResult(text="must not happen", model_requested="m"))
+    agent = build_agent(
+        recorder,
+        make_config(max_tokens=10),
+        counter=_CharCounter(),
+        context_limit=80,
+    )
+    state = TaskState.start("release", "plan", "approve")
+    with pytest.raises(ConfigurationError, match="Task context") as caught:
+        agent.ask("q", [], task=state)
+    assert caught.value.hint is not None
+    assert "/task update" in caught.value.hint
+    assert "/task clear" in caught.value.hint
+    assert recorder.calls == []
+
+
+def test_budget_crossing_before_trim_does_not_reject_task_that_fits_after_trim():
+    recorder = _Recorder(CallResult(text="ok", model_requested="m"))
+    agent = build_agent(
+        recorder,
+        make_config(max_tokens=10),
+        counter=_CharCounter(),
+        context_limit=500,
+    )
+    history = [
+        {"role": "user", "content": "u" * 180},
+        {"role": "assistant", "content": "a" * 180},
+    ]
+    state = TaskState.start("release", "plan", "approve")
+    reply = agent.ask("q", history, task=state)
+    sent = recorder.calls[0]
+    assert reply.dropped == 2
+    assert any("FORMAL TASK STATE" in message["content"] for message in sent)
+    assert not any(message["content"] == "u" * 180 for message in sent)
 
 
 # --- явная история --------------------------------------------------------

@@ -18,6 +18,7 @@ advent_core/session.py, счёт токенов — в advent_core/tokens.py. П
 
 from __future__ import annotations
 
+import copy
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -39,7 +40,7 @@ from advent_core.client import (
     resolve_alias,
 )
 from advent_core.compact import summary_messages
-from advent_core.config import DEFAULT_SYSTEM_PROMPT, Config, ConfigError
+from advent_core.config import DEFAULT_SYSTEM_PROMPT, Config, ConfigError, configured_secrets
 from advent_core.errors import AdventError
 from advent_core.facts import format_facts, render_note, validate_key
 from advent_core.journal import log_call
@@ -85,6 +86,12 @@ from advent_core.session import (
     parse_name,
     root_of,
     validate_name,
+)
+from advent_core.task_state import (
+    TASK_STATE_KEY,
+    TaskState,
+    TaskStateError,
+    task_messages,
 )
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCheck, counter_for
@@ -277,6 +284,8 @@ class AgentShell:
     window_dropped_reported: int | None = None
     active_profile: str | None = None
     profile_values: dict[str, str] = field(default_factory=dict)
+    task: TaskState | None = None
+    task_needs_healing: bool = False
 
     def __post_init__(self) -> None:
         try:
@@ -360,6 +369,11 @@ class AgentShell:
             console.note(
                 f"подхвачен целевой диалог: ход {self.dialog_turns} из {self.agent.max_turns}"
             )
+            if self.task is not None:
+                console.warn(
+                    "Persisted task несовместима с mode=dialog — "
+                    "используй /mode chat либо /task clear"
+                )
         # check_done() зовётся и на применённом из файла маркере: негодный done,
         # оставшийся в сессии с прошлого запуска, ловим сейчас, а не тогда,
         # когда диалог не закончится ни разу.
@@ -437,9 +451,9 @@ class AgentShell:
 
     # --- сессия ------------------------------------------------------------
 
-    def open_session(self, name: str) -> Session:
+    def open_session(self, name: str, *, quarantine: bool = True) -> Session:
         """Загружает сессию с диска и говорит вслух обо всём, что с ней не так."""
-        session = Session.load(name, directory=self.directory)
+        session = Session.load(name, directory=self.directory, quarantine=quarantine)
         for warning in session.warnings:
             console.warn(warning)
         console.note(f"сессия {session.name}: ходов {len(session.turns)}, начата {session.created}")
@@ -702,7 +716,27 @@ class AgentShell:
                 )
         self._apply_session_summary(session)
         self._apply_session_facts(session)
+        self._apply_session_task(session)
         return resumed_dialog
+
+    def _apply_session_task(self, session: Session) -> None:
+        """Load the optional task independently from the rest of session state."""
+        self.task = None
+        self.task_needs_healing = False
+        if TASK_STATE_KEY not in session.state:
+            return
+        raw = session.state.get(TASK_STATE_KEY)
+        try:
+            task = TaskState.from_json(raw)
+            task.validate_privacy(_task_configured_secrets(self))
+        except TaskStateError as error:
+            session.state.pop(TASK_STATE_KEY, None)
+            self.task_needs_healing = True
+            console.warn(f"в сессии {session.name} task повреждена — отключена ({error})")
+            return
+        self.task = task
+        status = "paused" if task.paused else task.phase
+        console.note(f"подхвачена task: {status} · {task.current_step}")
 
     def _apply_session_summary(self, session: Session) -> None:
         """Loads the summary and rewinds the working history to its boundary.
@@ -821,7 +855,7 @@ class AgentShell:
                 "истории; пересобрать заново: /facts backfill"
             )
 
-    def save(self) -> None:
+    def save(self) -> bool:
         """Сохраняет сессию; ошибку записи показывает, а не глотает.
 
         Session.save() специально не глотает OSError (в отличие от
@@ -832,6 +866,8 @@ class AgentShell:
             self.session.save()
         except OSError as error:
             console.warn(f"сессия не сохранена ({error}) — разговор остаётся только на экране")
+            return False
+        return True
 
 
 def _persona(config: Config) -> str | None:
@@ -922,6 +958,14 @@ def _warn_extra_args(name: str, args: list[str]) -> None:
 
 def _turn(shell: AgentShell, question: str) -> None:
     """Один ход: спросить, напечатать, посчитать, запомнить."""
+    if shell.task is not None and shell.task.paused:
+        console.warn("Task paused — prompt blocked; используй /task resume или /task clear")
+        return
+    if shell.task is not None and shell.agent.mode == "dialog":
+        console.warn(
+            "Task State Machine несовместима с mode=dialog — используй /mode chat либо /task clear"
+        )
+        return
     shell.last_question = question
     reply = _ask(shell, question, shell.history)
     if reply is None:
@@ -969,6 +1013,7 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             memory_upto=shell.memory_upto,
             memory_history=shell.session.history(),
             profile=shell.profile_values,
+            task=shell.task,
             on_chunk=console.write_chunk if streaming else None,
         )
     except AdventError as error:
@@ -1056,23 +1101,53 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
     )
     log_call(
         reply.result,
-        _journal_messages(reply.result.sent_messages) or [{"role": "user", "content": question}],
+        _journal_messages(
+            reply.result.sent_messages,
+            task=shell.task,
+            profile=shell.profile_values,
+        )
+        or [{"role": "user", "content": question}],
         week=WEEK,
         day=DAY,
     )
     return reply
 
 
-def _journal_messages(messages: list[chat_core.Message] | None) -> list[chat_core.Message]:
-    """Exclude private profile pseudo-messages from the durable call journal."""
+def _journal_messages(
+    messages: list[chat_core.Message] | None,
+    *,
+    task: TaskState | None = None,
+    profile: dict[str, str] | None = None,
+) -> list[chat_core.Message]:
+    """Exclude generated private context without deleting lookalike user text."""
     if not messages:
         return []
-    return [
-        message
-        for message in messages
-        if not str(message.get("content", "")).startswith("Профиль пользователя (учитывай")
-        and not str(message.get("content", "")).startswith("Профиль учтён")
-    ]
+    task_pair = task_messages(task)
+    synthetic_task_indices: set[int] = set()
+    protected_index = 1 if messages[0].get("role") == "system" else 0
+    profile_pair = profiles.messages(profile) if profile else []
+    if (
+        profile_pair
+        and [dict(message) for message in messages[protected_index:]][: len(profile_pair)]
+        == profile_pair
+    ):
+        protected_index += len(profile_pair)
+    if (
+        task_pair
+        and [dict(message) for message in messages[protected_index:]][: len(task_pair)] == task_pair
+    ):
+        synthetic_task_indices.update(range(protected_index, protected_index + len(task_pair)))
+
+    kept: list[chat_core.Message] = []
+    for index, message in enumerate(messages):
+        if index in synthetic_task_indices:
+            continue
+        content = str(message.get("content", ""))
+        if not content.startswith("Профиль пользователя (учитывай") and not content.startswith(
+            "Профиль учтён"
+        ):
+            kept.append(message)
+    return kept
 
 
 def _salvage_compaction(shell: AgentShell) -> None:
@@ -1358,11 +1433,16 @@ def _save_state(shell: AgentShell) -> None:
     shell.session.state["facts"] = shell.facts
     shell.session.state["facts_pinned"] = list(shell.facts_pinned)
     shell.session.state["facts_upto"] = shell.facts_upto
+    if shell.task is None:
+        shell.session.state.pop(TASK_STATE_KEY, None)
+    else:
+        shell.session.state[TASK_STATE_KEY] = shell.task.to_json()
     # Structured Day 11 layers have independent atomic files.  Save them
     # before the transcript so a successful session write never falsely claims
     # that a dirty memory layer was persisted.
     shell._save_memory()
-    shell.save()
+    if shell.save():
+        shell.task_needs_healing = False
 
 
 def _dialog_progress(shell: AgentShell, reply: AgentReply) -> None:
@@ -1752,6 +1832,10 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
             f"агент не читает параметр {name!r} — /params показывает те, что читает. "
             "Выставленный параметр, ни на что не влияющий, выглядит как поломка"
         )
+        return False
+
+    if name == "mode" and raw.strip().lower() == "dialog" and shell.task is not None:
+        console.warn("mode=dialog несовместим с retained task — сначала /task clear")
         return False
 
     # Captured BEFORE .set() mutates it: _maybe_backfill_facts needs to know
@@ -2275,6 +2359,20 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
     if shell.profile_values:
         profile_tokens = _profile_tokens(shell)
         table.add_row("profile tokens", _num(profile_tokens))
+    if shell.task is None:
+        table.add_row("task", "нет")
+        table.add_row("task tokens", "—")
+    else:
+        status = (
+            "done" if shell.task.phase == "done" else ("paused" if shell.task.paused else "running")
+        )
+        table.add_row("task", f"{shell.task.phase}, {status}")
+        table.add_row(
+            "task tokens",
+            "not injected"
+            if shell.task.paused or shell.task.phase == "done"
+            else _num(_task_tokens(shell)),
+        )
     table.add_row("prompt/completion", f"{prompt_label}/{completion_label}")
     table.add_row("всего за сессию", _session_tokens_label(shell))
     table.add_row("следующий запрос", _context_label(shell))
@@ -2331,10 +2429,186 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
     return False
 
 
+def _task_segments(args: list[str], expected: int, usage: str) -> list[str] | None:
+    text = " ".join(args)
+    parts = [part.strip() for part in text.split(" :: ")]
+    if len(parts) != expected or any(not part for part in parts):
+        console.warn(f"нужно: {usage}; delimiter — literal ' :: '")
+        return None
+    return parts
+
+
+def _task_configured_secrets(shell: AgentShell) -> tuple[str, ...]:
+    """Combine every configured secret source used by this process."""
+    values = list(configured_secrets())
+    if len(shell.config.api_key) >= 8 and shell.config.api_key not in values:
+        values.append(shell.config.api_key)
+    return tuple(values)
+
+
+def _task_save(shell: AgentShell, replacement: TaskState | None) -> bool:
+    """Persist one task mutation transactionally, rolling runtime and state back."""
+    previous_task = shell.task
+    previous_healing = shell.task_needs_healing
+    previous_state = copy.deepcopy(shell.session.state)
+    if replacement is not None:
+        replacement.validate_privacy(_task_configured_secrets(shell))
+    shell.task = replacement
+    shell.task_needs_healing = False
+    if replacement is None:
+        shell.session.state.pop(TASK_STATE_KEY, None)
+    else:
+        shell.session.state[TASK_STATE_KEY] = replacement.to_json()
+    try:
+        shell.session.save()
+    except OSError as error:
+        shell.task = previous_task
+        shell.task_needs_healing = previous_healing
+        shell.session.state = previous_state
+        console.warn(f"task не сохранена ({error}) — mutation отменена")
+        return False
+
+    return True
+
+
+def _task_required(shell: AgentShell) -> TaskState | None:
+    if shell.task is None:
+        console.warn("Task отсутствует — создай её через /task start")
+        return None
+    return shell.task
+
+
+def _task_show(shell: AgentShell) -> None:
+    task = shell.task
+    if task is None:
+        console.note("task: нет")
+        return
+    table = Table(title="Task State Machine", show_header=False)
+    table.add_column(style="dim")
+    table.add_column()
+    table.add_row("goal", rich_escape(task.goal))
+    table.add_row("phase", task.phase)
+    status = "paused" if task.paused else ("done" if task.phase == "done" else "running")
+    table.add_row("status", status)
+    table.add_row("current step", rich_escape(task.current_step))
+    table.add_row("expected action", rich_escape(task.expected_action))
+    if task.pause_reason:
+        table.add_row("pause reason", rich_escape(task.pause_reason))
+    if task.result:
+        table.add_row("result", rich_escape(task.result))
+    console.err.print(table)
+
+
+@command(
+    "/task",
+    "formal task state: start/show/update/advance/pause/resume/complete/clear",
+    usage="/task <subcommand>",
+)
+def _cmd_task(shell: AgentShell, args: list[str]) -> bool:
+    if not args:
+        console.warn("нужно: /task start|show|update|advance|pause|resume|complete|clear")
+        return False
+    sub, rest = args[0], args[1:]
+    try:
+        if sub == "show":
+            if rest:
+                console.warn("нужно: /task show (без arguments)")
+                return False
+            _task_show(shell)
+            return False
+        if sub == "clear":
+            if rest:
+                console.warn("нужно: /task clear (без arguments)")
+                return False
+            if shell.task is None and not shell.task_needs_healing:
+                console.note("task: уже нет")
+                return False
+            _task_save(shell, None)
+            return False
+        if sub == "start":
+            if shell.agent.mode == "dialog":
+                console.warn("Task нельзя начать в mode=dialog — сначала /mode chat")
+                return False
+            if shell.task is not None:
+                console.warn("Task уже существует — сначала /task clear")
+                return False
+            if shell.task_needs_healing:
+                console.warn("Persisted task повреждена — сначала explicit /task clear")
+                return False
+            parts = _task_segments(rest, 3, "/task start <goal> :: <step> :: <expected>")
+            if parts is None:
+                return False
+            task = TaskState.start(*parts, configured_secrets=_task_configured_secrets(shell))
+            _task_save(shell, task)
+            return False
+
+        task = _task_required(shell)
+        if task is None:
+            return False
+        if sub == "update":
+            parts = _task_segments(rest, 2, "/task update <step> :: <expected>")
+            if parts is None:
+                return False
+            replacement = task.update(*parts, configured_secrets=_task_configured_secrets(shell))
+            _task_save(shell, replacement)
+            return False
+        if sub == "advance":
+            if not rest:
+                console.warn("нужно: /task advance <phase> <step> :: <expected>")
+                return False
+            phase, body = rest[0], rest[1:]
+            parts = _task_segments(body, 2, "/task advance <phase> <step> :: <expected>")
+            if parts is None:
+                return False
+            replacement = task.advance(
+                phase, *parts, configured_secrets=_task_configured_secrets(shell)
+            )
+            _task_save(shell, replacement)
+            return False
+        if sub == "pause":
+            reason = " ".join(rest).strip() or None
+            replacement = task.pause(reason, configured_secrets=_task_configured_secrets(shell))
+            _task_save(shell, replacement)
+            return False
+        if sub == "resume":
+            if rest:
+                console.warn("нужно: /task resume (без arguments)")
+                return False
+            replacement = task.resume(configured_secrets=_task_configured_secrets(shell))
+            _task_save(shell, replacement)
+            return False
+        if sub == "complete":
+            result = " ".join(rest).strip()
+            if not result:
+                console.warn("нужно: /task complete <result>")
+                return False
+            replacement = task.complete(result, configured_secrets=_task_configured_secrets(shell))
+            _task_save(shell, replacement)
+            return False
+        console.warn(f"неизвестная /task subcommand {sub!r}")
+    except TaskStateError as error:
+        console.warn(str(error))
+    return False
+
+
 def _profile_tokens(shell: AgentShell) -> int | None:
     if shell.counter is None or not shell.profile_values:
         return None
     fragment = profiles.messages(shell.profile_values)
+    empty = [{"role": "user", "content": ""}]
+    total = shell.counter.count([*fragment, *empty])
+    overhead = shell.counter.count(empty)
+    if total is None or overhead is None:
+        return None
+    return max(0, total - overhead)
+
+
+def _task_tokens(shell: AgentShell) -> int | None:
+    if shell.counter is None or shell.task is None:
+        return None
+    fragment = task_messages(shell.task)
+    if not fragment:
+        return None
     empty = [{"role": "user", "content": ""}]
     total = shell.counter.count([*fragment, *empty])
     overhead = shell.counter.count(empty)
@@ -3063,24 +3337,45 @@ def _switch_session(
         else None
     )
     previous_profile = shell.active_profile
-    shell.save()
-    session = shell.open_session(name)
+    try:
+        shell.session.save()
+    except OSError as error:
+        console.warn(f"сессия не сохранена ({error}) — смена session отменена")
+        return
+    # `/new` stages a replacement before it is allowed to touch the target.
+    # A malformed target must therefore stay in place until the clean atomic
+    # save succeeds; ordinary switches keep the established quarantine path.
+    session = shell.open_session(name, quarantine=not fresh)
+    dropped = 0
+    fresh_branch_parent: str | None = None
     if fresh:
         session.state["active_profile"] = previous_profile
         dropped = len(session.turns)
         session.clear()
-        if dropped:
-            console.warn(f"сессия {session.name}: удалено ходов {dropped}")
         # Разговор стёрт — счётчик диалога обнуляем вместе с ним: «ход 2 из 10»
         # без истории врал бы. mode/done не трогаем: это настройка запуска,
         # а не содержимое разговора (clear() state не стирает).
         session.state["dialog_turns"] = 0
         parent, _segment, _is_checkpoint = parse_name(session.name)
         if parent is not None:
+            fresh_branch_parent = parent
+        try:
+            # Save the clean target before changing runtime identity. Session.save
+            # uses a sibling temp plus os.replace, so a failure leaves both the
+            # current runtime and the previous target file intact.
+            session.save()
+        except OSError as error:
+            console.warn(f"новая сессия не сохранена ({error}) — /new отменена")
+            return
+        if dropped:
+            console.warn(f"сессия {session.name}: удалено ходов {dropped}")
+        if fresh_branch_parent is not None:
             # SPEC §7.3: /new inside a branch clears only that branch's own
-            # file — the parent must never learn this happened.
+            # file — the parent must never learn this happened. Announce only
+            # after the clean target was saved successfully.
             console.note(
-                f"{session.name} — ветка (родитель {parent}), а не корень; стёрта только она"
+                f"{session.name} — ветка (родитель {fresh_branch_parent}), а не корень; "
+                "стёрта только она"
             )
     shell.session = session
     shell.history = session.history()
@@ -3112,6 +3407,10 @@ def _switch_session(
         console.note(
             f"подхвачен целевой диалог: ход {shell.dialog_turns} из {shell.agent.max_turns}"
         )
+        if shell.task is not None:
+            console.warn(
+                "Persisted task несовместима с mode=dialog — используй /mode chat либо /task clear"
+            )
     if before is not None:
         after = (shell.agent.context_strategy, shell.config.params.context_limit, shell.agent.mode)
         parent, _segment, _is_checkpoint = parse_name(session.name)
@@ -3125,13 +3424,59 @@ def _switch_session(
     # New conversation identity — a stale "already announced N" would
     # suppress a genuine window-drop note in the session just entered.
     shell.window_dropped_reported = None
-    if fresh:
-        shell.save()
+
+
+def _paused_command_allowed(parts: list[str], shell: AgentShell) -> bool:
+    command = parts[0]
+    if command in {
+        "/help",
+        "/exit",
+        "/tokens",
+        "/params",
+        "/sessions",
+        "/branches",
+        "/summary",
+    }:
+        return len(parts) == 1
+    if command in {"/checkpoint", "/new"}:
+        return len(parts) in {1, 2}
+    if command == "/switch":
+        return len(parts) == 2
+    if command == "/branch":
+        return (
+            (len(parts) == 2 and not parts[1].startswith("--"))
+            or (len(parts) == 3 and parts[1] == "--delete" and not parts[2].startswith("--"))
+            or (
+                len(parts) == 4
+                and not parts[1].startswith("--")
+                and parts[2] == "--from"
+                and not parts[3].startswith("--")
+            )
+        )
+    if command == "/facts":
+        return len(parts) == 1
+    if command == "/memory":
+        return len(parts) == 1 or (len(parts) == 2 and parts[1] in {"short", "working", "long"})
+    if command == "/profile":
+        return parts == ["/profile", "list"] or (
+            parts[:2] == ["/profile", "show"] and len(parts) in {2, 3}
+        )
+    if command == "/task":
+        return len(parts) == 2 and parts[1] in {"show", "resume", "clear"}
+    if shell.agent.mode == "dialog":
+        if command == "/mode" and parts[1:] == ["chat"]:
+            return True
+        if command == "/set" and parts[1:] == ["mode", "chat"]:
+            return True
+    return False
 
 
 def _dispatch(line: str, shell: AgentShell) -> bool:
     """Исполняет слэш-команду. True означает «выходим»."""
     parts = line.split()
+    if shell.task is not None and shell.task.paused and not _paused_command_allowed(parts, shell):
+        console.warn("Task paused — команда blocked; используй /task resume или /task clear")
+        return False
     entry = COMMANDS.get(parts[0])
     if entry is None:
         console.warn(f"неизвестная команда {parts[0]}. /help — список")
@@ -3213,6 +3558,15 @@ def _loop(shell: AgentShell) -> None:
         if line.startswith("/"):
             if _dispatch(line, shell):
                 return
+            continue
+        if shell.task is not None and shell.task.paused:
+            console.warn("Task paused — prompt blocked; используй /task resume или /task clear")
+            continue
+        if shell.task is not None and shell.agent.mode == "dialog":
+            console.warn(
+                "Task State Machine несовместима с mode=dialog — используй /mode chat "
+                "либо /task clear"
+            )
             continue
         _turn(shell, line)
 

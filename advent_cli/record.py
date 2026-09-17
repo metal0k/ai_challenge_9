@@ -154,6 +154,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d11()
     if week == 3 and day == 12:
         return _demo_steps_w03d12()
+    if week == 3 and day == 13:
+        return _demo_steps_w03d13()
     if week == 1 and day == 5:
         return _demo_steps_w01d05()
     if week == 1 and day == 4:
@@ -1444,6 +1446,91 @@ def _demo_steps_w03d12(*, session: str = "w03d12-live") -> list[Step]:
     ]
 
 
+def _demo_steps_w03d13(*, session: str = "w03d13-live") -> list[Step]:
+    return [
+        Step(
+            title=(
+                "День 13 LIVE · Task State Machine: planning → execution, "
+                "recommendation без auto-transition и pause hard gate"
+            ),
+            module="week_02.cli",
+            args=["--session", session, "--max-tokens", "500"],
+            stdin_lines=[
+                "/new",
+                (
+                    "/task start Выпустить платёжный API без downtime :: "
+                    "Составить безопасный release plan :: Подтвердить риски и rollback criteria"
+                ),
+                "/task show",
+                (
+                    "Составь release plan: ровно 4 коротких bullet points, до 90 слов, "
+                    "без code blocks. В последней строке обязательно: "
+                    "Рекомендация: /task advance execution …"
+                ),
+                "/task show",
+                (
+                    "/task advance execution Выполнить canary deploy :: "
+                    "Сообщить error rate и latency"
+                ),
+                (
+                    "Дай ровно 3 shell commands для canary deploy и 2 metric thresholds, "
+                    "до 90 слов, без code blocks."
+                ),
+                "/task pause Ожидаем metrics",
+                "Продолжай deploy без ожидания.",
+                "/task show",
+                "/exit",
+            ],
+            timeout=480,
+            line_pause=3.0,
+        ),
+        Step(
+            title=(
+                "День 13 LIVE · restart: resume без повторения, validation retry, done и cleanup"
+            ),
+            module="week_02.cli",
+            args=["--session", session, "--max-tokens", "500"],
+            stdin_lines=[
+                "/task show",
+                "/tokens",
+                "/task resume",
+                "/tokens",
+                (
+                    "Продолжай с текущего шага: ровно 3 коротких bullet points, "
+                    "до 80 слов, без code blocks."
+                ),
+                (
+                    "/task advance validation Проверить error rate и latency :: "
+                    "Решить, нужен ли rollback"
+                ),
+                (
+                    "Error rate вырос до 3%. Ответь ровно 3 коротких bullet points: "
+                    "stop, rollback, verify; до 70 слов, без code blocks. "
+                    "В последней строке обязательно: "
+                    "Рекомендация: /task advance execution …"
+                ),
+                "/task show",
+                (
+                    "/task advance execution Выполнить rollback canary :: "
+                    "Подтвердить восстановление metrics"
+                ),
+                (
+                    "/task advance validation Повторно проверить metrics :: "
+                    "Зафиксировать результат validation"
+                ),
+                "/task complete Release validation прошла, production stable",
+                "/task show",
+                "/tokens",
+                "/task clear",
+                "/task show",
+                "/exit",
+            ],
+            timeout=480,
+            line_pause=3.0,
+        ),
+    ]
+
+
 def _demo_steps_w03d11_live() -> list[Step]:
     """Day 11 live take: real Mistral answers over the real memory shell.
 
@@ -1542,6 +1629,8 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
     """Return the pre-recording checks for a concrete coursework day."""
     if (week, day) == (3, 12):
         return _demo_steps_w03d12(session="w03d12-rehearsal")
+    if (week, day) == (3, 13):
+        return _demo_steps_w03d13(session="w03d13-rehearsal")
     return [rehearsal_step(week)]
 
 
