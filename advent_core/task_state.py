@@ -255,7 +255,8 @@ def task_messages(task: TaskState | None) -> list[Message]:
         {
             "role": "assistant",
             "content": (
-                "Task context принят. Current user request при конфликте приоритетнее. "
+                "Task context принят. Session invariants при конфликте приоритетнее; "
+                "Task State при конфликте приоритетнее Current user request. "
                 "Ответ не меняет formal state. Если step действительно завершён, можно "
                 f"дать одну concise recommendation: {recommendations[task.phase]}"
             ),

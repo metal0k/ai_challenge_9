@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -38,6 +39,13 @@ from advent_core.compact import (
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError, ConfigurationError
 from advent_core.facts import DeltaResult, apply_delta, facts_messages, format_facts
+from advent_core.invariants import (
+    InvariantAssessment,
+    InvariantSet,
+    assessment_instruction,
+    invariant_messages,
+    parse_assessment,
+)
 from advent_core.memory import (
     MemoryDelta,
     MemoryFailure,
@@ -275,6 +283,11 @@ class AgentReply:
     memory_upto: int = 0
     memory_update: MemoryUpdate | None = None
     memory_failed: MemoryFailure | None = None
+    # The assessment is a service call, never a conversation turn.  It is
+    # returned so the CLI can render/account/journal it separately without
+    # retaining the assessment prompt or raw JSON in Session history.
+    invariant_assessment: InvariantAssessment | None = None
+    invariant_result: CallResult | None = None
 
 
 def marker_instruction(kind: str, needle: str) -> str:
@@ -1260,6 +1273,113 @@ class Agent:
         self.pending_memory_failed = None
         return pending
 
+    def _assess_invariants(
+        self, messages: list[Message], invariants: InvariantSet
+    ) -> tuple[CallResult, InvariantAssessment]:
+        """Run the isolated JSON preflight without changing user parameters.
+
+        A copy is necessary: changing ``self.config.params.format`` would make
+        the next ordinary answer JSON as a side effect of a policy check.
+        """
+        assessment_config = copy.deepcopy(self.config)
+        assessment_config.stream = False
+        assessment_config.params.format = "json"
+        assessment_config.params.schema_file = None
+        assessment_config.params.stop = None
+        try:
+            result = self._complete(assessment_config, messages, self.capabilities)
+        except AdventError as error:
+            result = CallResult(
+                model_requested=self.config.model,
+                stream=False,
+                finish_reason="error",
+            )
+            return result, InvariantAssessment(
+                None, error=f"invariant assessment failed: {error.message}"
+            )
+        assessment = parse_assessment(result.text, invariants)
+        if result.finish_reason == "error" or result.truncated:
+            assessment = InvariantAssessment(None, error="invariant assessment завершилась ошибкой")
+        return result, assessment
+
+    def _check_invariant_preflight_budget(
+        self,
+        *,
+        user_input: str,
+        history: list[Message],
+        system: str | None,
+        invariant_head: list[Message],
+        profile_head: list[Message],
+        task_head: list[Message],
+        strategy_head: list[Message],
+    ) -> list[Message]:
+        """Trim and validate before the assessment or any extractor is paid."""
+        preflight = self._trim(
+            history,
+            system,
+            user_input,
+            head=[*invariant_head, *profile_head, *task_head, *strategy_head],
+        )
+        budget = self._token_budget()
+        if self.counter is None or budget is None or preflight.tokens is None:
+            return preflight.history
+        baseline = chat_core.build_messages(
+            user_input,
+            system=system,
+            history=[*profile_head, *task_head, *strategy_head, *preflight.history],
+        )
+        baseline_tokens = self.counter.count(baseline)
+        if preflight.tokens > budget:
+            if baseline_tokens is not None and baseline_tokens <= budget:
+                raise ConfigurationError(
+                    "Invariant context не помещается в request budget",
+                    hint=(
+                        f"baseline={baseline_tokens}, с invariants={preflight.tokens}, "
+                        f"budget={budget}; используй /invariant remove <id> или /invariant clear"
+                    ),
+                )
+            raise ConfigurationError(
+                "Protected invariant/task context не помещается в request budget",
+                hint=f"request={preflight.tokens}, budget={budget}; сократи protected state",
+            )
+        return preflight.history
+
+    def _check_invariant_final_budget(
+        self,
+        *,
+        user_input: str,
+        system: str | None,
+        invariant_head: list[Message],
+        baseline_head: list[Message],
+        trimmed: _Trimmed,
+    ) -> None:
+        """Fail locally when a dynamic protected head grows after assessment."""
+        budget = self._token_budget()
+        if (
+            not invariant_head
+            or self.counter is None
+            or budget is None
+            or trimmed.tokens is None
+            or trimmed.tokens <= budget
+        ):
+            return
+        baseline = chat_core.build_messages(
+            user_input, system=system, history=[*baseline_head, *trimmed.history]
+        )
+        baseline_tokens = self.counter.count(baseline)
+        if baseline_tokens is not None and baseline_tokens <= budget:
+            raise ConfigurationError(
+                "Invariant context не помещается в request budget",
+                hint=(
+                    f"baseline={baseline_tokens}, с invariants={trimmed.tokens}, "
+                    f"budget={budget}; используй /invariant remove <id> или /invariant clear"
+                ),
+            )
+        raise ConfigurationError(
+            "Protected invariant/task context не помещается в request budget",
+            hint=f"request={trimmed.tokens}, budget={budget}; сократи protected state",
+        )
+
     # --- сам ход -----------------------------------------------------------
 
     def ask(
@@ -1276,6 +1396,7 @@ class Agent:
         memory_history: Sequence[Message] | None = None,
         profile: dict[str, str] | None = None,
         task: TaskState | None = None,
+        invariants: InvariantSet | None = None,
         on_chunk: Callable[[str], None] | None = None,
     ) -> AgentReply:
         """Один ход: собрать, обрезать, спросить, разобрать.
@@ -1292,6 +1413,85 @@ class Agent:
         FOUR — it's the 400-error safety net, not a strategy.
         """
         self._warn(self.check_done(), once=True)
+        # ``Iterable`` includes one-shot generators.  The preflight must see
+        # exactly the same pins as the later facts request.
+        facts_pinned = tuple(facts_pinned)
+
+        # Assessment is deliberately the first possible model call while
+        # rules are active.  Compaction/facts/memory must not spend tokens or
+        # mutate pending state for a request which policy will deny.
+        invariant_head = invariant_messages(invariants)
+        invariant_assessment: InvariantAssessment | None = None
+        invariant_result: CallResult | None = None
+        if invariant_head:
+            system_before_strategy = self.system_prompt()
+            profile_before_strategy = profile_messages(profile) if profile else []
+            task_before_strategy = task_messages(task)
+            preflight_working = list(history)
+            preflight_strategy_head: list[Message] = []
+            preflight_strategy = self.context_strategy
+            if preflight_strategy == "summary":
+                preflight_strategy_head = summary_messages(summary)
+            elif preflight_strategy in {"window", "facts"}:
+                _older, preflight_working = split_history(preflight_working, self.keep_last)
+                if preflight_strategy == "facts":
+                    preflight_strategy_head = facts_messages(dict(facts or {}), facts_pinned)
+            elif preflight_strategy == "memory":
+                preflight_memory = memory or MemorySnapshot()
+                preflight_strategy_head = memory_messages(
+                    MemorySnapshot(
+                        ShortTermMemory(), preflight_memory.working, preflight_memory.long_term
+                    ),
+                    summary=summary,
+                )
+            preflight_history = self._check_invariant_preflight_budget(
+                user_input=user_input,
+                history=preflight_working,
+                system=system_before_strategy,
+                invariant_head=invariant_head,
+                profile_head=profile_before_strategy,
+                task_head=task_before_strategy,
+                strategy_head=preflight_strategy_head,
+            )
+            assessment_messages = chat_core.build_messages(
+                assessment_instruction(user_input),
+                system=system_before_strategy,
+                history=[
+                    *invariant_head,
+                    *profile_before_strategy,
+                    *task_before_strategy,
+                    *preflight_strategy_head,
+                    *preflight_history,
+                ],
+            )
+            budget = self._token_budget()
+            assessment_tokens = self.counter.count(assessment_messages) if self.counter else None
+            if budget is not None and assessment_tokens is not None and assessment_tokens > budget:
+                raise ConfigurationError(
+                    "Invariant assessment не помещается в request budget",
+                    hint=(
+                        f"assessment={assessment_tokens}, budget={budget}; "
+                        "сократи invariant requirement"
+                    ),
+                )
+            invariant_result, invariant_assessment = self._assess_invariants(
+                assessment_messages, invariants
+            )
+            sent = invariant_result.sent_messages or assessment_messages
+            if self.counter is not None:
+                self.counter.calibrate(sent, invariant_result.usage.prompt_tokens)
+            if invariant_assessment.blocked:
+                return AgentReply(
+                    text="",
+                    history=list(history),
+                    result=invariant_result,
+                    context_tokens=assessment_tokens,
+                    context_exact=bool(
+                        self.counter and self.counter.exact and assessment_tokens is not None
+                    ),
+                    invariant_assessment=invariant_assessment,
+                    invariant_result=invariant_result,
+                )
 
         system = self.system_prompt()
         strategy = self.context_strategy
@@ -1411,9 +1611,9 @@ class Agent:
         profile_head = profile_messages(profile) if profile else []
         task_head = task_messages(task)
         strategy_head = head
-        protected_head = [*profile_head, *task_head, *strategy_head]
+        protected_head = [*invariant_head, *profile_head, *task_head, *strategy_head]
         trimmed = self._trim(working, system, user_input, head=protected_head)
-        if task_head and self.counter is not None:
+        if task_head and not invariant_head and self.counter is not None:
             budget = self._token_budget()
             if budget is not None and trimmed.tokens is not None and trimmed.tokens > budget:
                 baseline_final = chat_core.build_messages(
@@ -1431,6 +1631,13 @@ class Agent:
                             "либо увеличь context_limit"
                         ),
                     )
+        self._check_invariant_final_budget(
+            user_input=user_input,
+            system=system,
+            invariant_head=invariant_head,
+            baseline_head=[*profile_head, *task_head, *strategy_head],
+            trimmed=trimmed,
+        )
         # The safety-net trim cuts from the FRONT of `working` — exactly the
         # messages the cursor counts as already extracted. Left uncorrected,
         # facts_upto claims coverage of history that no longer exists, and next
@@ -1521,6 +1728,8 @@ class Agent:
             memory_upto=memory_upto_now if strategy == "memory" else 0,
             memory_update=memory_update if strategy == "memory" else None,
             memory_failed=memory_failed if strategy == "memory" else None,
+            invariant_assessment=invariant_assessment,
+            invariant_result=invariant_result,
         )
 
     def _detect_done(self, text: str) -> bool:

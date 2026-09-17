@@ -150,3 +150,32 @@ Live demo использует project-default Mistral model, streaming и дв�
 ```powershell
 uv run advent record --week 3 --day 13
 ```
+
+# Неделя 03, день 14 — Invariants and State Constraints
+
+`/invariant` добавляет session-scoped policy, которая имеет priority выше
+Task State и текущего user request. Правила не являются частью dialogue и
+сохраняются через restart, `/reset`, checkpoint и branch; `/new` их не удаляет.
+
+```text
+/invariant add no-public-network :: Do not expose the service to the public network.
+/invariant add approval-before-deploy :: Obtain explicit approval before deploy.
+/invariant list
+/invariant remove approval-before-deploy
+/invariant clear
+```
+
+При активных rules `adventagent` сначала выполняет отдельный structured JSON
+assessment. `compliant` запускает обычный answer call; в stderr после token
+panel видно `Invariant check: compliant`. Это не добавляется в stdout, поэтому
+`format=json` и `format=schema` сохраняют valid model-product output.
+
+`conflict`, `policy_conflict`, malformed JSON или assessment/API failure
+fail closed: answer call не запускается, Session dialogue не меняется, а REPL
+показывает named rule(s), explanation и safe alternative либо explicit
+`/invariant remove <id>`/`/invariant clear`. Raw assessment prompt и JSON не
+попадают в conversation journal; `/tokens` показывает rules block и отдельную
+стоимость assessment calls.
+
+`/invariant add|list|remove|clear` разрешены при paused Task State, хотя все
+model calls до `/task resume` по-прежнему blocked.

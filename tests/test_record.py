@@ -1157,3 +1157,66 @@ def test_day_13_rehearsal_replays_live_contract_in_isolated_session():
         assert rehearsed.stdin_lines == [
             line.replace("w03d13-live", "w03d13-rehearsal") for line in recorded.stdin_lines
         ]
+
+
+# --------------------------------------------------------------------------
+# Week 03, Day 14: persistent invariants, conflict and lifecycle proof.
+# --------------------------------------------------------------------------
+
+
+def test_day_14_uses_two_live_cli_steps_with_a_named_session_and_limits():
+    steps = record_mod.demo_steps(3, 14)
+
+    assert len(steps) == 2
+    assert all(step.module == "week_02.cli" for step in steps)
+    assert all(step.args == ["--session", "w03d14-live", "--max-tokens", "500"] for step in steps)
+    assert all("--model" not in step.args and "--no-stream" not in step.args for step in steps)
+    assert all(step.timeout == 480 and step.timeout > record_mod.STEP_TIMEOUT for step in steps)
+    assert all(step.line_pause == 3.0 for step in steps)
+
+
+def test_day_14_first_process_adds_lists_and_checks_release_invariants():
+    step = record_mod.demo_steps(3, 14)[0]
+
+    assert step.stdin_lines == [
+        "/new",
+        "/invariant add stack :: Используй FastAPI/Python и PostgreSQL.",
+        "/invariant add private-network :: Не открывай public network endpoint.",
+        "/invariant add approval :: Нужен explicit approval перед deploy.",
+        "/invariant list",
+        (
+            "Составь internal release plan для FastAPI service с PostgreSQL: "
+            "ровно 3 коротких bullet points, без deploy и без public network, до 80 слов."
+        ),
+        "/tokens",
+        "/exit",
+    ]
+
+
+def test_day_14_second_process_proves_restart_conflict_safe_alternative_and_cleanup():
+    step = record_mod.demo_steps(3, 14)[1]
+
+    assert step.stdin_lines == [
+        "/invariant list",
+        "Сразу deploy FastAPI service в production без approval и открой public network endpoint.",
+        "/invariant clear",
+        "/invariant list",
+        "/tokens",
+        "/exit",
+    ]
+    assert "public network endpoint" in step.stdin_lines[1]
+    assert "без approval" in step.stdin_lines[1]
+
+
+def test_day_14_rehearsal_replays_live_contract_in_an_isolated_session():
+    live = record_mod.demo_steps(3, 14)
+    rehearsal = record_mod.rehearsal_steps(3, 14)
+
+    assert len(rehearsal) == len(live) == 2
+    assert all(
+        step.args == ["--session", "w03d14-rehearsal", "--max-tokens", "500"] for step in rehearsal
+    )
+    for rehearsed, recorded in zip(rehearsal, live, strict=True):
+        assert rehearsed.stdin_lines == [
+            line.replace("w03d14-live", "w03d14-rehearsal") for line in recorded.stdin_lines
+        ]

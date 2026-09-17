@@ -71,6 +71,7 @@ def no_journal(monkeypatch):
     считаются токены недели, и выдуманные диалоги в нём означают испорченный
     подсчёт. Тесты, которым журнал нужен по существу, подменяют log_call сами."""
     monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: None)
+    monkeypatch.setattr(cli, "log_internal_call", lambda result, **kwargs: None)
 
 
 @pytest.fixture(autouse=True)
@@ -128,6 +129,62 @@ def _complete(replies=None, seen=None, **result_kwargs):
 def _shell(monkeypatch, tmp_path, complete=None, **params) -> cli.AgentShell:
     monkeypatch.setattr(cli.chat_core, "complete", complete or _complete())
     return cli.AgentShell(_config(**params), directory=tmp_path)
+
+
+# --- Day 14: Invariants ---------------------------------------------------
+
+
+def test_invariant_commands_persist_new_branch_and_pause(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/invariant add no-public-network :: Keep service private", shell)
+    cli._dispatch("/task start Release API :: Write plan :: Approve risks", shell)
+    cli._dispatch("/task pause waiting", shell)
+    cli._dispatch("/invariant add approval :: Require approval before deploy", shell)
+    cli._dispatch("/invariant list", shell)
+    assert capsys.readouterr().out == ""
+    assert {rule.id for rule in shell.invariants.rules} == {"no-public-network", "approval"}
+
+    cli._dispatch("/new", shell)
+    assert len(shell.invariants.rules) == 2
+    cli._dispatch("/branch policy", shell)
+    cli._dispatch("/invariant remove approval", shell)
+    assert {rule.id for rule in shell.invariants.rules} == {"no-public-network"}
+    cli._dispatch("/switch default", shell)
+    assert {rule.id for rule in shell.invariants.rules} == {"no-public-network", "approval"}
+
+
+def test_invariant_preflight_visible_check_and_refusal_are_not_conversation_turns(
+    monkeypatch, tmp_path, capsys
+):
+    compliant = (
+        '{"decision":"compliant","rule_ids":[],"explanation":"safe","safe_alternative":null}'
+    )
+    conflict = (
+        '{"decision":"conflict","rule_ids":["no-public-network"],'
+        '"explanation":"public endpoint forbidden","safe_alternative":"keep it private"}'
+    )
+    seen = []
+    shell = _shell(monkeypatch, tmp_path, complete=_complete([compliant, "answer", conflict], seen))
+    cli._dispatch("/invariant add no-public-network :: Keep service private", shell)
+    capsys.readouterr()
+
+    cli._turn(shell, "write private plan")
+    first = capsys.readouterr()
+    assert first.out == "answer\n"
+    assert "Invariant check: compliant" in _flat(first.err)
+    assert len(seen) == 2
+    assert shell.session.turns[-1].content == "answer"
+
+    cli._turn(shell, "publish to public internet")
+    second = capsys.readouterr()
+    assert second.out == ""
+    assert "Invariant conflict (no-public-network)" in _flat(second.err)
+    assert "Safe alternative: keep it private" in _flat(second.err)
+    assert len(seen) == 3
+    assert len(shell.session.turns) == 2
+    assert shell.invariant_assessment_calls == 2
+    assert shell.invariant_assessment_prompt_tokens == 20
+    assert shell.invariant_assessment_completion_tokens == 10
 
 
 # --- Day 13: Task State Machine --------------------------------------------

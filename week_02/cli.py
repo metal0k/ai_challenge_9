@@ -40,10 +40,24 @@ from advent_core.client import (
     resolve_alias,
 )
 from advent_core.compact import summary_messages
-from advent_core.config import DEFAULT_SYSTEM_PROMPT, Config, ConfigError, configured_secrets
+from advent_core.config import (
+    DEFAULT_SYSTEM_PROMPT,
+    Config,
+    ConfigError,
+    configured_secrets,
+    redact,
+)
 from advent_core.errors import AdventError
 from advent_core.facts import format_facts, render_note, validate_key
-from advent_core.journal import log_call
+from advent_core.invariants import (
+    INVARIANTS_STATE_KEY,
+    Invariant,
+    InvariantAssessment,
+    InvariantError,
+    InvariantSet,
+    invariant_messages,
+)
+from advent_core.journal import log_call, log_internal_call
 from advent_core.memory import (
     MemoryFailure,
     MemorySnapshot,
@@ -108,6 +122,11 @@ WEEK = 2
 # A compaction call is distinguished from a regular turn by kind=compact in
 # the journal, not by a day number.
 DAY = 10
+# Day 14 is additive to the long-lived agent.  Existing conversation and
+# service calls keep their historical journal provenance; only the new
+# invariant preflight records its Week 03 / Day 14 origin.
+INVARIANT_WEEK = 3
+INVARIANT_DAY = 14
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -286,6 +305,14 @@ class AgentShell:
     profile_values: dict[str, str] = field(default_factory=dict)
     task: TaskState | None = None
     task_needs_healing: bool = False
+    # Invariants are Session settings rather than conversation content: they
+    # outlive /new, while Session.clear() still removes summaries/facts/task.
+    invariants: InvariantSet = field(default_factory=InvariantSet)
+    invariants_needs_healing: bool = False
+    invariant_assessment_calls: int = 0
+    invariant_assessment_prompt_tokens: int = 0
+    invariant_assessment_completion_tokens: int = 0
+    invariant_assessment_failures: int = 0
 
     def __post_init__(self) -> None:
         try:
@@ -717,6 +744,7 @@ class AgentShell:
         self._apply_session_summary(session)
         self._apply_session_facts(session)
         self._apply_session_task(session)
+        self._apply_session_invariants(session)
         return resumed_dialog
 
     def _apply_session_task(self, session: Session) -> None:
@@ -737,6 +765,24 @@ class AgentShell:
         self.task = task
         status = "paused" if task.paused else task.phase
         console.note(f"подхвачена task: {status} · {task.current_step}")
+
+    def _apply_session_invariants(self, session: Session) -> None:
+        """Load all-or-nothing policy state without breaking a valid Session."""
+        self.invariants = InvariantSet()
+        self.invariants_needs_healing = False
+        if INVARIANTS_STATE_KEY not in session.state:
+            return
+        try:
+            self.invariants = InvariantSet.from_json(
+                session.state[INVARIANTS_STATE_KEY],
+                configured_secrets=_task_configured_secrets(self),
+            )
+        except InvariantError as error:
+            self.invariants_needs_healing = True
+            console.warn(f"в сессии {session.name} invariants повреждены — отключены ({error})")
+            return
+        if self.invariants.rules:
+            console.note(f"подхвачены invariants: {len(self.invariants.rules)}")
 
     def _apply_session_summary(self, session: Session) -> None:
         """Loads the summary and rewinds the working history to its boundary.
@@ -992,9 +1038,54 @@ def _turn(shell: AgentShell, question: str) -> None:
     # «контекст» показывал бы окно без этого обмена, хотя обещает следующий
     # запрос.
     _token_panel(shell, reply)
+    if reply.invariant_assessment is not None:
+        # stderr preserves machine-readable stdout for format=json/schema.
+        console.note("Invariant check: compliant")
 
     if shell.agent.mode == "dialog":
         _dialog_progress(shell, reply)
+
+
+def _report_invariant_assessment(
+    shell: AgentShell, assessment: InvariantAssessment, result: CallResult
+) -> None:
+    """Account and journal an internal preflight without its private payload."""
+    shell.invariant_assessment_calls += 1
+    shell.invariant_assessment_prompt_tokens += result.usage.prompt_tokens or 0
+    shell.invariant_assessment_completion_tokens += result.usage.completion_tokens or 0
+    if assessment.decision is None:
+        shell.invariant_assessment_failures += 1
+    log_internal_call(
+        result,
+        week=INVARIANT_WEEK,
+        day=INVARIANT_DAY,
+        kind="invariant_assessment",
+        status=assessment.decision or "failed",
+        extra={"rule_ids": list(assessment.rule_ids)},
+    )
+
+
+def _render_invariant_refusal(assessment: InvariantAssessment) -> None:
+    """A local refusal: never print model JSON or fabricate an answer call."""
+    if assessment.decision is None:
+        console.warn(
+            "Invariant check failed closed — ответ не сгенерирован: "
+            f"{redact(assessment.error or 'unknown assessment error')}"
+        )
+        console.note("Проверь invariants через /invariant list или исправь их explicit command")
+        return
+    ids = ", ".join(assessment.rule_ids)
+    if assessment.decision == "policy_conflict":
+        console.warn(
+            f"Invariant policy conflict ({ids}) — ответ не сгенерирован: "
+            f"{redact(assessment.explanation)}"
+        )
+        console.note(
+            f"Разреши конфликт explicit: /invariant remove <id> (rules: {ids}) или /invariant clear"
+        )
+        return
+    console.warn(f"Invariant conflict ({ids}) — запрос отклонён: {redact(assessment.explanation)}")
+    console.note(f"Safe alternative: {redact(assessment.safe_alternative or '')}")
 
 
 def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> AgentReply | None:
@@ -1014,6 +1105,7 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             memory_history=shell.session.history(),
             profile=shell.profile_values,
             task=shell.task,
+            invariants=shell.invariants,
             on_chunk=console.write_chunk if streaming else None,
         )
     except AdventError as error:
@@ -1038,6 +1130,12 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             error=error.message,
         )
         return None
+
+    if reply.invariant_assessment is not None and reply.invariant_result is not None:
+        _report_invariant_assessment(shell, reply.invariant_assessment, reply.invariant_result)
+        if reply.invariant_assessment.blocked:
+            _render_invariant_refusal(reply.invariant_assessment)
+            return None
 
     # result.stream, а не streaming: решение о стриме принимает агент, и
     # печатать ответ второй раз на несовпадении этих двух значений — самый
@@ -1105,6 +1203,7 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             reply.result.sent_messages,
             task=shell.task,
             profile=shell.profile_values,
+            invariants=shell.invariants,
         )
         or [{"role": "user", "content": question}],
         week=WEEK,
@@ -1118,13 +1217,22 @@ def _journal_messages(
     *,
     task: TaskState | None = None,
     profile: dict[str, str] | None = None,
+    invariants: InvariantSet | None = None,
 ) -> list[chat_core.Message]:
     """Exclude generated private context without deleting lookalike user text."""
     if not messages:
         return []
     task_pair = task_messages(task)
-    synthetic_task_indices: set[int] = set()
+    synthetic_indices: set[int] = set()
     protected_index = 1 if messages[0].get("role") == "system" else 0
+    invariant_pair = invariant_messages(invariants)
+    if (
+        invariant_pair
+        and [dict(message) for message in messages[protected_index:]][: len(invariant_pair)]
+        == invariant_pair
+    ):
+        synthetic_indices.update(range(protected_index, protected_index + len(invariant_pair)))
+        protected_index += len(invariant_pair)
     profile_pair = profiles.messages(profile) if profile else []
     if (
         profile_pair
@@ -1136,11 +1244,11 @@ def _journal_messages(
         task_pair
         and [dict(message) for message in messages[protected_index:]][: len(task_pair)] == task_pair
     ):
-        synthetic_task_indices.update(range(protected_index, protected_index + len(task_pair)))
+        synthetic_indices.update(range(protected_index, protected_index + len(task_pair)))
 
     kept: list[chat_core.Message] = []
     for index, message in enumerate(messages):
-        if index in synthetic_task_indices:
+        if index in synthetic_indices:
             continue
         content = str(message.get("content", ""))
         if not content.startswith("Профиль пользователя (учитывай") and not content.startswith(
@@ -1437,12 +1545,19 @@ def _save_state(shell: AgentShell) -> None:
         shell.session.state.pop(TASK_STATE_KEY, None)
     else:
         shell.session.state[TASK_STATE_KEY] = shell.task.to_json()
+    if shell.invariants.rules:
+        shell.session.state[INVARIANTS_STATE_KEY] = shell.invariants.to_json()
+    else:
+        # Missing is the canonical empty form.  It both survives /new and
+        # makes `/invariant clear` an explicit, durable removal.
+        shell.session.state.pop(INVARIANTS_STATE_KEY, None)
     # Structured Day 11 layers have independent atomic files.  Save them
     # before the transcript so a successful session write never falsely claims
     # that a dirty memory layer was persisted.
     shell._save_memory()
     if shell.save():
         shell.task_needs_healing = False
+        shell.invariants_needs_healing = False
 
 
 def _dialog_progress(shell: AgentShell, reply: AgentReply) -> None:
@@ -1508,7 +1623,9 @@ def _next_context_tokens(shell: AgentShell) -> int | None:
     if shell.counter is None:
         return None
     messages = chat_core.build_messages(
-        "", system=shell.agent.system_prompt(), history=shell.history
+        "",
+        system=shell.agent.system_prompt(),
+        history=[*invariant_messages(shell.invariants), *shell.history],
     )
     return shell.counter.count(messages)
 
@@ -2373,6 +2490,7 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
             if shell.task.paused or shell.task.phase == "done"
             else _num(_task_tokens(shell)),
         )
+    table.add_row("invariants", _invariant_label(shell))
     table.add_row("prompt/completion", f"{prompt_label}/{completion_label}")
     table.add_row("всего за сессию", _session_tokens_label(shell))
     table.add_row("следующий запрос", _context_label(shell))
@@ -2591,6 +2709,91 @@ def _cmd_task(shell: AgentShell, args: list[str]) -> bool:
     return False
 
 
+def _invariant_save(shell: AgentShell, replacement: InvariantSet) -> bool:
+    """Persist one invariant mutation transactionally, mirroring task state."""
+    previous_invariants = shell.invariants
+    previous_healing = shell.invariants_needs_healing
+    previous_state = copy.deepcopy(shell.session.state)
+    shell.invariants = replacement
+    shell.invariants_needs_healing = False
+    if replacement.rules:
+        shell.session.state[INVARIANTS_STATE_KEY] = replacement.to_json()
+    else:
+        shell.session.state.pop(INVARIANTS_STATE_KEY, None)
+    try:
+        shell.session.save()
+    except OSError as error:
+        shell.invariants = previous_invariants
+        shell.invariants_needs_healing = previous_healing
+        shell.session.state = previous_state
+        console.warn(f"invariants не сохранены ({error}) — mutation отменена")
+        return False
+    return True
+
+
+def _invariant_configured_secrets(shell: AgentShell) -> tuple[str, ...]:
+    return _task_configured_secrets(shell)
+
+
+def _invariant_list(shell: AgentShell) -> None:
+    if not shell.invariants.rules:
+        console.note("invariants: нет")
+        return
+    table = Table(title="Session invariants", show_header=True)
+    table.add_column("id", style="dim")
+    table.add_column("requirement")
+    for rule in shell.invariants.rules:
+        table.add_row(rule.id, rich_escape(rule.requirement))
+    console.err.print(table)
+
+
+@command(
+    "/invariant",
+    "session policy: add/list/remove/clear",
+    usage="/invariant <subcommand>",
+)
+def _cmd_invariant(shell: AgentShell, args: list[str]) -> bool:
+    if not args:
+        console.warn("нужно: /invariant add|list|remove|clear")
+        return False
+    sub, rest = args[0], args[1:]
+    try:
+        if sub == "list":
+            if rest:
+                console.warn("нужно: /invariant list (без arguments)")
+                return False
+            _invariant_list(shell)
+            return False
+        if sub == "clear":
+            if rest:
+                console.warn("нужно: /invariant clear (без arguments)")
+                return False
+            _invariant_save(shell, InvariantSet())
+            return False
+        if sub == "add":
+            parts = _task_segments(rest, 2, "/invariant add <id> :: <requirement>")
+            if parts is None:
+                return False
+            replacement = shell.invariants.add(
+                Invariant(*parts), configured_secrets=_invariant_configured_secrets(shell)
+            )
+            _invariant_save(shell, replacement)
+            return False
+        if sub == "remove":
+            if len(rest) != 1:
+                console.warn("нужно: /invariant remove <id>")
+                return False
+            # Reuse the authoritative slug validation without treating the
+            # supplied id as free-form text.
+            Invariant(rest[0], "validates id")
+            _invariant_save(shell, shell.invariants.remove(rest[0]))
+            return False
+        console.warn(f"неизвестная /invariant subcommand {sub!r}")
+    except InvariantError as error:
+        console.warn(str(error))
+    return False
+
+
 def _profile_tokens(shell: AgentShell) -> int | None:
     if shell.counter is None or not shell.profile_values:
         return None
@@ -2615,6 +2818,37 @@ def _task_tokens(shell: AgentShell) -> int | None:
     if total is None or overhead is None:
         return None
     return max(0, total - overhead)
+
+
+def _invariant_tokens(shell: AgentShell) -> int | None:
+    if shell.counter is None or not shell.invariants.rules:
+        return None
+    fragment = invariant_messages(shell.invariants)
+    empty = [{"role": "user", "content": ""}]
+    total = shell.counter.count([*fragment, *empty])
+    overhead = shell.counter.count(empty)
+    if total is None or overhead is None:
+        return None
+    return max(0, total - overhead)
+
+
+def _invariant_label(shell: AgentShell) -> str:
+    if not shell.invariants.rules:
+        return "нет; assessment calls 0"
+    mark = "" if shell.counter is not None and shell.counter.exact else "~"
+    parts = [
+        f"rules {len(shell.invariants.rules)}, block {mark}{_num(_invariant_tokens(shell))} tokens"
+    ]
+    failures = (
+        f", failed {shell.invariant_assessment_failures}"
+        if shell.invariant_assessment_failures
+        else ""
+    )
+    parts.append(
+        f"assessment calls {shell.invariant_assessment_calls}{failures}, cost "
+        f"{shell.invariant_assessment_prompt_tokens}/{shell.invariant_assessment_completion_tokens}"
+    )
+    return "; ".join(parts)
 
 
 def _summary_tokens(shell: AgentShell) -> int | None:
@@ -3463,6 +3697,15 @@ def _paused_command_allowed(parts: list[str], shell: AgentShell) -> bool:
         )
     if command == "/task":
         return len(parts) == 2 and parts[1] in {"show", "resume", "clear"}
+    if command == "/invariant":
+        if len(parts) < 2:
+            return False
+        sub = parts[1]
+        return (
+            (sub in {"list", "clear"} and len(parts) == 2)
+            or (sub == "remove" and len(parts) == 3)
+            or (sub == "add" and len(parts) >= 5)
+        )
     if shell.agent.mode == "dialog":
         if command == "/mode" and parts[1:] == ["chat"]:
             return True

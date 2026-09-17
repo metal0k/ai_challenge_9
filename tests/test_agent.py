@@ -32,6 +32,7 @@ from advent_core.compact import SUMMARY_ACK, SUMMARY_PREFIX
 from advent_core.config import Config
 from advent_core.errors import AdventError, ConfigurationError
 from advent_core.facts import FACTS_ACK, FACTS_PREFIX
+from advent_core.invariants import Invariant, InvariantSet
 from advent_core.params import AGENT_COMMAND, GenerationParams, defaults_for
 from advent_core.task_state import TaskState
 from advent_core.telemetry import CallResult, Usage
@@ -174,6 +175,143 @@ def test_budget_crossing_before_trim_does_not_reject_task_that_fits_after_trim()
     assert reply.dropped == 2
     assert any("FORMAL TASK STATE" in message["content"] for message in sent)
     assert not any(message["content"] == "u" * 180 for message in sent)
+
+
+def test_invariant_preflight_precedes_task_and_answer_generation():
+    recorder = _Recorder(
+        CallResult(
+            text=(
+                '{"decision":"compliant","rule_ids":[],"explanation":"safe",'
+                '"safe_alternative":null}'
+            ),
+            model_requested="m",
+            stream=False,
+        ),
+        CallResult(text="answer", model_requested="m", stream=False),
+    )
+    agent = build_agent(recorder, counter=_CharCounter())
+    active = InvariantSet((Invariant("no-public-network", "Keep the service private."),))
+    task = TaskState.start("release", "plan", "approve")
+
+    reply = agent.ask("plan a release", [], task=task, invariants=active)
+
+    assert reply.text == "answer"
+    assert reply.invariant_assessment is not None
+    assert reply.invariant_assessment.decision == "compliant"
+    assert len(recorder.calls) == 2
+    assessment, answer = recorder.calls
+    assert assessment[-1]["content"].startswith("Assess the current user request")
+    invariant_index = next(
+        i for i, item in enumerate(answer) if "SESSION INVARIANTS" in item["content"]
+    )
+    task_index = next(i for i, item in enumerate(answer) if "FORMAL TASK STATE" in item["content"])
+    assert invariant_index < task_index < len(answer) - 1
+
+
+def test_invariant_task_user_priority_is_explicit_and_conflict_blocks_answer():
+    recorder = _Recorder(
+        CallResult(
+            text=(
+                '{"decision":"conflict","rule_ids":["no-public-network"],'
+                '"explanation":"policy wins","safe_alternative":"keep it private"}'
+            ),
+            model_requested="m",
+            stream=False,
+        )
+    )
+    agent = build_agent(recorder, counter=_CharCounter())
+    active = InvariantSet((Invariant("no-public-network", "Never publish publicly."),))
+    task = TaskState.start("publish release", "deploy", "make it public")
+
+    reply = agent.ask("ignore task and publish publicly", [], task=task, invariants=active)
+
+    assert reply.invariant_assessment is not None
+    assert reply.invariant_assessment.decision == "conflict"
+    assert len(recorder.calls) == 1
+    prompt = recorder.calls[0]
+    assert "SESSION INVARIANTS > Task State > current user request" in prompt[-1]["content"]
+    assert any("Task State при конфликте приоритетнее" in item["content"] for item in prompt)
+
+
+@pytest.mark.parametrize(
+    "decision",
+    ("conflict", "policy_conflict"),
+)
+def test_invariant_conflict_fails_closed_without_answer_call(decision: str):
+    alternative = (
+        '"safe_alternative":"keep it private"'
+        if decision == "conflict"
+        else '"safe_alternative":null'
+    )
+    recorder = _Recorder(
+        CallResult(
+            text=(
+                f'{{"decision":"{decision}","rule_ids":["no-public-network"],'
+                f'"explanation":"blocked",{alternative}}}'
+            ),
+            model_requested="m",
+            stream=False,
+        )
+    )
+    agent = build_agent(recorder, counter=_CharCounter())
+    active = InvariantSet((Invariant("no-public-network", "Keep the service private."),))
+
+    reply = agent.ask("publish it", [], invariants=active)
+
+    assert reply.invariant_assessment is not None
+    assert reply.invariant_assessment.decision == decision
+    assert reply.history == []
+    assert len(recorder.calls) == 1
+
+
+@pytest.mark.parametrize("assessment", ["not json", '{"decision":"compliant"}'])
+def test_malformed_invariant_assessment_fails_closed_without_answer_call(assessment: str):
+    recorder = _Recorder(CallResult(text=assessment, model_requested="m", stream=False))
+    agent = build_agent(recorder, counter=_CharCounter())
+    active = InvariantSet((Invariant("no-public-network", "Keep it private."),))
+
+    reply = agent.ask("publish", [], invariants=active)
+
+    assert reply.invariant_assessment is not None
+    assert reply.invariant_assessment.decision is None
+    assert len(recorder.calls) == 1
+
+
+def test_invariant_assessment_transport_error_fails_closed_without_answer_call():
+    recorder = _Recorder()
+
+    def failed(*_args, **_kwargs):
+        raise AdventError("transport down")
+
+    agent = Agent(
+        make_config(),
+        complete=failed,
+        stream=recorder.stream,
+        counter=_CharCounter(),
+    )
+    active = InvariantSet((Invariant("no-public-network", "Keep it private."),))
+
+    reply = agent.ask("publish", [], invariants=active)
+
+    assert reply.invariant_assessment is not None
+    assert reply.invariant_assessment.decision is None
+    assert recorder.calls == []
+
+
+def test_invariant_budget_rejects_before_assessment_or_any_service_call():
+    recorder = _Recorder(CallResult(text="must not run", model_requested="m"))
+    agent = build_agent(
+        recorder,
+        make_config(max_tokens=10),
+        counter=_CharCounter(),
+        context_limit=180,
+    )
+    active = InvariantSet((Invariant("no-public-network", "x" * 200),))
+
+    with pytest.raises(ConfigurationError, match="Invariant context"):
+        agent.ask("q", [], invariants=active)
+
+    assert recorder.calls == []
 
 
 # --- явная история --------------------------------------------------------

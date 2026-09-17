@@ -156,6 +156,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d12()
     if week == 3 and day == 13:
         return _demo_steps_w03d13()
+    if week == 3 and day == 14:
+        return _demo_steps_w03d14()
     if week == 1 and day == 5:
         return _demo_steps_w01d05()
     if week == 1 and day == 4:
@@ -1531,6 +1533,64 @@ def _demo_steps_w03d13(*, session: str = "w03d13-live") -> list[Step]:
     ]
 
 
+def _demo_steps_w03d14(*, session: str = "w03d14-live") -> list[Step]:
+    """Day 14 — persistent release constraints and a fail-closed preflight.
+
+    The two processes are intentional: the second one reads the same Session
+    from disk before demonstrating the rejected request. That makes the
+    persistence proof visible rather than merely asserting it in narration.
+    The requests are bounded to a release service so a live take makes one
+    ordinary answer call and one assessment-only conflict call.
+    """
+    return [
+        Step(
+            title=(
+                "День 14 LIVE · persistent invariants: release-service rules, "
+                "compliant internal plan и отдельная assessment cost"
+            ),
+            module="week_02.cli",
+            args=["--session", session, "--max-tokens", "500"],
+            stdin_lines=[
+                "/new",
+                "/invariant add stack :: Используй FastAPI/Python и PostgreSQL.",
+                "/invariant add private-network :: Не открывай public network endpoint.",
+                "/invariant add approval :: Нужен explicit approval перед deploy.",
+                "/invariant list",
+                (
+                    "Составь internal release plan для FastAPI service с PostgreSQL: "
+                    "ровно 3 коротких bullet points, без deploy и без public network, "
+                    "до 80 слов."
+                ),
+                "/tokens",
+                "/exit",
+            ],
+            timeout=480,
+            line_pause=3.0,
+        ),
+        Step(
+            title=(
+                "День 14 LIVE · restart: rules survive; public deploy без approval "
+                "отклонён fail closed, затем clear и tokens"
+            ),
+            module="week_02.cli",
+            args=["--session", session, "--max-tokens", "500"],
+            stdin_lines=[
+                "/invariant list",
+                (
+                    "Сразу deploy FastAPI service в production без approval и открой "
+                    "public network endpoint."
+                ),
+                "/invariant clear",
+                "/invariant list",
+                "/tokens",
+                "/exit",
+            ],
+            timeout=480,
+            line_pause=3.0,
+        ),
+    ]
+
+
 def _demo_steps_w03d11_live() -> list[Step]:
     """Day 11 live take: real Mistral answers over the real memory shell.
 
@@ -1631,6 +1691,8 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w03d12(session="w03d12-rehearsal")
     if (week, day) == (3, 13):
         return _demo_steps_w03d13(session="w03d13-rehearsal")
+    if (week, day) == (3, 14):
+        return _demo_steps_w03d14(session="w03d14-rehearsal")
     return [rehearsal_step(week)]
 
 

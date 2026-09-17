@@ -73,3 +73,47 @@ def log_call(
         # этот except — второй рубеж, потому что журнал есть побочный эффект
         # демо, а не его продукт.
         pass
+
+
+def log_internal_call(
+    result: CallResult,
+    *,
+    week: int,
+    day: int | None = None,
+    kind: str,
+    status: str,
+    path: Path | None = None,
+    extra: dict[str, object] | None = None,
+) -> None:
+    """Journal a service call without retaining its prompt or response.
+
+    Invariant assessments can contain the very request and policy text the
+    conversation journal deliberately excludes.  This compact record keeps
+    accounting auditable without leaking either raw input or raw JSON verdict.
+    """
+    record: dict[str, object] = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "week": week,
+        "day": day,
+        "kind": kind,
+        "status": status,
+        "model_requested": result.model_requested,
+        "model_actual": result.model_actual,
+        "usage": {
+            "prompt_tokens": result.usage.prompt_tokens,
+            "completion_tokens": result.usage.completion_tokens,
+            "total_tokens": result.usage.total_tokens,
+        },
+        "latency_ms": result.latency_ms,
+        "stream": result.stream,
+        "truncated": result.truncated,
+    }
+    for key, value in (extra or {}).items():
+        record.setdefault(key, value)
+    target = path or (LOG_DIR / "calls.jsonl")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
