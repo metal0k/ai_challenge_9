@@ -190,8 +190,13 @@ Once the user explicitly authorizes publication:
 
 1. Re-run the final checks and record their result.
 2. Create a focused `commit` with no unrelated files and no `Co-Authored-By`.
-3. Push the branch, create or update the submission tag only if the project
-   convention and authorization permit it, and verify the remote target.
+3. Before any GitHub operation, read the project's credential rule. When it
+   specifies a token in `.env`, use that token only as an ephemeral header and
+   disable interactive credential flows (`GIT_TERMINAL_PROMPT=0`,
+   `GCM_INTERACTIVE=Never`, and `credential.helper=`). Never fall back to a
+   browser authorization dialog, Credential Manager, or a token embedded in a
+   URL. Push the branch, create or update the submission tag only if the
+   project convention and authorization permit it, and verify the remote target.
 4. Place the approved video under the required final name, upload it to the
    specified destination, and verify the returned public link opens to the
    intended artifact.
