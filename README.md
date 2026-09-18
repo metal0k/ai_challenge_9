@@ -60,6 +60,7 @@ uv run advent w01 bench                    # один запрос на лест
 | 03 | 12 | Персонализация ассистента | [`w03d12`](https://github.com/metal0k/ai_challenge_9/tree/w03d12) | [Yandex Disk](https://disk.yandex.ru/i/tdYTyrYJv2HjQw) |
 | 03 | 13 | Task State Machine | [`w03d13`](https://github.com/metal0k/ai_challenge_9/tree/w03d13) | [Yandex Disk](https://disk.yandex.ru/i/vg2a0TkPp4lUwQ) |
 | 03 | 14 | Инварианты и ограничения состояния | [`w03d14`](https://github.com/metal0k/ai_challenge_9/tree/w03d14) | [Yandex Disk](https://yadi.sk/i/bvV5ke6lGRawOw) |
+| 03 | 15 | Контролируемые переходы состояний | [`w03d15`](https://github.com/metal0k/ai_challenge_9/tree/w03d15) | [Yandex Disk](https://yadi.sk/i/35I1oYnE2emgOA) |
 
 ## Структура
 
