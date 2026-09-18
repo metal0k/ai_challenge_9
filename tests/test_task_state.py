@@ -26,6 +26,7 @@ def test_constructor_rejects_boolean_version():
         ("phase", "review"),
         ("goal", ""),
         ("current_step", "x\ny"),
+        ("plan_approved", 1),
         ("paused", 1),
     ],
 )
@@ -66,7 +67,7 @@ def test_configured_secret_has_absolute_priority_but_placeholders_are_allowed():
 
 
 def test_legal_forward_and_retry_transitions():
-    planning = task().update("Plan canary", "Approve plan")
+    planning = task().update("Plan canary", "Approve plan").approve()
     execution = planning.advance("execution", "Deploy canary", "Read metrics")
     validation = execution.advance("validation", "Check metrics", "Decide rollback")
     retry = validation.advance("execution", "Rollback", "Confirm recovery")
@@ -77,10 +78,44 @@ def test_legal_forward_and_retry_transitions():
         "phase": "done",
         "current_step": "Task completed",
         "expected_action": "none",
+        "plan_approved": True,
         "paused": False,
         "pause_reason": None,
         "result": "stable",
     }
+
+
+def test_legacy_task_without_plan_approval_requires_explicit_approval():
+    raw = task().to_json()
+    raw.pop("plan_approved")
+    restored = TaskState.from_json(raw)
+    assert restored.plan_approved is False
+    with pytest.raises(TaskStateError, match="/task approve"):
+        restored.advance("execution", "deploy", "observe")
+
+
+def test_approval_requires_active_planning_and_resets_after_plan_update():
+    approved = task().approve()
+    assert approved.plan_approved is True
+    with pytest.raises(TaskStateError, match="уже approved"):
+        approved.approve()
+    changed = approved.update("Revised plan", "Approve revised plan")
+    assert changed.plan_approved is False
+    with pytest.raises(TaskStateError, match="/task approve"):
+        changed.advance("execution", "deploy", "observe")
+    execution = changed.approve().advance("execution", "deploy", "observe")
+    with pytest.raises(TaskStateError, match="только в planning"):
+        execution.approve()
+    with pytest.raises(TaskStateError, match="paused"):
+        task().pause().approve()
+
+
+def test_retry_plan_approval_is_preserved():
+    approved = task().approve()
+    execution = approved.advance("execution", "deploy", "observe")
+    validation = execution.advance("validation", "check", "decide")
+    retry = validation.advance("execution", "rollback", "confirm")
+    assert retry.plan_approved is True
 
 
 @pytest.mark.parametrize("phase", ["planning", "validation", "done"])
@@ -105,6 +140,7 @@ def test_pause_preserves_work_and_allows_only_resume_semantically():
 def test_done_is_terminal_and_not_injected():
     done = (
         task()
+        .approve()
         .advance("execution", "ship", "observe")
         .advance("validation", "check", "decide")
         .complete("ok")
@@ -123,3 +159,12 @@ def test_task_messages_name_priority_and_are_matched_structurally():
     assert all(is_task_message(message, state) for message in messages)
     lookalike = {"role": "user", "content": messages[0]["content"] + " extra"}
     assert not is_task_message(lookalike, state)
+
+
+def test_task_messages_commands_present():
+    state = task()
+    messages = task_messages(state)
+    assert messages[1]["content"].find("/task approve") != -1
+    approved_state = state.approve()
+    approved_messages = task_messages(approved_state)
+    assert approved_messages[1]["content"].find("/task advance execution") != -1

@@ -2610,6 +2610,7 @@ def _task_show(shell: AgentShell) -> None:
     table.add_row("status", status)
     table.add_row("current step", rich_escape(task.current_step))
     table.add_row("expected action", rich_escape(task.expected_action))
+    table.add_row("plan approved", "yes" if task.plan_approved else "no")
     if task.pause_reason:
         table.add_row("pause reason", rich_escape(task.pause_reason))
     if task.result:
@@ -2619,12 +2620,12 @@ def _task_show(shell: AgentShell) -> None:
 
 @command(
     "/task",
-    "formal task state: start/show/update/advance/pause/resume/complete/clear",
+    "formal task state: start/show/update/approve/advance/pause/resume/complete/clear",
     usage="/task <subcommand>",
 )
 def _cmd_task(shell: AgentShell, args: list[str]) -> bool:
     if not args:
-        console.warn("нужно: /task start|show|update|advance|pause|resume|complete|clear")
+        console.warn("нужно: /task start|show|update|approve|advance|pause|resume|complete|clear")
         return False
     sub, rest = args[0], args[1:]
     try:
@@ -2668,6 +2669,13 @@ def _cmd_task(shell: AgentShell, args: list[str]) -> bool:
             if parts is None:
                 return False
             replacement = task.update(*parts, configured_secrets=_task_configured_secrets(shell))
+            _task_save(shell, replacement)
+            return False
+        if sub == "approve":
+            if rest:
+                console.warn("нужно: /task approve (без arguments)")
+                return False
+            replacement = task.approve(configured_secrets=_task_configured_secrets(shell))
             _task_save(shell, replacement)
             return False
         if sub == "advance":

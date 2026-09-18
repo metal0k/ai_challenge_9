@@ -57,6 +57,7 @@ class TaskState:
     phase: TaskPhase
     current_step: str
     expected_action: str
+    plan_approved: bool = False
     paused: bool = False
     pause_reason: str | None = None
     result: str | None = None
@@ -76,6 +77,8 @@ class TaskState:
         object.__setattr__(
             self, "expected_action", _text("expected_action", self.expected_action, 1000)
         )
+        if not isinstance(self.plan_approved, bool):
+            raise TaskStateError("plan_approved должен быть boolean")
         if not isinstance(self.paused, bool):
             raise TaskStateError("paused должен быть boolean")
         if self.pause_reason is not None:
@@ -119,6 +122,7 @@ class TaskState:
             phase=phase,  # type: ignore[arg-type]
             current_step=raw.get("current_step"),  # type: ignore[arg-type]
             expected_action=raw.get("expected_action"),  # type: ignore[arg-type]
+            plan_approved=raw.get("plan_approved", False),  # type: ignore[arg-type]
             paused=raw.get("paused"),  # type: ignore[arg-type]
             pause_reason=raw.get("pause_reason"),  # type: ignore[arg-type]
             result=raw.get("result"),  # type: ignore[arg-type]
@@ -131,6 +135,7 @@ class TaskState:
             "phase": self.phase,
             "current_step": self.current_step,
             "expected_action": self.expected_action,
+            "plan_approved": self.plan_approved,
             "paused": self.paused,
             "pause_reason": self.pause_reason,
             "result": self.result,
@@ -160,7 +165,22 @@ class TaskState:
         configured_secrets: Iterable[str] = (),
     ) -> TaskState:
         self._require_mutable()
-        state = replace(self, current_step=current_step, expected_action=expected_action)
+        state = replace(
+            self,
+            current_step=current_step,
+            expected_action=expected_action,
+            plan_approved=False if self.phase == "planning" else self.plan_approved,
+        )
+        state.validate_privacy(configured_secrets)
+        return state
+
+    def approve(self, *, configured_secrets: Iterable[str] = ()) -> TaskState:
+        self._require_mutable()
+        if self.phase != "planning":
+            raise TaskStateError("Plan можно approve только в planning")
+        if self.plan_approved:
+            raise TaskStateError("Plan уже approved")
+        state = replace(self, plan_approved=True)
         state.validate_privacy(configured_secrets)
         return state
 
@@ -180,6 +200,8 @@ class TaskState:
         }
         if phase not in allowed.get(self.phase, set()):
             raise TaskStateError(f"transition {self.phase} → {phase} запрещён")
+        if self.phase == "planning" and not self.plan_approved:
+            raise TaskStateError("Для transition в execution нужен /task approve")
         state = replace(
             self,
             phase=phase,  # type: ignore[arg-type]
@@ -238,7 +260,11 @@ def task_messages(task: TaskState | None) -> list[Message]:
     if task is None or task.paused or task.phase == "done":
         return []
     recommendations = {
-        "planning": "/task update … или /task advance execution …",
+        "planning": (
+            "/task update … или /task approve …"
+            if not task.plan_approved
+            else "/task update … или /task advance execution …"
+        ),
         "execution": "/task update … или /task advance validation …",
         "validation": "/task update …, /task advance execution … или /task complete …",
     }

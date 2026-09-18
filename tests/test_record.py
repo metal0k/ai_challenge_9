@@ -1160,6 +1160,41 @@ def test_day_13_rehearsal_replays_live_contract_in_isolated_session():
 
 
 # --------------------------------------------------------------------------
+# Week 03, Day 15: approval gate before execution and restart continuity.
+# --------------------------------------------------------------------------
+
+
+def test_day_15_records_approval_gate_pause_and_validation_before_done():
+    steps = record_mod.demo_steps(3, 15)
+    assert len(steps) == 2
+    assert all(step.module == "week_02.cli" for step in steps)
+    assert all(step.args == ["--session", "w03d15-live", "--max-tokens", "500"] for step in steps)
+    first, second = steps
+    early_advance = (
+        "/task advance execution Выполнить canary deploy :: Сообщить error rate и latency"
+    )
+    assert first.stdin_lines.index(early_advance) < first.stdin_lines.index("/task approve")
+    assert first.stdin_lines.count(early_advance) == 2
+    assert "Рекомендация: /task approve" in first.stdin_lines[2]
+    assert "/task pause Ожидаем metrics" in first.stdin_lines
+    assert second.stdin_lines[:2] == ["/task show", "/task resume"]
+    assert any(line.startswith("/task advance validation") for line in second.stdin_lines)
+    assert any(line.startswith("/task complete ") for line in second.stdin_lines)
+
+
+def test_day_15_rehearsal_replays_live_contract_in_isolated_session():
+    live = record_mod.demo_steps(3, 15)
+    rehearsal = record_mod.rehearsal_steps(3, 15)
+    assert all(
+        step.args == ["--session", "w03d15-rehearsal", "--max-tokens", "500"] for step in rehearsal
+    )
+    for rehearsed, recorded in zip(rehearsal, live, strict=True):
+        assert rehearsed.stdin_lines == [
+            line.replace("w03d15-live", "w03d15-rehearsal") for line in recorded.stdin_lines
+        ]
+
+
+# --------------------------------------------------------------------------
 # Week 03, Day 14: persistent invariants, conflict and lifecycle proof.
 # --------------------------------------------------------------------------
 

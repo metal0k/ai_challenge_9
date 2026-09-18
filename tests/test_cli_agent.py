@@ -197,6 +197,7 @@ def _start_task(shell: cli.AgentShell) -> None:
 def test_task_commands_persist_full_lifecycle_and_restart(monkeypatch, tmp_path, capsys):
     shell = _shell(monkeypatch, tmp_path)
     _start_task(shell)
+    cli._dispatch("/task approve", shell)
     cli._dispatch("/task advance execution Deploy canary :: Read metrics", shell)
     cli._dispatch("/task advance validation Check metrics :: Decide rollback", shell)
     cli._dispatch("/task advance execution Rollback canary :: Confirm recovery", shell)
@@ -208,6 +209,7 @@ def test_task_commands_persist_full_lifecycle_and_restart(monkeypatch, tmp_path,
     assert restarted.task.phase == "done"
     assert restarted.task.result == "Production stable"
     assert restarted.task.expected_action == "none"
+    assert restarted.task.plan_approved is True
     cli._dispatch("/task show", restarted)
     assert "Production stable" in _flat(capsys.readouterr().err)
 
@@ -218,6 +220,7 @@ def test_successful_task_mutations_are_silent(monkeypatch, tmp_path, capsys):
     commands = [
         "/task start Release API :: Write plan :: Approve risks",
         "/task update Plan canary :: Approve plan",
+        "/task approve",
         "/task advance execution Deploy canary :: Read metrics",
         "/task pause waiting",
         "/task resume",
@@ -237,10 +240,12 @@ def test_illegal_task_transition_and_extra_delimiter_do_not_mutate(monkeypatch, 
     shell = _shell(monkeypatch, tmp_path)
     _start_task(shell)
     before = shell.task
+    cli._dispatch("/task advance execution deploy :: observe", shell)
     cli._dispatch("/task advance validation skip :: no", shell)
     cli._dispatch("/task update one :: two :: three", shell)
     assert shell.task == before
     stderr = _flat(capsys.readouterr().err)
+    assert "/task approve" in stderr
     assert "transition planning → validation запрещён" in stderr
     assert "delimiter" in stderr
 
@@ -608,6 +613,23 @@ def test_task_show_resume_and_clear_reject_extra_arguments(monkeypatch, tmp_path
     cli._dispatch("/task resume extra", shell)
     cli._dispatch("/task clear extra", shell)
     assert shell.task == paused
+
+
+def test_task_approval_is_visible_and_paused_command_is_blocked(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/task show", shell)
+    shown = _flat(capsys.readouterr().err)
+    assert "plan approved" in shown and "no" in shown
+    cli._dispatch("/task approve", shell)
+    cli._dispatch("/task show", shell)
+    shown = _flat(capsys.readouterr().err)
+    assert "plan approved" in shown and "yes" in shown
+    cli._dispatch("/task pause wait", shell)
+    paused = shell.task
+    cli._dispatch("/task approve", shell)
+    assert shell.task == paused
+    assert "команда blocked" in _flat(capsys.readouterr().err)
 
 
 def test_tokens_distinguish_running_paused_done_and_absent_task(monkeypatch, tmp_path, capsys):

@@ -158,6 +158,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d13()
     if week == 3 and day == 14:
         return _demo_steps_w03d14()
+    if week == 3 and day == 15:
+        return _demo_steps_w03d15()
     if week == 1 and day == 5:
         return _demo_steps_w01d05()
     if week == 1 and day == 4:
@@ -1533,6 +1535,61 @@ def _demo_steps_w03d13(*, session: str = "w03d13-live") -> list[Step]:
     ]
 
 
+def _demo_steps_w03d15(*, session: str = "w03d15-live") -> list[Step]:
+    return [
+        Step(
+            title="День 15 LIVE · explicit plan approval blocks early execution",
+            module="week_02.cli",
+            args=["--session", session, "--max-tokens", "500"],
+            stdin_lines=[
+                "/new",
+                (
+                    "/task start Выпустить платёжный API без downtime :: "
+                    "Составить безопасный release plan :: Подтвердить риски и rollback criteria"
+                ),
+                (
+                    "Составь release plan: ровно 4 коротких bullet points, до 90 слов, "
+                    "без code blocks. В последней строке обязательно: "
+                    "Рекомендация: /task approve"
+                ),
+                "/task advance execution Выполнить canary deploy :: Сообщить error rate и latency",
+                "/task show",
+                "/task approve",
+                "/task advance execution Выполнить canary deploy :: Сообщить error rate и latency",
+                "/task pause Ожидаем metrics",
+                "Продолжай deploy без ожидания.",
+                "/task show",
+                "/exit",
+            ],
+            timeout=480,
+            line_pause=3.0,
+        ),
+        Step(
+            title="День 15 LIVE · restart, resume and validation before done",
+            module="week_02.cli",
+            args=["--session", session, "--max-tokens", "500"],
+            stdin_lines=[
+                "/task show",
+                "/task resume",
+                (
+                    "Продолжай с текущего шага: ровно 3 коротких bullet points, "
+                    "до 80 слов, без code blocks."
+                ),
+                (
+                    "/task advance validation Проверить error rate и latency :: "
+                    "Зафиксировать результат"
+                ),
+                "/task complete Release validation прошла, production stable",
+                "/task show",
+                "/task clear",
+                "/exit",
+            ],
+            timeout=480,
+            line_pause=3.0,
+        ),
+    ]
+
+
 def _demo_steps_w03d14(*, session: str = "w03d14-live") -> list[Step]:
     """Day 14 — persistent release constraints and a fail-closed preflight.
 
@@ -1693,6 +1750,8 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w03d13(session="w03d13-rehearsal")
     if (week, day) == (3, 14):
         return _demo_steps_w03d14(session="w03d14-rehearsal")
+    if (week, day) == (3, 15):
+        return _demo_steps_w03d15(session="w03d15-rehearsal")
     return [rehearsal_step(week)]
 
 

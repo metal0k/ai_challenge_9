@@ -179,3 +179,28 @@ fail closed: answer call не запускается, Session dialogue не ме
 
 `/invariant add|list|remove|clear` разрешены при paused Task State, хотя все
 model calls до `/task resume` по-прежнему blocked.
+
+# Неделя 03, день 15 — Контролируемые переходы состояний
+
+`planning → execution` требует explicit `/task approve`: model может дать
+recommendation, но не меняет state. `/task update` в `planning` сбрасывает
+approval, поэтому изменённый plan надо подтвердить заново. `validation` остаётся
+обязательным перед `/task complete`, а retry `validation → execution` сохраняет
+первоначальный approval.
+
+```text
+/task start Выпустить API :: Составить plan :: Подтвердить риски
+/task update Уточнить rollback plan :: Подтвердить изменённый plan
+/task approve
+/task advance execution Выполнить canary :: Проверить metrics
+/task advance validation Проверить metrics :: Зафиксировать результат
+/task complete Production stable
+```
+
+`plan_approved` сохраняется через restart; legacy session без этого key
+трактуется как unapproved. `/task show` отображает status, а pause блокирует и
+ordinary prompt, и `/task approve` до `/task resume`.
+
+```powershell
+uv run advent record --week 3 --day 15
+```
