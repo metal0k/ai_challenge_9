@@ -47,6 +47,12 @@ class StreamTruncated(AdventError):
     exit_code = 7
 
 
+class MCPError(AdventError):
+    """MCP connection failure: spawn, handshake, timeout or protocol (week 04)."""
+
+    exit_code = 8
+
+
 class ConfigurationError(AdventError):
     """Ошибка конфигурации, долетевшая до слоя chat.py (обычно из formats.py).
 

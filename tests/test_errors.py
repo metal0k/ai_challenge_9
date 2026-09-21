@@ -93,3 +93,13 @@ def test_non_400_statuses_are_untouched(status):
     error = translate(_DuckError(status, "Prompt 1 > 0 maximum context length"))
 
     assert "окно модели" not in error.message
+
+
+def test_mcp_error_has_exit_code_8_and_keeps_message_and_hint():
+    from advent_core.errors import AdventError, MCPError
+
+    error = MCPError("нет сервера", hint="проверьте --server")
+    assert error.exit_code == 8
+    assert error.message == "нет сервера"
+    assert error.hint == "проверьте --server"
+    assert isinstance(error, AdventError)

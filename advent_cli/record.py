@@ -75,6 +75,8 @@ DEFAULT_MODULE = "advent_cli"
 MODULE_COMMANDS = {
     DEFAULT_MODULE: "advent",
     "week_02.cli": "adventagent",
+    # Week 04 (MCP) has its own entry point, like week 02's agent.
+    "week_04.cli": "adventmcp",
     # День 07 показывает файл сессии глазами — подпись в кадре должна
     # соответствовать тому, что зритель может повторить.
     "json.tool": "python -m json.tool",
@@ -160,6 +162,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 4 and day == 16:
+        return _demo_steps_w04d16()
     if week == 1 and day == 5:
         return _demo_steps_w01d05()
     if week == 1 and day == 4:
@@ -1535,6 +1539,39 @@ def _demo_steps_w03d13(*, session: str = "w03d13-live") -> list[Step]:
     ]
 
 
+def _demo_steps_w04d16() -> list[Step]:
+    """Day 16 — MCP connection: handshake, tool list, verification, failure, wire log.
+
+    No stdin and no API calls: the client spawns this repo's own stdio server
+    locally. The verdict line, the error text and the raw frames are the
+    headlines, so each step holds the screen longer than the shared pause.
+    """
+    return [
+        Step(
+            title="1. Подключение к MCP-серверу: handshake, список инструментов, сверка",
+            module="week_04.cli",
+            args=["tools"],
+            timeout=60,
+            line_pause=5.0,
+        ),
+        Step(
+            title="2. Сервер не стартует: exit 8 и понятная причина вместо traceback",
+            module="week_04.cli",
+            args=["tools", "--server", "no-such-mcp-server"],
+            expect_failure=True,
+            timeout=60,
+            line_pause=5.0,
+        ),
+        Step(
+            title="3. Сырой лог: JSON-RPC кадры в обе стороны (→ клиент, ← сервер)",
+            module="week_04.cli",
+            args=["tools", "--raw"],
+            timeout=60,
+            line_pause=6.0,
+        ),
+    ]
+
+
 def _demo_steps_w03d15(*, session: str = "w03d15-live") -> list[Step]:
     return [
         Step(
@@ -1722,6 +1759,14 @@ def rehearsal_step(week: int) -> Step:
     §17.2). Сессия репетиции — своя: `/params` и заведомо неверная команда
     ходов не пишут, но подставлять сюда демо-сессию всё равно нельзя.
     """
+    if week == 4:
+        # Cheap machinery check: spawn, exit code and the Cyrillic error text.
+        return Step(
+            title="репетиция",
+            module="week_04.cli",
+            args=["tools", "--server", "no-such-mcp-server"],
+            expect_failure=True,
+        )
     if week == 3:
         return Step(
             title="репетиция Day 11 offline demo",

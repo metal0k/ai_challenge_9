@@ -1160,6 +1160,43 @@ def test_day_13_rehearsal_replays_live_contract_in_isolated_session():
 
 
 # --------------------------------------------------------------------------
+# Week 04, Day 16: MCP connection demo.
+# --------------------------------------------------------------------------
+
+
+def test_day_16_records_success_then_failure_then_raw_frames():
+    steps = record_mod.demo_steps(4, 16)
+    assert [step.args for step in steps] == [
+        ["tools"],
+        ["tools", "--server", "no-such-mcp-server"],
+        ["tools", "--raw"],
+    ]
+    assert all(step.module == "week_04.cli" for step in steps)
+    assert [step.expect_failure for step in steps] == [False, True, False]
+    assert all(step.stdin_lines == [] and step.note is None for step in steps)
+    assert all(step.line_pause is not None and step.line_pause >= 5.0 for step in steps)
+    assert all(step.timeout == 60 for step in steps)
+
+
+def test_day_16_titles_are_short_and_numbered():
+    titles = [step.title for step in record_mod.demo_steps(4, 16)]
+    assert [title[:2] for title in titles] == ["1.", "2.", "3."]
+    assert all(len(title) < 100 for title in titles)
+
+
+def test_week_04_module_is_shown_as_adventmcp_in_the_caption():
+    assert record_mod.MODULE_COMMANDS["week_04.cli"] == "adventmcp"
+
+
+def test_week_04_rehearsal_uses_the_mcp_entry_point_not_a_missing_w04_group():
+    steps = record_mod.rehearsal_steps(4, 16)
+    assert len(steps) == 1
+    assert steps[0].module == "week_04.cli"
+    assert steps[0].args == ["tools", "--server", "no-such-mcp-server"]
+    assert steps[0].expect_failure is True
+
+
+# --------------------------------------------------------------------------
 # Week 03, Day 15: approval gate before execution and restart continuity.
 # --------------------------------------------------------------------------
 

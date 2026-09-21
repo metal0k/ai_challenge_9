@@ -20,6 +20,7 @@ dependencies = [
     # опциональный extra: без неё день не работает, а условный импорт усложнил
     # бы код ровно там, где он должен читаться легко. Тянет numpy и pycountry.
     "mistral-common>=1.8.6",
+    "mcp>=2,<3",
 ]
 
 [project.scripts]
@@ -28,6 +29,8 @@ advent = "advent_cli.app:main"
 # («Оптимизация агента») продолжает ТОГО ЖЕ агента, и привязка к номеру недели
 # заставила бы week_03 либо импортировать чужую неделю, либо форкнуть код.
 adventagent = "week_02.cli:main"
+# Week 04 (MCP): a client is a separate process family, not an `advent` group.
+adventmcp = "week_04.cli:main"
 
 [dependency-groups]
 dev = [
@@ -40,7 +43,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["advent_core", "advent_cli", "week_01", "week_02"]
+packages = ["advent_core", "advent_cli", "week_01", "week_02", "week_04"]
 
 [tool.ruff]
 line-length = 100
