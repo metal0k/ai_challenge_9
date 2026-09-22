@@ -894,3 +894,28 @@ same seconds. `mistral-large-latest` refuses differently, with 403
 `advent w01 models` never shows it. Three different shapes of "you cannot use
 this model", none of which is an outage — check the headers before diagnosing
 one.
+
+**`chat.complete()`/`stream()` can hand back the exact list object you passed
+in, and a caller that keeps mutating it corrupts an already-returned
+`CallResult`.** `CallResult.sent_messages` is built from `payload["messages"]`,
+and `_payload()` returns the caller's `messages` list unchanged (by identity)
+whenever `format == "text"` — the common case. Day 17's tool-calling loop kept
+appending to its own message list across up to three rounds, and because each
+round's `CallResult` had already been parked (cost must survive the turn,
+CLAUDE.md's own day-09 rule), every earlier round's `sent_messages` silently
+grew to include later rounds' messages too — a journal row for round 1 ended
+up recording round 3's tool output. Any code that holds onto a `CallResult`
+across more than one `complete()`/`stream()` call on the *same* mutable
+message list needs to snapshot (`list(payload["messages"])`) rather than trust
+the field is its own copy.
+
+**A `tools=` payload is invisible to the exact token counter and to
+`reconcile()`, and the gap is not small.** `CallResult.sent_messages` only
+ever holds the chat messages; the `tools` JSON Schema goes into a separate
+`payload["tools"]` key that no counter ever sees. Measured on one `git_log`
+call (day 17): the local exact count came to 384 against a real server
+`prompt_tokens` of 781 — the schema alone was roughly half the request. Any
+future day that sends `tools=` has to skip `reconcile()`/`calibrate()` on
+those turns (a mismatch there is not "the tokenizer table drifted", it is
+"the schema was never counted") rather than let it print a false-positive
+warning on camera.
