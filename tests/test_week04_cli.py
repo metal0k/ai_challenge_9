@@ -30,9 +30,12 @@ def own_server_arg() -> str:
 def test_default_server_lists_tools_and_verifies_them():
     proc = run_cli("tools")
     assert proc.returncode == 0
-    for name in ("list_days", "get_task", "count_tokens"):
+    # Четвёртый инструмент — git_log дня 17; счётчик сверки растёт вместе с
+    # TOOL_NAMES, и число здесь литеральное намеренно: взятое из того же
+    # списка, что и код, оно не могло бы покраснеть никогда.
+    for name in ("list_days", "get_task", "count_tokens", "git_log"):
         assert name in proc.stdout
-    assert "✓ 3 из 3 инструментов совпадают с ожидаемыми" in proc.stdout
+    assert "✓ 4 из 4 инструментов совпадают с ожидаемыми" in proc.stdout
     assert "week: integer · обязательный" in proc.stdout
     assert "model: string · опциональный" in proc.stdout
     assert "по умолчанию ministral-14b-latest" in proc.stdout

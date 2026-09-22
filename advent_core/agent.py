@@ -25,6 +25,7 @@ import json
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from advent_core import chat as chat_core
 from advent_core import formats
@@ -63,6 +64,11 @@ from advent_core.profiles import messages as profile_messages
 from advent_core.task_state import TaskState, task_messages
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCounter, reconcile
+
+if TYPE_CHECKING:
+    # Type name only. A runtime import would make the MCP SDK (anyio, mcp) a
+    # hard dependency of every Agent import — the agent stays MCP-agnostic.
+    from advent_core.mcp_client import ToolCallOutcome
 
 # Сигнатуры шва: те же, что у chat.complete/chat.stream. Callable[..., ...] —
 # не лень, а осознанное послабление: mypy всё равно не проверит соответствие
@@ -143,6 +149,11 @@ MEMORY_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "memory_delta
 # вместе с ним (в том числе в файл сессии).
 INTERRUPT_NOTE = "[ответ прерван пользователем и остался незаконченным]"
 
+# Tool rounds per ask() (SPEC-w04d17.md §4). The model may fix its own bad
+# arguments (n=100 → error → n=20), but a misbehaving one must not loop: every
+# round is a paid call.
+MAX_TOOL_ROUNDS = 3
+
 
 @dataclass(slots=True, frozen=True)
 class Compaction:
@@ -209,6 +220,43 @@ class FactsFailure:
 
     result: CallResult
     reason: str  # "truncated" (hit FACTS_RESPONSE_TOKENS) or "invalid" (bad JSON/schema)
+
+
+@dataclass(slots=True, frozen=True)
+class ToolCallLog:
+    """One actual tool invocation — the FREE half of a tool round.
+
+    Paid rounds park in `pending_tool_rounds` (they must survive a failed
+    turn); this rides the return value instead, because nothing is lost with
+    money attached. `arguments` is the PARSED dict actually handed to the
+    callback, not the SDK's raw string — the journal (kind="mcp_tool") and the
+    stderr note both want what the tool really got.
+    """
+
+    name: str
+    arguments: dict
+    result_text: str
+    is_error: bool
+
+
+def _parse_tool_arguments(raw: str | dict) -> dict[str, Any]:
+    """RawToolCall.arguments → dict. SDK types allow both str and dict.
+
+    A live probe (2026-09-22) only ever showed a JSON string, but the type
+    branch is real, so both are accepted. Raises ValueError/TypeError on
+    anything else — the caller turns that into a tool error the model sees.
+    """
+    if isinstance(raw, dict):
+        return raw
+    parsed = json.loads(raw or "{}")
+    if not isinstance(parsed, dict):
+        raise ValueError("верхний уровень не объект")
+    return parsed
+
+
+def _arguments_text(raw: str | dict) -> str:
+    """Wire form echoed back to the API: always a string, even when it came as a dict."""
+    return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
 
 
 @dataclass(slots=True, frozen=True)
@@ -288,6 +336,13 @@ class AgentReply:
     # retaining the assessment prompt or raw JSON in Session history.
     invariant_assessment: InvariantAssessment | None = None
     invariant_result: CallResult | None = None
+    # Day 17. Tool calls actually made this turn, in order, across all rounds —
+    # free (no Mistral request), for the stderr note and kind="mcp_tool".
+    tool_calls: tuple[ToolCallLog, ...] = ()
+    # Paid tool-loop rounds 1..N−1 — the final round is `result` as usual. On
+    # MAX_TOOL_ROUNDS exhaustion the last result is BOTH (SPEC-w04d17.md §4.4):
+    # the caller must not double-count it in /tokens.
+    tool_round_results: tuple[CallResult, ...] = ()
 
 
 def marker_instruction(kind: str, needle: str) -> str:
@@ -400,6 +455,9 @@ class Agent:
         facts_prompt: str | None = None,
         memory_prompt: str | None = None,
         on_warning: Callable[[str], None] | None = None,
+        tools: Sequence[dict] | None = None,
+        call_tool: Callable[[str, dict[str, Any]], ToolCallOutcome] | None = None,
+        mcp_enabled: bool = False,
     ) -> None:
         self.config = config
         self._complete = complete
@@ -445,11 +503,40 @@ class Agent:
         self.pending_facts_failed: FactsFailure | None = None
         self.pending_memory: MemoryUpdate | None = None
         self.pending_memory_failed: MemoryFailure | None = None
+        # Day 17 function calling. None/False everywhere means "no tools":
+        # a plain sentinel, not a function default captured at import — the
+        # trap that complete/stream above exist to avoid does not apply here.
+        # Mistral FunctionTool-shaped dicts, assembled once by the caller.
+        self.tools = tools
+        # Sync callback "run this tool". By contract it NEVER raises: the
+        # caller catches MCPError and returns ToolCallOutcome(is_error=True).
+        self._call_tool = call_tool
+        self.mcp_enabled = mcp_enabled
+        # Paid tool-loop rounds parked the moment they arrive — round 2 may
+        # never happen, and a round that cost money must survive the turn
+        # (day 09's rule, same shape as pending_compaction above).
+        self.pending_tool_rounds: list[CallResult] = []
         self._on_warning = on_warning
         # Одинаковые предупреждения не повторяются каждый ход: в разговоре на
         # двадцать реплик «лимит окна неизвестен» двадцать раз — это шум, в
         # котором тонет то, что случилось только что.
         self._said: set[str] = set()
+
+    @property
+    def call_tool(self) -> Callable[[str, dict[str, Any]], ToolCallOutcome] | None:
+        """Публичное имя колбэка вызова инструмента; поле хранится как `_call_tool`.
+
+        Property, а не голый атрибут: `ask()` читает `self._call_tool`, и
+        обычное `agent.call_tool = ...` из CLI молча завело бы ВТОРОЙ атрибут,
+        которого никто не читает, — инструменты выглядели бы подключёнными и
+        не вызывались бы ни разу. Симметрия с `tools`/`mcp_enabled`, которые
+        так и настраиваются: присваиванием живому агенту.
+        """
+        return self._call_tool
+
+    @call_tool.setter
+    def call_tool(self, value: Callable[[str, dict[str, Any]], ToolCallOutcome] | None) -> None:
+        self._call_tool = value
 
     # --- предупреждения наверх -------------------------------------------
 
@@ -795,6 +882,89 @@ class Agent:
         pending = self.pending_compaction
         self.pending_compaction = None
         return pending
+
+    def take_pending_tool_rounds(self) -> list[CallResult]:
+        """Paid tool-loop rounds. Hands them over exactly once."""
+        pending = self.pending_tool_rounds
+        self.pending_tool_rounds = []
+        return pending
+
+    def _run_tool_loop(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[CallResult, list[ToolCallLog]]:
+        """Up to MAX_TOOL_ROUNDS function-calling rounds; the last result is the turn's.
+
+        Returns a pair, like _run_facts/_run_memory: the CallResult that
+        becomes AgentReply.result, plus the free per-call log. The tool
+        messages are EPHEMERAL — they live only inside this call and never
+        reach the persistent history (SPEC-w04d17.md §6 of the interview), so
+        `local_messages` is a loose list[dict[str, Any]] rather than
+        list[Message]: `tool_calls`/`role:"tool"` do not fit dict[str, str].
+
+        No streaming here on purpose: tool rounds always go through
+        complete() (chat.py's own docstring says why).
+        """
+        local_messages: list[dict[str, Any]] = list(messages)
+        logs: list[ToolCallLog] = []
+        result: CallResult | None = None
+        for _round in range(MAX_TOOL_ROUNDS):
+            result = self._complete(
+                self.config,
+                local_messages,
+                self.capabilities,
+                tools=self.tools,
+                tool_choice="auto",
+            )
+            if not result.tool_calls:
+                # Final answer: the turn's one ordinary paid call, nothing parked.
+                return result, logs
+            # Park BEFORE running any tool: the next round may never happen.
+            self.pending_tool_rounds.append(result)
+            local_messages.append(
+                {
+                    # Probe 2026-09-22: content comes back as '' on a tool
+                    # round, and it must stay a string — counters read it.
+                    "role": "assistant",
+                    "content": result.text or "",
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": _arguments_text(call.arguments),
+                            },
+                        }
+                        for call in result.tool_calls
+                    ],
+                }
+            )
+            for call in result.tool_calls:
+                try:
+                    arguments = _parse_tool_arguments(call.arguments)
+                except (ValueError, TypeError) as error:
+                    # Unparsable arguments are the model's mistake, not a
+                    # crash: feed it back as a tool error and let the same
+                    # retry path the day is built on handle it.
+                    text = f"аргументы вызова не разобрать как JSON-объект: {error}"
+                    logs.append(ToolCallLog(call.name, {}, text, True))
+                else:
+                    outcome = self._call_tool(call.name, arguments)  # never raises, by contract
+                    text = outcome.text
+                    logs.append(ToolCallLog(call.name, arguments, text, outcome.is_error))
+                local_messages.append(
+                    {
+                        "role": "tool",
+                        "content": text,
+                        "tool_call_id": call.id,
+                        "name": call.name,
+                    }
+                )
+        self._warn(f"инструмент вызывался {MAX_TOOL_ROUNDS} раза, финального ответа модель не дала")
+        # The last round is already parked AND becomes the reply's result —
+        # the overlap is deliberate (SPEC-w04d17.md §4.4), not an oversight.
+        assert result is not None  # MAX_TOOL_ROUNDS >= 1, so the loop ran
+        return result, logs
 
     def compact_now(
         self,
@@ -1663,7 +1833,17 @@ class Agent:
                 user_input, system=system, history=[*protected_head, *trimmed.history]
             )
 
-        if on_chunk is not None and chat_core.should_stream(self.config):
+        tool_logs: list[ToolCallLog] = []
+        # Whether `tools` went into the payload this turn — decided BEFORE the
+        # call, so it holds even when the model never touched a tool.
+        tool_messages_sent = bool(self.mcp_enabled and self.tools and self._call_tool)
+        if tool_messages_sent:
+            # Tools take the complete() path whatever on_chunk says — the
+            # decision is made before it is known whether the model will even
+            # call a tool, so /mcp on silences streaming for the whole session
+            # (SPEC-w04d17.md §3), the same trade format=json already makes.
+            result, tool_logs = self._run_tool_loop(messages)
+        elif on_chunk is not None and chat_core.should_stream(self.config):
             result = self._stream(self.config, messages, on_chunk, self.capabilities)
         else:
             result = self._complete(self.config, messages, self.capabilities)
@@ -1685,6 +1865,9 @@ class Agent:
         self.pending_memory = None
         facts_failed = self.take_pending_facts_failed()
         memory_failed = self.take_pending_memory_failed() or memory_failed
+        # Drained unconditionally, whatever the turn did: take_* empties the
+        # list, and a round left parked here would be billed to the next turn.
+        tool_rounds = self.take_pending_tool_rounds()
 
         # Сверять надо с тем, что РЕАЛЬНО ушло в API: слой формата дописывает
         # инструкцию к system внутри chat._payload(), и сверка «до слоя» дала
@@ -1693,11 +1876,27 @@ class Agent:
         # (посчитанный ДО отправки, когда sent_messages ещё нет) при
         # format != text немного занижен — это цена показа заполненности
         # заранее, и она честнее, чем показ после отправки.
+        #
+        # Ход с инструментами из сверки исключён целиком, и это не
+        # послабление. Схемы `tools` едут в payload отдельным полем, а
+        # `sent_messages` их не содержит — локальный счёт занижен ровно на их
+        # объём (живой замер 2026-09-22: 384 против 781 у сервера на одном
+        # git_log). Предупредить тут значило бы объявить поломкой известную
+        # разницу, а откалиброваться — научить оценщик, что запросы вдвое
+        # больше, чем они есть, и испортить счёт всем последующим ходам, в
+        # том числе после /mcp off.
         sent = result.sent_messages or messages
-        if self.counter is not None:
+        if self.counter is not None and not tool_messages_sent:
             check = reconcile(self.counter, sent, result.usage.prompt_tokens)
             self._warn(check.warning())
             self.counter.calibrate(sent, result.usage.prompt_tokens)
+        elif tool_messages_sent:
+            self._warn(
+                "сверка счёта токенов пропущена: схемы инструментов уходят в запрос, "
+                "а в локальный счёт не попадают — разница с сервером это их объём, "
+                "а не расхождение таблицы токенизаторов",
+                once=True,
+            )
 
         new_history = [*trimmed.history, {"role": "user", "content": user_input}]
         assistant_text = result.text
@@ -1708,14 +1907,30 @@ class Agent:
         if assistant_text:
             new_history.append({"role": "assistant", "content": assistant_text})
 
+        # trimmed.tokens was counted BEFORE the tool loop, so it is short by
+        # every ephemeral message the parked rounds added. The server's own
+        # prompt_tokens for the final round is the exact size of what actually
+        # went — and exact it is, whatever kind of counter the session has.
+        # dropped_tokens keeps coming from the trim: that is what the TRIM
+        # freed, a different number about a different event.
+        context_tokens = trimmed.tokens
+        context_exact = bool(self.counter and self.counter.exact and trimmed.tokens is not None)
+        # Gated on tool_messages_sent, not on tool_rounds: a turn where the
+        # model answered without touching a tool parks nothing, yet the
+        # `tools` schemas still rode in the payload, so trimmed.tokens is
+        # short by their volume while context_exact would claim otherwise.
+        if tool_messages_sent and result.usage.prompt_tokens is not None:
+            context_tokens = result.usage.prompt_tokens
+            context_exact = True
+
         return AgentReply(
             text=result.text,
             history=new_history,
             result=result,
             dropped=trimmed.dropped,
             done=self._detect_done(result.text),
-            context_tokens=trimmed.tokens,
-            context_exact=bool(self.counter and self.counter.exact and trimmed.tokens is not None),
+            context_tokens=context_tokens,
+            context_exact=context_exact,
             dropped_tokens=trimmed.dropped_tokens,
             summary=summary_now,
             compaction=compaction,
@@ -1730,6 +1945,8 @@ class Agent:
             memory_failed=memory_failed if strategy == "memory" else None,
             invariant_assessment=invariant_assessment,
             invariant_result=invariant_result,
+            tool_calls=tuple(tool_logs),
+            tool_round_results=tuple(tool_rounds),
         )
 
     def _detect_done(self, text: str) -> bool:
@@ -1762,6 +1979,7 @@ __all__ = [
     "MEMORY_RESPONSE_TOKENS",
     "MEMORY_SCHEMA_PATH",
     "INTERRUPT_NOTE",
+    "MAX_TOOL_ROUNDS",
     "RESPONSE_RESERVE_TOKENS",
     "SUMMARY_MAX_TOKENS",
     "Agent",
@@ -1772,6 +1990,7 @@ __all__ = [
     "FactsUpdate",
     "MemoryFailureResult",
     "StreamFn",
+    "ToolCallLog",
     "done_conflicts_with_stop",
     "marker_instruction",
 ]

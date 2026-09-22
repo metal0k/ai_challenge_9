@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import copy
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,7 +47,7 @@ from advent_core.config import (
     configured_secrets,
     redact,
 )
-from advent_core.errors import AdventError
+from advent_core.errors import AdventError, MCPError
 from advent_core.facts import format_facts, render_note, validate_key
 from advent_core.invariants import (
     INVARIANTS_STATE_KEY,
@@ -127,6 +127,10 @@ DAY = 10
 # invariant preflight records its Week 03 / Day 14 origin.
 INVARIANT_WEEK = 3
 INVARIANT_DAY = 14
+# Same reasoning for MCP tool use: the capability belongs to week 04 / day 17,
+# the agent it hangs on is this week's. Ordinary turns keep WEEK/DAY.
+MCP_WEEK = 4
+MCP_DAY = 17
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -313,6 +317,25 @@ class AgentShell:
     invariant_assessment_prompt_tokens: int = 0
     invariant_assessment_completion_tokens: int = 0
     invariant_assessment_failures: int = 0
+    # Day 17 (MCP). Cost of the EXTRA function-calling rounds this run —
+    # rounds 1..N−1, whose CallResults never become conversation turns and so
+    # land in neither session.token_total() nor the growth table. Same
+    # accounting shape as compact_*/facts_*/memory_* above, for the same
+    # reason: something has to name a paid call nobody else counts.
+    mcp_rounds: int = 0
+    mcp_prompt_tokens: int = 0
+    mcp_completion_tokens: int = 0
+    # Actual tool invocations (free — no Mistral request), incl. failed ones.
+    mcp_tool_calls: int = 0
+    mcp_tool_errors: int = 0
+    # Names of the tools fetched at the first `/mcp on`, for `/mcp` with no
+    # arguments. Empty while the tools have never been fetched this run.
+    mcp_tool_names: list[str] = field(default_factory=list)
+    # The server that answered that fetch, so a later `/mcp on` reusing the
+    # cached list still names it instead of printing a shorter message.
+    mcp_server_name: str | None = None
+    # The session file's wish, parsed before the agent exists at startup.
+    mcp_restore: bool = False
 
     def __post_init__(self) -> None:
         try:
@@ -384,6 +407,8 @@ class AgentShell:
             # Агент не печатает — он отдаёт текст сюда (SPEC §5).
             on_warning=console.warn,
         )
+        # The session's own `mcp_enabled` was parsed before the agent existed.
+        self._restore_mcp()
         if self.config.params.context_limit is not None:
             # Override — инструмент демо, и молча живущий заниженный лимит
             # после перезапуска — ловушка: на старте его называют вслух,
@@ -741,11 +766,63 @@ class AgentShell:
                     f"в файле сессии {session.name} негодное "
                     f"context_strategy={raw_strategy!r} — игнор"
                 )
+        self._apply_session_mcp(session)
         self._apply_session_summary(session)
         self._apply_session_facts(session)
         self._apply_session_task(session)
         self._apply_session_invariants(session)
+        # No-op at startup (the agent isn't built yet) — __post_init__ calls
+        # it again once it is.
+        self._restore_mcp()
         return resumed_dialog
+
+    def _apply_session_mcp(self, session: Session) -> None:
+        """Reads the `mcp_enabled` key — three cases, like `context_limit` above.
+
+        Absent (every session file older than day 17) → keep whatever is
+        already in effect; `null` → an explicit off, as `_save_state` writes
+        it for a session with tools off; a real bool → apply it. Anything else
+        (an int, a string, `"true"`) warns instead of passing silently — the
+        inverse of `context_limit`'s test, where `bool` is the rejected type.
+
+        Only the WISH is parsed here: at startup this runs before the agent
+        exists, and attaching the tools needs it. `_restore_mcp()` does that.
+        """
+        self.mcp_restore = self.agent.mcp_enabled if hasattr(self, "agent") else False
+        if "mcp_enabled" not in session.state:
+            return
+        raw = session.state["mcp_enabled"]
+        if raw is None:
+            self.mcp_restore = False
+        elif isinstance(raw, bool):
+            self.mcp_restore = raw
+        else:
+            console.warn(f"в файле сессии {session.name} негодное mcp_enabled={raw!r} — игнор")
+
+    def _restore_mcp(self) -> None:
+        """Brings the live agent in line with the session's `mcp_enabled`.
+
+        Fetching the tool list here is not the eager startup connect §6 rules
+        out: it happens only when the session file says the user had tools on,
+        which is their own persisted choice. The alternative — restoring the
+        flag without the tools — would leave `mcp_enabled=True` with
+        `tools=None`, which `Agent.ask()` treats as off: a session that says
+        "включены" and behaves as if they were not.
+        """
+        if not hasattr(self, "agent"):
+            return
+        if self.mcp_restore and not self.agent.mcp_enabled:
+            console.note(f"в сессии {self.session.name} инструменты MCP были включены")
+            if not _mcp_enable(self):
+                # mcp_restore stays True on purpose, and _save_state writes it
+                # rather than the live flag: a server that happens to be down
+                # now must not erase a preference the user set earlier.
+                console.warn(
+                    "сохранённое /mcp on не восстановлено — сервер недоступен; "
+                    "настройка в файле сессии осталась как была"
+                )
+        elif not self.mcp_restore and self.agent.mcp_enabled:
+            _mcp_disable(self)
 
     def _apply_session_task(self, session: Session) -> None:
         """Load the optional task independently from the rest of session state."""
@@ -1112,6 +1189,7 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
         # Compaction/facts, if either happened, happened BEFORE the failure —
         # so both are salvaged and reported first, in the order things
         # actually occurred.
+        _salvage_tool_rounds(shell)
         _salvage_compaction(shell)
         _salvage_facts(shell, facts_before)
         _salvage_facts_failure(shell)
@@ -1194,9 +1272,15 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
     # только показ. Сверять надо с тем, что РЕАЛЬНО ушло в API (sent_messages):
     # слой формата дописывает инструкцию внутри chat._payload(), и сверка «до
     # слоя» дала бы стабильную ложную дельту.
-    shell.last_check = tokens.reconcile(
-        shell.counter, reply.result.sent_messages or [], reply.result.usage.prompt_tokens
-    )
+    if not shell.agent.mcp_enabled:
+        # С инструментами сверять нечего: схемы tools уходят в запрос отдельным
+        # полем payload, в sent_messages их нет, и локальный счёт занижен ровно
+        # на их объём. Agent.ask() по той же причине не калибруется на таком
+        # ходу; печатать «разошлось» здесь значило бы назвать поломкой
+        # известную разницу.
+        shell.last_check = tokens.reconcile(
+            shell.counter, reply.result.sent_messages or [], reply.result.usage.prompt_tokens
+        )
     log_call(
         reply.result,
         _journal_messages(
@@ -1209,6 +1293,10 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
         week=WEEK,
         day=DAY,
     )
+    # Right after the turn's own row: the extra function-calling rounds and
+    # the tool invocations themselves (day 17). Here rather than in _turn()
+    # because /again goes through _ask() too and its rounds cost the same.
+    _report_tool_use(shell, reply)
     return reply
 
 
@@ -1519,6 +1607,14 @@ def _save_state(shell: AgentShell) -> None:
     # None — честное «карточка»: перечитывание файла вернёт лимит из карточки,
     # и ключ не нужно удалять, достаточно пустого значения.
     shell.session.state["context_limit"] = shell.config.params.context_limit
+    # A setting, not content (it survives /new, like mode/context_limit): an
+    # explicit False is written, never left absent — "ключ есть и выключено"
+    # and "ключа нет вовсе" are different facts on the read side.
+    # `or shell.mcp_restore`: when the server was down at startup, the agent
+    # is off while the WISH is still on, and writing the live flag would
+    # silently overwrite the user's saved preference with False. `/mcp off`
+    # clears mcp_restore first, so an explicit off still writes False.
+    shell.session.state["mcp_enabled"] = shell.agent.mcp_enabled or shell.mcp_restore
     shell.session.state["active_profile"] = shell.active_profile
     # Summary and its coverage boundary are conversation CONTENT, not a
     # setting: Session.clear() wipes them along with the turns
@@ -1611,6 +1707,22 @@ def _num(value: int | None) -> str:
     return "—" if value is None else str(value)
 
 
+def _sum_tokens(usages: list, field_name: str) -> int | None:
+    """Сумма одного поля по нескольким usage. None — хоть одно неизвестно.
+
+    Не `or 0`: неизвестное слагаемое делает неизвестной всю сумму, и выдать
+    её за точное число хуже, чем показать прочерк (то же правило, что у
+    _component_label по ходам сессии).
+    """
+    total = 0
+    for usage in usages:
+        value = getattr(usage, field_name)
+        if value is None:
+            return None
+        total += value
+    return total
+
+
 def _next_context_tokens(shell: AgentShell) -> int | None:
     """Сколько займёт СЛЕДУЮЩИЙ запрос — до отправки, а не после.
 
@@ -1701,7 +1813,16 @@ def _token_panel(shell: AgentShell, reply: AgentReply) -> None:
     is one.
     """
     usage = reply.result.usage
-    turn = f"{_num(usage.prompt_tokens)}/{_num(usage.completion_tokens)}"
+    # Ход с инструментом — это несколько платных запросов, а не один: показать
+    # только финальный значило бы назвать цену хода меньше, чем она была
+    # (находка [HIGH] spec-review SPEC-w04d17.md). Прочерк не превращается в
+    # ноль: если хоть одно слагаемое неизвестно, неизвестна и сумма.
+    extra_rounds = _extra_tool_rounds(reply)
+    prompt = _sum_tokens([usage, *(r.usage for r in extra_rounds)], "prompt_tokens")
+    completion = _sum_tokens([usage, *(r.usage for r in extra_rounds)], "completion_tokens")
+    turn = f"{_num(prompt)}/{_num(completion)}"
+    if extra_rounds:
+        turn += f" (раундов {len(extra_rounds) + 1})"
     parts = [
         f"токены · ход {turn}",
         f"сессия {_session_tokens_label(shell)}",
@@ -2084,6 +2205,289 @@ def _cmd_strategy(shell: AgentShell, args: list[str]) -> bool:
         console.note(f"стратегия контекста: {shell.agent.context_strategy} (есть: {choices})")
         return False
     return _cmd_set(shell, ["context_strategy", *args])
+
+
+# --------------------------------------------------------------------------
+# MCP tools (day 17)
+# --------------------------------------------------------------------------
+
+# Seconds for one trip to the MCP server: spawn, handshake and the call.
+# Same number as `adventmcp tools` (week_04/cli.py DEFAULT_TIMEOUT) — the
+# server is a local subprocess, and only its startup is worth guarding.
+MCP_TIMEOUT = 15.0
+
+
+def _mcp_function_tools(tools: list) -> list[dict]:
+    """MCP ToolInfo -> Mistral FunctionTool.
+
+    Takes the RAW JSON Schema (`input_schema`): it fits `function.parameters`
+    as is, while the `args` summary would need translating back. A tool with
+    no schema gets an empty object, not None — `"parameters": null` is a 400.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema or {"type": "object", "properties": {}},
+            },
+        }
+        for tool in tools
+    ]
+
+
+def _mcp_bridge(command: list[str]) -> Callable[[str, dict], object]:
+    """The "call a tool" closure for Agent.call_tool.
+
+    Per Agent's contract (advent_core/agent.py) this callback NEVER raises —
+    an unreachable server becomes error text the model sees as the tool
+    message's content and can react to, not an exception that kills the turn.
+    `Exception`, not just `MCPError`: the translated region is only the inner
+    coroutine, and `anyio.run()` around it can raise its own. BaseException
+    stays uncaught on purpose — mcp_client deliberately lets KeyboardInterrupt
+    and SystemExit through.
+    """
+    from advent_core import mcp_client
+
+    def call(name: str, arguments: dict) -> object:
+        try:
+            return mcp_client.call_tool_once(command, name, arguments, timeout=MCP_TIMEOUT)
+        except MCPError as error:
+            return mcp_client.ToolCallOutcome(text=error.message, is_error=True)
+        except Exception as error:
+            return mcp_client.ToolCallOutcome(text=str(error) or repr(error), is_error=True)
+
+    return call
+
+
+def _mcp_note_enabled(shell: AgentShell) -> None:
+    """The one "tools are on" message, so both routes into `_mcp_enable` say
+    the same thing — the cached-list route used to print strictly less."""
+    where = f"{shell.mcp_server_name}, " if shell.mcp_server_name else ""
+    console.note(
+        f"инструменты MCP включены: {where}{', '.join(shell.mcp_tool_names) or 'ни одного'}"
+    )
+    # A turn with tools always goes through complete(): the decision is made
+    # BEFORE it is known whether the model will reach for a tool, so streaming
+    # is off for EVERY turn until /mcp off. The same trade format=json/schema
+    # already makes, and it must be said out loud, not discovered on camera.
+    console.note("инструменты выключают стриминг ответов до /mcp off")
+
+
+def _mcp_enable(shell: AgentShell) -> bool:
+    """Turn the tools on, fetching the list only when this run has none yet.
+
+    Lazy rather than eager at CLI startup: while `/mcp off`, no subprocess is
+    spawned and every earlier week-02 day behaves exactly as before. Server
+    unreachable — print why and stay off; the REPL never dies of it.
+
+    The cached-list fast path lives here, not in `_cmd_mcp`, so `_restore_mcp`
+    gets it too — it used to respawn the server on every session switch.
+    """
+    from advent_core import mcp_client
+
+    if shell.agent.tools and shell.agent.call_tool:
+        # Already fetched this run — a second server spawn buys nothing.
+        shell.agent.mcp_enabled = True
+        _mcp_note_enabled(shell)
+        return True
+
+    # The repo's one deliberate cross-week import: the agent's REPL has to
+    # know how to launch ITS OWN week_04 MCP server, and that command is
+    # week_04's own business. Inlining the literal would make a second,
+    # unsynchronized copy; moving it into advent_core would put "week_04" in
+    # the week-agnostic layer. See specs/SPEC-w04d17.md §1 decision 5.
+    from week_04.client import default_server_command
+
+    command = default_server_command()
+    try:
+        listing = mcp_client.connect_and_list(
+            command,
+            timeout=MCP_TIMEOUT,
+            raw=False,
+            # The protocol mirror is only for `adventmcp tools --raw`; here it
+            # would be noise in the middle of a conversation.
+            sink=lambda _line: None,
+        )
+    except MCPError as error:
+        console.warn(f"инструменты не подключены: {error.message}")
+        _warn_text(error.hint)
+        return False
+
+    shell.agent.tools = _mcp_function_tools(listing.tools)
+    shell.agent.call_tool = _mcp_bridge(command)
+    shell.agent.mcp_enabled = True
+    shell.mcp_tool_names = [tool.name for tool in listing.tools]
+    shell.mcp_server_name = listing.server_name
+    _mcp_note_enabled(shell)
+    return True
+
+
+def _mcp_disable(shell: AgentShell) -> None:
+    """Turn the tools off without throwing the fetched list away.
+
+    `tools`/`call_tool` stay on the agent: a second `/mcp on` in this run pays
+    no second server spawn, and `Agent.ask()` reads `mcp_enabled` and leaves
+    them alone without the flag.
+    """
+    shell.agent.mcp_enabled = False
+    # The last reconciliation was made before /mcp on; tool turns skip
+    # reconciling, so without this `/tokens` would keep showing a result from
+    # a different identity as if it were current. Same value _switch_session
+    # uses for "nothing to compare yet".
+    shell.last_check = None
+    console.note("инструменты MCP выключены; стриминг снова доступен")
+
+
+@command(
+    "/mcp",
+    "инструменты MCP: без значения — состояние и список, on|off — переключить",
+    usage="/mcp on | off",
+)
+def _cmd_mcp(shell: AgentShell, args: list[str]) -> bool:
+    """Shaped like `/strategy`: no argument prints, an argument switches.
+
+    Its own handler rather than a delegation to `/set`: `mcp_enabled` is not a
+    Mistral request parameter and has no business in the params.py registry,
+    whose capabilities filter exists for exactly those.
+    """
+    if not args:
+        state = "включены" if shell.agent.mcp_enabled else "выключены"
+        known = ", ".join(shell.mcp_tool_names) if shell.mcp_tool_names else "список не забран"
+        console.note(f"инструменты MCP: {state} ({known})")
+        console.note("git_log — последние N коммитов этого репозитория: hash, дата, автор, тема")
+        return False
+
+    value = args[0].strip().lower()
+    _warn_extra_args("/mcp", args[1:])
+    if value == "on":
+        if shell.agent.mcp_enabled:
+            console.note("инструменты MCP уже включены")
+            return False
+        # The cached-list fast path lives inside _mcp_enable now, so /mcp on
+        # and _restore_mcp take exactly the same route and print the same text.
+        if not _mcp_enable(shell):
+            return False
+    elif value == "off":
+        if not shell.agent.mcp_enabled:
+            console.note("инструменты MCP уже выключены")
+            return False
+        _mcp_disable(shell)
+    else:
+        console.warn(f"нужно: /mcp on | off; получено {args[0]!r}")
+        return False
+
+    shell.mcp_restore = shell.agent.mcp_enabled
+    _save_state(shell)
+    return False
+
+
+def _mcp_label(shell: AgentShell) -> str:
+    """The `/tokens` line about tools: state, calls, and the extra rounds' cost.
+
+    There is nowhere else to name that cost: rounds 1..N−1 are service calls,
+    they never become session turns and so appear in neither "всего за сессию"
+    nor the growth table. Same rule as compaction and facts.
+
+    The counters print whatever the toggle says. An early return on `/mcp off`
+    is how the cost of already-paid rounds went invisible the moment the user
+    switched the tools off — the money was spent either way.
+    """
+    if not shell.agent.mcp_enabled:
+        parts = ["выключены (/mcp on)"]
+    else:
+        parts = [f"включены: {', '.join(shell.mcp_tool_names) or 'ни одного'}"]
+    if shell.mcp_tool_calls:
+        errors = f", из них ошибок {shell.mcp_tool_errors}" if shell.mcp_tool_errors else ""
+        parts.append(f"вызовов инструмента {shell.mcp_tool_calls}{errors}")
+    if shell.mcp_rounds:
+        parts.append(
+            f"лишних раундов {shell.mcp_rounds}, стоили "
+            f"{shell.mcp_prompt_tokens}/{shell.mcp_completion_tokens}"
+        )
+    return "; ".join(parts)
+
+
+def _extra_tool_rounds(reply: AgentReply) -> tuple[CallResult, ...]:
+    """The paid rounds EXCEPT the one that became the turn's answer.
+
+    When MAX_TOOL_ROUNDS runs out the last round is both parked AND returned
+    as `reply.result` (SPEC-w04d17.md §4.4) — adding both would bill one call
+    twice. Compared by identity, not by value: it is literally one object.
+    """
+    return tuple(result for result in reply.tool_round_results if result is not reply.result)
+
+
+def _account_tool_rounds(shell: AgentShell, results: Sequence[CallResult]) -> None:
+    """Accounting and journal for the tool loop's paid rounds. One place, two paths.
+
+    The second path is the salvage of a failed turn (`_salvage_tool_rounds`),
+    and it must count identically: a round paid before a crash costs the same
+    as a round paid before an answer.
+    """
+    for index, result in enumerate(results, start=1):
+        shell.mcp_rounds += 1
+        shell.mcp_prompt_tokens += result.usage.prompt_tokens or 0
+        shell.mcp_completion_tokens += result.usage.completion_tokens or 0
+        log_call(
+            result,
+            # Through the same filter as the turn's own row: round 1's
+            # sent_messages IS the full turn payload, synthetic task/profile/
+            # invariant blocks included, and the journal is not where they go.
+            _journal_messages(
+                result.sent_messages,
+                task=shell.task,
+                profile=shell.profile_values,
+                invariants=shell.invariants,
+            ),
+            week=MCP_WEEK,
+            day=MCP_DAY,
+            extra={"kind": "mcp_tool_round", "round": index},
+        )
+
+
+def _salvage_tool_rounds(shell: AgentShell) -> None:
+    """Keeps the rounds paid for before the turn crashed. Mirror of _salvage_compaction.
+
+    Round 1 ("n=100" -> tool error) is an already-paid Mistral request. If
+    round 2 dies on the network, `ask()` raises, no `AgentReply` is born, and
+    without this round 1 would vanish whole: no `mcp_tool_round` row, no cost
+    in `/tokens` — while the list stayed dirty on the agent and the next
+    successful turn billed someone else's tokens to itself. No identity
+    dedup needed here: there is no turn answer at all, so nothing is extra.
+    """
+    _account_tool_rounds(shell, shell.agent.take_pending_tool_rounds())
+
+
+def _report_tool_use(shell: AgentShell, reply: AgentReply) -> None:
+    """Journal and accounting for tool calls — right after the turn's own row.
+
+    Two different things, two different `kind`s. `mcp_tool_round` is a paid
+    Mistral request with its own usage; `mcp_tool` is the tool invocation
+    itself, which is free and has no `CallResult` to attach.
+    """
+    _account_tool_rounds(shell, _extra_tool_rounds(reply))
+    for call in reply.tool_calls:
+        shell.mcp_tool_calls += 1
+        shell.mcp_tool_errors += bool(call.is_error)
+        mark = " (ошибка)" if call.is_error else ""
+        console.note(f"инструмент {call.name}{mark}: {call.arguments}")
+        log_call(
+            # Not a Mistral request: usage is empty by definition, and the
+            # carrier exists only to give the journal row its usual shape.
+            CallResult(model_requested=shell.config.model),
+            [],
+            week=MCP_WEEK,
+            day=MCP_DAY,
+            extra={
+                "kind": "mcp_tool",
+                "tool": call.name,
+                "arguments": call.arguments,
+                "is_error": call.is_error,
+                "result_chars": len(call.result_text),
+            },
+        )
 
 
 @command("/again", "повторить последний вопрос с текущими настройками, без истории")
@@ -2501,6 +2905,7 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
     table.add_row("сжатие истории", _compact_label(shell))
     table.add_row("facts", _facts_label(shell))
     table.add_row("memory", _memory_label(shell))
+    table.add_row("инструменты", _mcp_label(shell))
     override = shell.config.params.context_limit
     if override is not None:
         # Override обязан быть виден и здесь: «окно 2500» без второго числа
@@ -2515,7 +2920,14 @@ def _cmd_tokens(shell: AgentShell, args: list[str]) -> bool:
         table.add_row("окно модели", _num(shell.agent.context_limit))
 
     check = shell.last_check
-    if check is None:
+    if shell.agent.mcp_enabled:
+        # Отдельный исход, а не «сошлось/разошлось»: пока инструменты включены,
+        # локальный счёт не видит их схем, и сравнивать нечего с чем.
+        table.add_row(
+            "сверка с сервером",
+            "пропущена: схемы инструментов уходят в запрос, но не в локальный счёт",
+        )
+    elif check is None:
         # «Сверять не с чем» — отдельный исход, а не «сошлось»: в этом запуске
         # ещё не было ни одного ответа.
         table.add_row("сверка с сервером", "в этом запуске ходов ещё не было")
@@ -3695,6 +4107,12 @@ def _paused_command_allowed(parts: list[str], shell: AgentShell) -> bool:
                 and not parts[3].startswith("--")
             )
         )
+    if command == "/mcp":
+        # Its own branch, not the argument-less set above: that one ends in
+        # `len(parts) == 1`, which would let `/mcp` through and block the only
+        # two forms that do anything. Turning the tools on or off is not a
+        # reason to leave the pause first.
+        return len(parts) == 1 or (len(parts) == 2 and parts[1].lower() in {"on", "off"})
     if command == "/facts":
         return len(parts) == 1
     if command == "/memory":

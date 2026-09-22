@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Iterable
 
@@ -9,7 +10,7 @@ from advent_core import formats
 from advent_core.client import mistral_client, requests_per_minute
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError, ConfigurationError, translate
-from advent_core.telemetry import CallResult, Usage
+from advent_core.telemetry import CallResult, RawToolCall, Usage
 
 Message = dict[str, str]
 
@@ -156,11 +157,40 @@ def _with_format_instruction(
     return [{"role": "system", "content": system}, *rest]
 
 
+def _tool_call_arguments(tool_call: object) -> str:
+    """FunctionCall.arguments as a JSON string: str stays str untouched, a
+    dict (the SDK types allow it) is json.dumps'd.
+
+    Not str(): agent.py json.loads() this downstream, and a Python repr
+    (single quotes) never parses — every dict-typed call would burn a paid
+    retry round as a bogus "bad arguments" error. A live probe only ever
+    showed str; the dict branch is the defensive one.
+    """
+    function = getattr(tool_call, "function", None)
+    arguments = getattr(function, "arguments", "") if function is not None else ""
+    return arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+
+
 def complete(
-    config: Config, messages: list[Message], capabilities: dict | None = None
+    config: Config,
+    messages: list[Message],
+    capabilities: dict | None = None,
+    *,
+    tools: list[dict] | None = None,
+    tool_choice: str | None = None,
 ) -> CallResult:
-    """Один ответ целиком, без стрима."""
+    """Один ответ целиком, без стрима.
+
+    tools/tool_choice: one function-calling round. stream() deliberately
+    does not take these — parsing tool_calls out of SSE chunks is unneeded
+    complexity here; tool rounds always go through complete() (agent.py
+    routes them).
+    """
     payload, skipped, format_name, schema = _payload(config, messages, capabilities)
+    if tools is not None:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
     started = time.perf_counter()
 
     with mistral_client(config) as mistral:
@@ -193,6 +223,18 @@ def complete(
     finish_reason = getattr(choice, "finish_reason", None)
     verdict = formats.verify(format_name, text, schema)
 
+    # getattr, same reasoning as finish_reason/reasoning_content above — SDK
+    # wrapper shape is not something to assume survives a version bump.
+    raw_tool_calls = getattr(choice.message, "tool_calls", None) or []
+    tool_calls = tuple(
+        RawToolCall(
+            id=getattr(tc, "id", ""),
+            name=getattr(getattr(tc, "function", None), "name", ""),
+            arguments=_tool_call_arguments(tc),
+        )
+        for tc in raw_tool_calls
+    )
+
     return CallResult(
         text=text,
         model_requested=config.model,
@@ -204,9 +246,14 @@ def complete(
         finish_reason=finish_reason,
         format_ok=verdict.ok,
         format_detail=verdict.detail,
-        sent_messages=payload["messages"],
+        # Copy, not the payload list itself: _payload() returns the caller's
+        # own list by identity when format=="text", and agent.py's tool loop
+        # appends later rounds to it — a parked CallResult would otherwise
+        # grow to claim it sent messages that did not exist yet.
+        sent_messages=list(payload["messages"]),
         rate_limit_rpm=rate_limit_rpm,
         reasoning_text=reasoning_text,
+        tool_calls=tool_calls,
     )
 
 
@@ -221,6 +268,8 @@ def stream(
     usage приходит в последнем чанке, поэтому его нельзя брать раньше конца
     цикла. Ctrl+C и обрыв соединения не теряют уже напечатанный текст —
     он возвращается с пометкой truncated.
+
+    No tools/tool_choice params here on purpose — see complete()'s docstring.
     """
     payload, skipped, format_name, schema = _payload(config, messages, capabilities)
     started = time.perf_counter()
@@ -230,7 +279,8 @@ def stream(
         model_requested=config.model,
         stream=True,
         skipped_params=skipped,
-        sent_messages=payload["messages"],
+        # Copy — same reason as in complete().
+        sent_messages=list(payload["messages"]),
     )
     parts: list[str] = []
     # Цепочка рассуждения копится отдельно от ответа — на reasoning-моделях

@@ -8,17 +8,21 @@ import sys
 import time
 from types import SimpleNamespace
 
+import anyio
 import pytest
 
+from advent_core import mcp_client as client_mod
 from advent_core.errors import MCPError
-from week_04 import client as client_mod
-from week_04.client import (
+from advent_core.mcp_client import (
     ToolArg,
+    ToolCallOutcome,
+    acall_tool,
+    call_tool_once,
     connect_and_list,
-    default_server_command,
     split_command,
     summarize_args,
 )
+from week_04.client import default_server_command
 
 TIMEOUT = 30.0
 
@@ -32,6 +36,15 @@ def _list(cmd=None, *, raw=False, timeout=TIMEOUT):
         sink=lines.append,
     )
     return result, lines
+
+
+def _call(name, arguments, *, cmd=None, timeout=TIMEOUT):
+    return call_tool_once(
+        default_server_command() if cmd is None else cmd,
+        name,
+        arguments,
+        timeout=timeout,
+    )
 
 
 def _alive(pid: int) -> bool:
@@ -55,7 +68,10 @@ def test_lists_the_three_tools_of_the_repo_server():
     assert result.server_name == "advent-repo"
     assert result.server_version == "0.1.0"
     assert result.protocol_version
-    assert [t.name for t in result.tools] == ["list_days", "get_task", "count_tokens"]
+    # Containment, not equality: this file tests the transport, not the server's
+    # exact tool set (that's test_week04_server.py's contract) — a sibling tool
+    # (e.g. git_log) landing on the server must not fail the transport test.
+    assert {"list_days", "get_task", "count_tokens"} <= {t.name for t in result.tools}
     assert lines == []  # no tap without --raw
 
 
@@ -94,6 +110,54 @@ def test_raw_tap_does_not_change_the_tool_list():
     assert tapped == plain
     assert plain_lines == []
     assert tapped_lines != []
+
+
+# ---- tools/call (real server) --------------------------------------------
+
+
+def test_call_tool_once_returns_the_text_result_of_a_no_arg_tool():
+    outcome = _call("list_days", {})
+    assert isinstance(outcome, ToolCallOutcome)
+    assert outcome.is_error is False
+    # list_days() always returns tag lines or an explicit "none found" text —
+    # never "": a bare isinstance(str) check would pass even on empty extraction.
+    assert outcome.text.strip()
+
+
+def test_call_tool_once_reports_a_server_side_tool_error():
+    # get_task validates its week/day and raises ToolError server-side.
+    outcome = _call("get_task", {"week": 999, "day": 1})
+    assert outcome.is_error is True
+    assert outcome.text  # server's error text, not empty
+
+
+def test_call_tool_once_passes_arguments_through():
+    # count_tokens's answer is a function of `text`'s length: two different
+    # values must produce two different results, proving the argument dict
+    # itself crossed the wire rather than a stub/default being used.
+    short = _call("count_tokens", {"text": "a"})
+    long = _call("count_tokens", {"text": "a" * 50})
+    assert short.is_error is False
+    assert long.is_error is False
+    assert "привет" not in short.text  # tool returns a token count, not an echo
+    assert "токенов" in short.text
+    assert short.text != long.text
+
+
+def test_acall_tool_mirrors_the_sync_wrapper():
+    async def scenario():
+        return await acall_tool(default_server_command(), "list_days", {}, timeout=TIMEOUT)
+
+    outcome = anyio.run(scenario)
+    assert isinstance(outcome, ToolCallOutcome)
+    assert outcome.is_error is False
+
+
+def test_call_tool_once_missing_executable_raises_mcp_error():
+    with pytest.raises(MCPError) as info:
+        _call("list_days", {}, cmd=["no-such-mcp-server"])
+    assert info.value.message == "исполняемый файл не найден: no-such-mcp-server"
+    assert info.value.exit_code == 8
 
 
 # ---- pagination (fake SDK client) ---------------------------------------

@@ -7,7 +7,7 @@ import pytest
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCRequest, JSONRPCResponse
 
-from week_04.wire import TapTransport, frame_line
+from advent_core.mcp_wire import TapTransport, frame_line
 
 PING = SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=1, method="ping"))
 PONG = SessionMessage(JSONRPCResponse(jsonrpc="2.0", id=1, result={}))

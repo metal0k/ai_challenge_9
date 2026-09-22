@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,9 +25,11 @@ from advent_core.agent import (
     FACTS_RESPONSE_TOKENS,
     FACTS_SCHEMA_PATH,
     INTERRUPT_NOTE,
+    MAX_TOOL_ROUNDS,
     SUMMARY_MAX_TOKENS,
     Agent,
     AgentReply,
+    ToolCallLog,
     done_conflicts_with_stop,
     marker_instruction,
 )
@@ -33,9 +38,10 @@ from advent_core.config import Config
 from advent_core.errors import AdventError, ConfigurationError
 from advent_core.facts import FACTS_ACK, FACTS_PREFIX
 from advent_core.invariants import Invariant, InvariantSet
+from advent_core.mcp_client import ToolCallOutcome
 from advent_core.params import AGENT_COMMAND, GenerationParams, defaults_for
 from advent_core.task_state import TaskState
-from advent_core.telemetry import CallResult, Usage
+from advent_core.telemetry import CallResult, RawToolCall, Usage
 
 
 def make_config(**params) -> Config:
@@ -1821,3 +1827,446 @@ def test_budget_trim_moves_the_facts_cursor_with_the_history_it_cuts():
         f"курсор {reply.facts_upto} покрывает больше, чем есть истории "
         f"({len(reply.history)}) — обмен уедет из окна непрочитанным"
     )
+
+
+# --- вызов инструментов, день 17 -------------------------------------------
+
+GIT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "git_log",
+        "description": "Последние N коммитов этого репозитория",
+        "parameters": {"type": "object", "properties": {"n": {"type": "integer"}}},
+    },
+}
+
+
+class _ToolRecorder(_Recorder):
+    """_Recorder плюс шов tools/tool_choice дня 17.
+
+    Отдельный подкласс, а не правка базового: тест (a) обязан доказать, что
+    ход БЕЗ инструментов ходит ровно по старому пути, а двойник, который
+    молча принимает новые аргументы, доказать этого не может.
+
+    `calls` пишется копией списка: tool-loop дописывает эфемерные сообщения в
+    ТОТ ЖЕ список между раундами, и без копии все раунды оказались бы одним.
+    """
+
+    def __init__(self, *results: CallResult) -> None:
+        super().__init__(*results)
+        self.tool_kwargs: list[tuple] = []
+
+    def complete(self, config, messages, capabilities=None, *, tools=None, tool_choice=None):
+        self.tool_kwargs.append((tools, tool_choice))
+        self.calls.append(list(messages))
+        return self.results[min(len(self.calls) - 1, len(self.results) - 1)]
+
+
+class _ToolDouble:
+    """Шов call_tool: запоминает (имя, аргументы), отдаёт заготовленный исход."""
+
+    def __init__(self, *outcomes: ToolCallOutcome) -> None:
+        self.outcomes = list(outcomes) or [ToolCallOutcome(text="ок", is_error=False)]
+        self.calls: list[tuple[str, dict]] = []
+
+    def __call__(self, name: str, arguments: dict) -> ToolCallOutcome:
+        self.calls.append((name, arguments))
+        return self.outcomes[min(len(self.calls) - 1, len(self.outcomes) - 1)]
+
+
+def _tool_round(arguments: str | dict, *, call_id: str = "BpfW4tBmq") -> CallResult:
+    """Раунд, в котором модель просит инструмент.
+
+    Форма литеральная, с живого probe 2026-09-22: content == '' (пустая
+    строка, не None), finish_reason == 'tool_calls', FunctionCall.arguments —
+    JSON-СТРОКА ('{"n": 3}'). Словарь в arguments тоже допускается типами SDK
+    и покрыт отдельно.
+    """
+    return CallResult(
+        text="",
+        model_requested="ministral-14b-latest",
+        finish_reason="tool_calls",
+        usage=Usage(prompt_tokens=120, completion_tokens=20, total_tokens=140),
+        tool_calls=(RawToolCall(id=call_id, name="git_log", arguments=arguments),),
+    )
+
+
+def _final_round(text: str = "последние коммиты: e9ca166, 91345a0") -> CallResult:
+    return CallResult(
+        text=text,
+        model_requested="ministral-14b-latest",
+        finish_reason="stop",
+        usage=Usage(prompt_tokens=310, completion_tokens=40, total_tokens=350),
+    )
+
+
+class _UndercountingCounter(_CharCounter):
+    """Точный счётчик, воспроизводящий РЕАЛЬНОЕ поведение на ходу с инструментами.
+
+    Живой замер 2026-09-22 (ministral-14b-latest, точный токенизатор):
+    эфемерную форму счётчик НЕ отвергает — считает и выдаёт 384 против 781 у
+    сервера. Разница это объём схем `tools`, которые едут в payload отдельным
+    полем и в `sent_messages` не попадают, а вовсе не отказ по форме
+    сообщений. Двойник, возвращающий None, этого режима отказа не
+    воспроизводит вовсе, и проверка «предупреждения не было» становится
+    пустой: она не может покраснеть, даже если пропуск сверки сломается.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(exact=True)
+        self.tool_shape_counts = 0
+
+    def count(self, messages) -> int | None:
+        if any("tool_calls" in m or m["role"] == "tool" for m in messages):
+            self.tool_shape_counts += 1
+            return 384
+        return super().count(messages)
+
+
+def _mcp_agent(recorder: _ToolRecorder, call_tool: _ToolDouble, **kwargs) -> Agent:
+    kwargs.setdefault("counter", _CharCounter())
+    return build_agent(
+        recorder,
+        tools=[GIT_TOOL],
+        call_tool=call_tool,
+        mcp_enabled=True,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mcp_enabled", "tools"),
+    ((False, [GIT_TOOL]), (True, None)),
+    ids=("toggle-off", "no-tools"),
+)
+def test_turn_without_tools_goes_the_old_path_untouched(mcp_enabled, tools):
+    """`/mcp off` (и «тулов нет») не меняет ни один ход предыдущих дней."""
+    recorder = _ToolRecorder(CallResult(text="ответ", model_requested="m"))
+    double = _ToolDouble()
+    agent = build_agent(
+        recorder,
+        counter=_CharCounter(),
+        tools=tools,
+        call_tool=double,
+        mcp_enabled=mcp_enabled,
+    )
+
+    reply = agent.ask("привет", [])
+
+    assert recorder.tool_kwargs == [(None, None)], "tools ушли в API на ходу без инструментов"
+    assert double.calls == []
+    assert reply.tool_calls == ()
+    assert reply.tool_round_results == ()
+    assert reply.text == "ответ"
+
+
+def test_tools_are_sent_but_an_answer_without_a_call_parks_nothing():
+    """Модель сама решает: `tool_choice="auto"` не обязывает её звать инструмент."""
+    recorder = _ToolRecorder(_final_round("коммиты не нужны"))
+    double = _ToolDouble()
+    agent = _mcp_agent(recorder, double)
+
+    reply = agent.ask("привет", [])
+
+    assert recorder.tool_kwargs == [([GIT_TOOL], "auto")]
+    assert double.calls == []
+    assert reply.tool_round_results == (), "единственный платный вызов хода не паркуется"
+    assert reply.tool_calls == ()
+    assert reply.text == "коммиты не нужны"
+
+
+def test_one_tool_call_then_the_final_answer():
+    """Раунд с вызовом — платный и паркуется; сам вызов инструмента бесплатный."""
+    round_one = _tool_round('{"n": 3}')
+    recorder = _ToolRecorder(round_one, _final_round())
+    double = _ToolDouble(ToolCallOutcome(text="e9ca166  2026-09-22  denis0k  docs", is_error=False))
+    agent = _mcp_agent(recorder, double)
+
+    reply = agent.ask("покажи 3 последних коммита", [])
+
+    assert double.calls == [("git_log", {"n": 3})], "JSON-строка аргументов не разобрана в dict"
+    assert reply.tool_round_results == (round_one,)
+    assert reply.tool_calls == (
+        ToolCallLog(
+            name="git_log",
+            arguments={"n": 3},
+            result_text="e9ca166  2026-09-22  denis0k  docs",
+            is_error=False,
+        ),
+    )
+    assert reply.text == "последние коммиты: e9ca166, 91345a0"
+    assert agent.pending_tool_rounds == [], "запаркованные раунды не отданы наружу"
+
+
+def test_tool_round_messages_never_reach_the_history():
+    """След вызова эфемерен: наружу уходит только текст финального ответа."""
+    recorder = _ToolRecorder(_tool_round('{"n": 3}'), _final_round())
+    agent = _mcp_agent(recorder, _ToolDouble())
+
+    reply = agent.ask("покажи коммиты", [])
+
+    assert reply.history == [
+        {"role": "user", "content": "покажи коммиты"},
+        {"role": "assistant", "content": "последние коммиты: e9ca166, 91345a0"},
+    ]
+    # А в САМ запрос второго раунда они, наоборот, обязаны попасть.
+    second = recorder.calls[1]
+    assert second[-1]["role"] == "tool"
+    assert second[-1]["tool_call_id"] == "BpfW4tBmq"
+    assert second[-2]["role"] == "assistant"
+    assert second[-2]["content"] == "", "content раунда с tool_calls обязан остаться строкой"
+    assert second[-2]["tool_calls"][0]["function"]["arguments"] == '{"n": 3}'
+
+
+def test_error_then_retry_bills_both_rounds():
+    """Сценарий дня: n=100 → ошибка инструмента → n=20 → ответ.
+
+    Второй раунд отдаёт аргументы СЛОВАРЁМ — типы SDK допускают оба варианта
+    (SPEC-w04d17.md, «Риски»), и покрыта должна быть именно развилка.
+    """
+    first = _tool_round('{"n": 100}', call_id="call-1")
+    second = _tool_round({"n": 20}, call_id="call-2")
+    recorder = _ToolRecorder(first, second, _final_round())
+    double = _ToolDouble(
+        ToolCallOutcome(text="n должен быть от 1 до 20, получено 100", is_error=True),
+        ToolCallOutcome(text="e9ca166  2026-09-22  denis0k  docs", is_error=False),
+    )
+    agent = _mcp_agent(recorder, double)
+
+    reply = agent.ask("покажи 100 коммитов", [])
+
+    assert double.calls == [("git_log", {"n": 100}), ("git_log", {"n": 20})]
+    assert reply.tool_round_results == (first, second), "платный раунд 1 потерян — его не оплатят"
+    assert [(log.arguments, log.is_error) for log in reply.tool_calls] == [
+        ({"n": 100}, True),
+        ({"n": 20}, False),
+    ]
+    # Словарь уходит обратно в API строкой — там ждут строку, а не объект.
+    assert recorder.calls[2][-2]["tool_calls"][0]["function"]["arguments"] == '{"n": 20}'
+    assert reply.text == "последние коммиты: e9ca166, 91345a0"
+
+
+def test_three_rounds_without_a_final_answer_warn_and_do_not_crash():
+    last = _tool_round('{"n": 1}', call_id="call-3")
+    recorder = _ToolRecorder(
+        _tool_round('{"n": 3}', call_id="call-1"),
+        _tool_round('{"n": 2}', call_id="call-2"),
+        last,
+        _final_round("этот раунд не должен состояться"),
+    )
+    agent = _mcp_agent(recorder, _ToolDouble())
+
+    reply = agent.ask("зациклись", [])
+
+    assert len(recorder.calls) == MAX_TOOL_ROUNDS, "потолок раундов не сработал"
+    assert any("3 раза" in warning for warning in agent.warnings)
+    assert len(reply.tool_calls) == MAX_TOOL_ROUNDS
+    # Последний раунд И запаркован, И стал результатом хода — перекрытие
+    # зафиксировано спекой (§4.4), и вызывающий код обязан о нём знать, а не
+    # сложить usage дважды.
+    assert reply.result is last
+    assert reply.tool_round_results[-1] is last
+    assert reply.text == ""
+
+
+def test_unparsable_arguments_come_back_as_a_tool_error_not_a_traceback():
+    """Негодный JSON от модели — тот же путь, что ошибка инструмента."""
+    recorder = _ToolRecorder(_tool_round("{n: 3"), _final_round("исправляюсь"))
+    double = _ToolDouble()
+    agent = _mcp_agent(recorder, double)
+
+    reply = agent.ask("покажи коммиты", [])
+
+    assert double.calls == [], "инструмент вызван с неразобранными аргументами"
+    assert reply.tool_calls[0].is_error is True
+    assert reply.tool_calls[0].arguments == {}
+    assert "JSON" in recorder.calls[1][-1]["content"], "модель не увидела, что именно сломалось"
+    assert reply.text == "исправляюсь"
+
+
+def test_context_tokens_come_from_the_server_after_a_tool_round():
+    """Локальный счёт сделан ДО tool-loop и не знает про эфемерные сообщения."""
+    recorder = _ToolRecorder(_tool_round('{"n": 3}'), _final_round())
+    agent = _mcp_agent(recorder, _ToolDouble())
+
+    reply = agent.ask("покажи коммиты", [])
+
+    assert reply.context_tokens == 310, "показан размер запроса до раундов с инструментом"
+    assert reply.context_exact is True
+
+
+def test_context_tokens_come_from_the_server_even_when_no_tool_was_called():
+    """Ход с `/mcp on`, на котором модель ответила сразу, — тот же случай.
+
+    Раундов не запарковано (финальный ответ не паркуется вовсе), но схемы
+    `tools` всё равно уехали в payload, а `trimmed.tokens` про них не знает.
+    Условие подмены поэтому стоит на `tool_messages_sent`, а не на списке
+    раундов: иначе занижённый локальный счёт показывался бы с пометкой
+    «точно».
+    """
+    recorder = _ToolRecorder(_final_round())
+    agent = _mcp_agent(recorder, _ToolDouble())
+
+    reply = agent.ask("привет", [])
+
+    assert recorder.tool_kwargs == [([GIT_TOOL], "auto")], "схемы tools не ушли в запрос"
+    assert reply.tool_round_results == (), "нечего парковать: инструмент не звали"
+    assert reply.context_tokens == 310, "показан локальный счёт, не знающий про схемы tools"
+    assert reply.context_exact is True
+
+
+def test_dict_arguments_survive_the_seam_between_chat_and_the_tool_loop(monkeypatch):
+    """Шов chat.complete() → Agent._run_tool_loop на dict-аргументах.
+
+    Каждая сторона была покрыта отдельно, а композиция — сломана: chat.py
+    отдавал Python repr (`"{'n': 3}"`), agent.py его json.loads(), и
+    совершенно корректный вызов превращался в платный раунд «аргументы не
+    разобрать». Поэтому здесь НАСТОЯЩИЙ chat.complete() поверх
+    SDK-образного ответа, а не заранее собранный CallResult: подделанный
+    CallResult ровно этот шов и обходит.
+    """
+
+    class _FakeChat:
+        def __init__(self, responses):
+            self.responses = list(responses)
+
+        def complete(self, **_payload):
+            return self.responses.pop(0)
+
+    usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+
+    def _response(message):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason="tool_calls")],
+            model="ministral-14b-latest",
+            usage=usage,
+        )
+
+    tool_call = SimpleNamespace(
+        # СЛОВАРЬ, а не строка: типы SDK допускают оба (SPEC-w04d17.md §4).
+        function=SimpleNamespace(name="git_log", arguments={"n": 3}),
+        id="BpfW4tBmq",
+        type="function",
+        index=0,
+    )
+    asked = _response(SimpleNamespace(content="", tool_calls=[tool_call]))
+    answered = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="последние коммиты", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        model="ministral-14b-latest",
+        usage=usage,
+    )
+
+    # Один клиент на оба раунда: mistral_client() зовётся на КАЖДЫЙ
+    # complete(), и фейк, собираемый внутри, отдавал бы «позови инструмент»
+    # снова и снова, пока не кончится MAX_TOOL_ROUNDS.
+    fake = SimpleNamespace(chat=_FakeChat([asked, answered]))
+
+    @contextmanager
+    def _fake_client(_config):
+        yield fake
+
+    monkeypatch.setattr(chat_core, "mistral_client", _fake_client)
+
+    double = _ToolDouble()
+    agent = Agent(
+        make_config(),
+        complete=chat_core.complete,
+        stream=lambda *args, **kwargs: pytest.fail("ход с инструментами не стримится"),
+        on_warning=lambda _text: None,
+        counter=_CharCounter(),
+        tools=[GIT_TOOL],
+        call_tool=double,
+        mcp_enabled=True,
+    )
+
+    reply = agent.ask("покажи коммиты", [])
+
+    assert double.calls == [("git_log", {"n": 3})], "словарь не доехал до инструмента"
+    assert reply.tool_calls[0].is_error is False
+    assert reply.text == "последние коммиты"
+
+
+def test_a_tool_turn_is_not_reconciled_against_the_local_count():
+    """Ход с инструментами из сверки исключён целиком, и эфемерная форма до
+    счётчика не доезжает.
+
+    Переписано после живого прогона собранного дня (2026-09-22,
+    ministral-14b-latest, ТОЧНЫЙ токенизатор): вопреки ожиданию, счётчик эту
+    форму не отверг, а посчитал — 384 против 781 у сервера на одном вызове
+    git_log. Разница это объём схем `tools`, которые едут в payload отдельным
+    полем и в `sent_messages` не попадают. Сверка объявила бы её
+    расхождением таблицы токенизаторов («похоже, таблица разъехалась» — в
+    кадре), а калибровка научила бы оценщик, что запросы вдвое больше, чем
+    они есть, и испортила бы счёт всем ходам после `/mcp off`.
+
+    Двойник и usage подобраны по тем самым числам: пропусти сверку не тем
+    условием — и разрыв в 2x выдаст предупреждение, то есть проверка может
+    покраснеть. Usage задаётся здесь, а не в `_final_round()`: тот общий и
+    его 310 зафиксированы соседним тестом про `context_tokens`.
+    """
+    ephemeral = [
+        {"role": "user", "content": "покажи коммиты"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "BpfW4tBmq",
+                    "type": "function",
+                    "function": {"name": "git_log", "arguments": '{"n": 3}'},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "e9ca166  2026-09-22",
+            "tool_call_id": "BpfW4tBmq",
+            "name": "git_log",
+        },
+    ]
+    final = replace(
+        _final_round(),
+        sent_messages=ephemeral,
+        usage=Usage(prompt_tokens=781, completion_tokens=40, total_tokens=821),
+    )
+    recorder = _ToolRecorder(_tool_round('{"n": 3}'), final)
+    counter = _UndercountingCounter()
+    agent = _mcp_agent(recorder, _ToolDouble(), counter=counter, context_limit=100_000)
+
+    reply = agent.ask("покажи коммиты", [])
+
+    assert reply.text == "последние коммиты: e9ca166, 91345a0"
+    assert counter.tool_shape_counts == 0, "эфемерная форма всё-таки доехала до счётчика"
+    assert counter.calibrations == [], "оценщик откалиброван по запросу со схемами tools"
+    assert not any("счёт токенов разошёлся" in warning for warning in agent.warnings), (
+        f"известная разница выдана за расхождение: {agent.warnings}"
+    )
+    # Молчать тоже нельзя: пропуск сверки должен быть назван вслух, один раз.
+    assert sum("сверка счёта токенов пропущена" in w for w in agent.warnings) == 1
+
+
+def test_a_paid_tool_round_survives_a_failing_turn():
+    """Раунд 1 оплачен; если раунд 2 упадёт по сети, он не должен исчезнуть."""
+
+    class _FailingSecond(_ToolRecorder):
+        def complete(self, config, messages, capabilities=None, *, tools=None, tool_choice=None):
+            if self.tool_kwargs:
+                raise AdventError("сеть отвалилась")
+            return super().complete(
+                config, messages, capabilities, tools=tools, tool_choice=tool_choice
+            )
+
+    first = _tool_round('{"n": 3}')
+    recorder = _FailingSecond(first)
+    agent = _mcp_agent(recorder, _ToolDouble())
+
+    with pytest.raises(AdventError):
+        agent.ask("покажи коммиты", [])
+
+    assert agent.take_pending_tool_rounds() == [first]
+    assert agent.take_pending_tool_rounds() == [], "раунды отдаются ровно один раз"

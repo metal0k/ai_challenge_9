@@ -74,6 +74,20 @@ class Usage:
         return self.prompt_tokens is None or self.completion_tokens is None
 
 
+@dataclass(slots=True, frozen=True)
+class RawToolCall:
+    """One choice.message.tool_calls entry, as the SDK sent it — unparsed.
+
+    arguments: FunctionCall.arguments as received. SDK types allow both str
+    and dict; a live probe only ever showed str. Callers parse it (JSON);
+    this layer does not — it just carries what the SDK returned.
+    """
+
+    id: str
+    name: str
+    arguments: str
+
+
 @dataclass(slots=True)
 class CallResult:
     text: str = ""
@@ -119,6 +133,11 @@ class CallResult:
     # см. advent_core/chat.py). None — поля не было вовсе: обычная модель
     # Mistral его не присылает.
     reasoning_text: str | None = None
+    # tool_calls the model asked for on this round (finish_reason ==
+    # "tool_calls"), unparsed — empty for every call that isn't a
+    # function-calling round. Every existing CallResult(...) call site keeps
+    # working unchanged: this is the last field, default ().
+    tool_calls: tuple[RawToolCall, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -30,8 +31,8 @@ third
 """
 
 
-def test_tool_names_constant_is_the_literal_trio():
-    assert server.TOOL_NAMES == ("list_days", "get_task", "count_tokens")
+def test_tool_names_constant_has_all_four_tools():
+    assert server.TOOL_NAMES == ("list_days", "get_task", "count_tokens", "git_log")
 
 
 def test_extract_day_returns_only_that_section():
@@ -97,6 +98,44 @@ def test_count_tokens_estimate_for_a_model_without_exact_tokenizer():
     assert server.count_tokens("a" * 30, "ministral-8b-latest") == (
         "10 токенов (оценка, ministral-8b-latest)"
     )
+
+
+def test_git_log_returns_pinned_line_format():
+    lines = server.git_log(3).splitlines()
+    # Exactly 3, not "1..3": a range passes even when `n` is ignored outright
+    # and the tool always answers with one line. This repo has far more.
+    assert len(lines) == 3
+    line_re = re.compile(r"^[0-9a-f]+ {2}\d{4}-\d{2}-\d{2} {2}.+ {2}.+$")
+    for line in lines:
+        assert line_re.match(line), line
+    assert len(server.git_log(1).splitlines()) == 1
+
+
+def test_git_log_rejects_out_of_range_n():
+    with pytest.raises(ToolError, match="n должен быть от 1 до 20, получено 0"):
+        server.git_log(0)
+    with pytest.raises(ToolError, match="n должен быть от 1 до 20, получено 21"):
+        server.git_log(21)
+
+
+def test_git_log_survives_missing_git(monkeypatch):
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(server.subprocess, "run", no_git)
+    with pytest.raises(ToolError, match="git log не выполнился"):
+        server.git_log(5)
+
+
+def test_git_log_raises_on_nonzero_returncode(monkeypatch):
+    class Failed:
+        returncode = 128
+        stdout = ""
+        stderr = "fatal: not a git repository\n"
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: Failed())
+    with pytest.raises(ToolError, match="fatal: not a git repository"):
+        server.git_log(5)
 
 
 def test_server_writes_nothing_to_stdout_without_a_client():

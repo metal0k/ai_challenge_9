@@ -19,7 +19,7 @@ from advent_core.client import model_names, resolve_alias
 from advent_core.config import Config
 from advent_core.errors import AdventError
 from advent_core.params import GenerationParams
-from advent_core.telemetry import Usage
+from advent_core.telemetry import RawToolCall, Usage
 
 
 def test_messages_order_is_system_history_question():
@@ -517,6 +517,127 @@ def test_stream_reasoning_text_is_none_without_reasoning_deltas(monkeypatch):
     result = chat_core.stream(_config(), [{"role": "user", "content": "q"}], lambda c: None)
 
     assert result.reasoning_text is None
+
+
+# --------------------------------------------------------------------------
+# tools/tool_choice (W04D17 §3): function-calling plumbing on complete()
+# --------------------------------------------------------------------------
+
+
+def test_complete_without_tools_sends_no_tools_keys(monkeypatch):
+    """Backward compat: tools=None/tool_choice=None must not reach the SDK."""
+    fake = _FakeMistral(complete_response=_complete_response("привет", "stop"))
+    _patch_client(monkeypatch, fake)
+
+    chat_core.complete(_config(), [{"role": "user", "content": "q"}])
+
+    assert "tools" not in fake.chat.complete_kwargs
+    assert "tool_choice" not in fake.chat.complete_kwargs
+
+
+def test_complete_sends_tools_and_tool_choice_verbatim(monkeypatch):
+    fake = _FakeMistral(complete_response=_complete_response("", "tool_calls"))
+    _patch_client(monkeypatch, fake)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "git_log", "description": "…", "parameters": {}},
+        }
+    ]
+
+    chat_core.complete(
+        _config(),
+        [{"role": "user", "content": "q"}],
+        tools=tools,
+        tool_choice="auto",
+    )
+
+    assert fake.chat.complete_kwargs["tools"] == tools
+    assert fake.chat.complete_kwargs["tool_choice"] == "auto"
+
+
+def test_complete_parses_tool_calls_from_response(monkeypatch):
+    """Literal shape from a live SDK probe (2026-09-22), not an invented one:
+    choice.message.tool_calls == [ToolCall(function=FunctionCall(name='git_log',
+    arguments='{"n": 3}'), id='BpfW4tBmq', type='function', index=0)],
+    finish_reason == 'tool_calls', content == ''."""
+    tool_call = SimpleNamespace(
+        function=SimpleNamespace(name="git_log", arguments='{"n": 3}'),
+        id="BpfW4tBmq",
+        type="function",
+        index=0,
+    )
+    message = SimpleNamespace(content="", tool_calls=[tool_call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    response = SimpleNamespace(choices=[choice], model="mistral-small-2603", usage=usage)
+    fake = _FakeMistral(complete_response=response)
+    _patch_client(monkeypatch, fake)
+
+    result = chat_core.complete(_config(), [{"role": "user", "content": "q"}])
+
+    assert result.finish_reason == "tool_calls"
+    assert result.text == ""
+    assert result.tool_calls == (RawToolCall(id="BpfW4tBmq", name="git_log", arguments='{"n": 3}'),)
+
+
+def test_complete_encodes_dict_arguments_as_json_not_python_repr(monkeypatch):
+    """SDK's FunctionCall.arguments type allows str OR dict (SPEC §4 Risks:
+    'тест должен покрыть именно ветвление, а не один случай'). Not observed
+    live (probe only showed str) — covers the type branch defensively.
+
+    json.dumps, not str(): agent.py json.loads() this downstream, and a
+    Python repr (single quotes) never parses — the dict branch used to turn
+    a well-formed call into a paid "bad arguments" retry round. The spec asks
+    only that both types be accepted; producing valid JSON satisfies it."""
+    tool_call = SimpleNamespace(
+        function=SimpleNamespace(name="git_log", arguments={"n": 3}),
+        id="xyz",
+        type="function",
+        index=0,
+    )
+    message = SimpleNamespace(content="", tool_calls=[tool_call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    response = SimpleNamespace(choices=[choice], model="mistral-small-2603", usage=usage)
+    fake = _FakeMistral(complete_response=response)
+    _patch_client(monkeypatch, fake)
+
+    result = chat_core.complete(_config(), [{"role": "user", "content": "q"}])
+
+    assert result.tool_calls[0].arguments == '{"n": 3}'
+    assert isinstance(result.tool_calls[0].arguments, str)
+    assert json.loads(result.tool_calls[0].arguments) == {"n": 3}
+
+
+def test_sent_messages_is_a_snapshot_not_an_alias_of_the_caller_list(monkeypatch):
+    """`_payload()` при format=text отдаёт ТОТ ЖЕ список по identity.
+
+    Tool-loop в agent.py дописывает в него эфемерные сообщения между
+    раундами, и запаркованный `CallResult` раунда 1 дорастал до сообщений,
+    которых в его запросе не было и быть не могло — а `week_02/cli.py`
+    пишет их в журнал строкой `mcp_tool_round`.
+    """
+    fake = _FakeMistral(complete_response=_complete_response("привет", "stop"))
+    _patch_client(monkeypatch, fake)
+    messages = [{"role": "user", "content": "q"}]
+
+    result = chat_core.complete(_config(), messages)
+
+    assert result.sent_messages == messages
+    assert result.sent_messages is not messages
+    messages.append({"role": "assistant", "content": "позже"})
+    assert len(result.sent_messages) == 1, "снимок вырос вслед за списком вызывающего кода"
+
+
+def test_complete_tool_calls_empty_when_response_has_none(monkeypatch):
+    """Ordinary response (no tool_calls attribute at all) — getattr fallback."""
+    fake = _FakeMistral(complete_response=_complete_response("привет", "stop"))
+    _patch_client(monkeypatch, fake)
+
+    result = chat_core.complete(_config(), [{"role": "user", "content": "q"}])
+
+    assert result.tool_calls == ()
 
 
 def test_list_models_uses_base_url_when_set(monkeypatch):

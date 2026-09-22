@@ -18,12 +18,13 @@ from advent_core import tokens
 
 SERVER_NAME = "advent-repo"
 # The client's default `--expect` list; tests assert the literal names.
-TOOL_NAMES = ("list_days", "get_task", "count_tokens")
+TOOL_NAMES = ("list_days", "get_task", "count_tokens", "git_log")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TAG_RE = re.compile(r"^w\d{2}d\d{2}$")
 DEFAULT_MODEL = "ministral-14b-latest"
 GIT_TIMEOUT = 10.0
+GIT_LOG_MAX = 20
 
 mcp = MCPServer(
     SERVER_NAME,
@@ -108,6 +109,27 @@ def count_tokens(
     total = full - overhead
     kind = "точно" if counter.exact else "оценка"
     return f"{total} токенов ({kind}, {model})"
+
+
+@mcp.tool(description="Последние N коммитов этого репозитория: hash, дата, автор, тема.")
+def git_log(n: int = 5) -> str:
+    if not 1 <= n <= GIT_LOG_MAX:
+        raise ToolError(f"n должен быть от 1 до {GIT_LOG_MAX}, получено {n}")
+    try:
+        proc = subprocess.run(
+            ["git", "log", f"-{n}", "--pretty=format:%h  %ad  %an  %s", "--date=short"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=GIT_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ToolError(f"git log не выполнился: {exc}") from exc
+    if proc.returncode != 0:
+        raise ToolError(f"git log завершился с ошибкой: {proc.stderr.strip()}")
+    return proc.stdout
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ from advent_core.params import AGENT_COMMAND, defaults_for
 from advent_core.session import Session
 from advent_core.task_state import TaskState, task_messages
 from advent_core.telemetry import CallResult, Usage
-from advent_core.tokens import EstimateCounter
+from advent_core.tokens import EstimateCounter, TokenCheck
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -3844,3 +3844,486 @@ def test_strategy_refuses_an_unknown_value_without_changing_anything(monkeypatch
     assert shell.agent.context_strategy == "summary"
     # Same refusal /set prints — the wrapper adds no message of its own.
     assert "context_strategy принимает только" in _flat(capsys.readouterr().err)
+
+
+# --- Day 17: инструменты MCP -------------------------------------------------
+
+
+def _tool_rounds_complete(script, seen=None):
+    """Двойник complete(), принимающий tools/tool_choice.
+
+    Штатный `_complete` выше их не принимает вовсе — с включёнными
+    инструментами он упал бы TypeError'ом на первом же ходу. Каждый элемент
+    `script` — либо список пар (имя, JSON-аргументы) для раунда с вызовом
+    инструмента, либо строка финального ответа.
+    """
+    from advent_core.telemetry import RawToolCall
+
+    queue = list(script)
+
+    def complete(config, messages, capabilities=None, *, tools=None, tool_choice=None):
+        if seen is not None:
+            seen.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        step = queue.pop(0)
+        # Снимок, как в настоящем chat.complete(): tool-loop дописывает
+        # эфемерные сообщения в ТОТ ЖЕ список между раундами, и двойник,
+        # хранящий его по ссылке, показал бы раунду 1 чужие сообщения.
+        if isinstance(step, str):
+            return _reply(step, sent_messages=list(messages))
+        calls = tuple(
+            RawToolCall(id=f"call_{index}", name=name, arguments=arguments)
+            for index, (name, arguments) in enumerate(step)
+        )
+        result = _reply("", sent_messages=list(messages))
+        result.tool_calls = calls
+        result.finish_reason = "tool_calls"
+        return result
+
+    return complete
+
+
+def _fake_tool(shell, outcomes=None):
+    """Мост к инструменту без подпроцесса: агенту нужен колбэк, а не сервер."""
+    from advent_core.mcp_client import ToolCallOutcome
+
+    queue = list(outcomes or [])
+
+    def call(name, arguments):
+        if queue:
+            text, is_error = queue.pop(0)
+            return ToolCallOutcome(text=text, is_error=is_error)
+        return ToolCallOutcome(text="abc1234  2026-09-22  автор  тема", is_error=False)
+
+    shell.agent.tools = [
+        {
+            "type": "function",
+            "function": {"name": "git_log", "description": "коммиты", "parameters": {}},
+        }
+    ]
+    shell.agent.call_tool = call
+    shell.agent.mcp_enabled = True
+    shell.mcp_tool_names = ["git_log"]
+
+
+def test_mcp_without_arguments_says_the_tools_are_off_by_default(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/mcp", shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert "выключены" in stderr
+    assert "git_log" in stderr
+    assert shell.agent.mcp_enabled is False
+    assert shell.agent.tools is None
+
+
+def test_mcp_on_against_the_real_server_attaches_its_raw_schemas(monkeypatch, tmp_path, capfd):
+    """Настоящий stdio-подпроцесс, как в тестах дня 16: транспорт не мокается.
+
+    capfd, а не capsys: подмена sys.stderr объектом без fileno() ломает
+    запуск подпроцесса по stdio — сервер падает с «fileno» ещё до handshake.
+    """
+    shell = _shell(monkeypatch, tmp_path)
+    capfd.readouterr()
+
+    cli._dispatch("/mcp on", shell)
+
+    assert shell.agent.mcp_enabled is True
+    assert shell.agent.call_tool is not None
+    names = {tool["function"]["name"] for tool in shell.agent.tools}
+    assert {"list_days", "get_task", "count_tokens", "git_log"} <= names
+    git_log = next(t for t in shell.agent.tools if t["function"]["name"] == "git_log")
+    # Сырая JSON Schema, а не сводка ToolArg: именно её ждёт function.parameters.
+    assert git_log["function"]["parameters"]["properties"]["n"]["type"] == "integer"
+    assert shell.session.state["mcp_enabled"] is True
+    assert "стриминг" in _flat(capfd.readouterr().err)
+
+
+def test_mcp_on_with_an_unreachable_server_neither_crashes_nor_turns_tools_on(
+    monkeypatch, tmp_path, capsys
+):
+    shell = _shell(monkeypatch, tmp_path)
+    import week_04.client as week04_client
+
+    monkeypatch.setattr(week04_client, "default_server_command", lambda: ["no-such-binary-xyz"])
+    capsys.readouterr()
+
+    assert cli._dispatch("/mcp on", shell) is False
+
+    assert shell.agent.mcp_enabled is False
+    assert shell.agent.tools is None
+    assert "инструменты не подключены" in _flat(capsys.readouterr().err)
+
+
+def test_mcp_off_keeps_the_fetched_tools_so_a_second_on_costs_nothing(monkeypatch, tmp_path):
+    """Проверяется отсутствие ВТОРОГО запуска сервера, а не обход `_mcp_enable`.
+
+    Быстрый путь переехал внутрь `_mcp_enable` (его же зовёт `_restore_mcp`,
+    который раньше платил подпроцессом на каждый переход между сессиями), так
+    что мерить надо `connect_and_list`, а не сам вызов хелпера.
+    """
+    from advent_core import mcp_client
+
+    shell = _shell(monkeypatch, tmp_path)
+    _fake_tool(shell)
+    spawns = []
+    monkeypatch.setattr(
+        mcp_client,
+        "connect_and_list",
+        lambda *args, **kwargs: spawns.append(args) or pytest.fail("сервер запущен второй раз"),
+    )
+
+    cli._dispatch("/mcp off", shell)
+    assert shell.agent.mcp_enabled is False
+    assert shell.session.state["mcp_enabled"] is False
+
+    cli._dispatch("/mcp on", shell)
+    assert shell.agent.mcp_enabled is True
+    assert spawns == []  # список уже забран — второго запуска сервера нет
+
+
+def test_restoring_a_session_reuses_the_fetched_tools_instead_of_respawning(
+    monkeypatch, tmp_path, capsys
+):
+    """Быстрый путь обязан работать и для `_restore_mcp`, не только для `/mcp on`.
+
+    Переход между сессиями зовёт `_restore_mcp`, а тот раньше шёл мимо
+    быстрого пути `_cmd_mcp` и платил новым подпроцессом за каждый переход.
+    """
+    from advent_core import mcp_client
+
+    shell = _shell(monkeypatch, tmp_path)
+    _fake_tool(shell)
+    shell.agent.mcp_enabled = False
+    shell.mcp_restore = True
+    monkeypatch.setattr(
+        mcp_client,
+        "connect_and_list",
+        lambda *args, **kwargs: pytest.fail("сервер запущен ради уже забранного списка"),
+    )
+    capsys.readouterr()
+
+    shell._restore_mcp()
+
+    assert shell.agent.mcp_enabled is True
+
+
+def test_both_routes_to_enabled_name_the_server_the_same_way(monkeypatch, tmp_path, capsys):
+    """Сообщение о включении — одно на оба пути.
+
+    Путь с забором списка знает `listing.server_name`, быстрый — нет, и
+    раньше печатал строку короче. Имя сервера поэтому живёт на shell.
+    """
+    shell = _shell(monkeypatch, tmp_path)
+    _fake_tool(shell)
+    shell.agent.mcp_enabled = False
+    shell.mcp_server_name = "advent-mcp"
+    capsys.readouterr()
+
+    cli._dispatch("/mcp on", shell)
+    cached = _flat(capsys.readouterr().err)
+    assert "инструменты MCP включены: advent-mcp, git_log" in cached
+    assert "стриминг" in cached
+
+    # Без известного имени строка остаётся корректной, а не печатает None.
+    shell.agent.mcp_enabled = False
+    shell.mcp_server_name = None
+    capsys.readouterr()
+    cli._dispatch("/mcp on", shell)
+    nameless = _flat(capsys.readouterr().err)
+    assert "инструменты MCP включены: git_log" in nameless
+    assert "None" not in nameless
+
+
+def test_the_tool_bridge_swallows_any_exception_not_just_mcperror(monkeypatch):
+    """Контракт `Agent.call_tool`: колбэк не бросает НИКОГДА.
+
+    `except MCPError` покрывал только переведённую область — а переводится
+    внутренняя корутина, тогда как `anyio.run()` вокруг неё может бросить
+    своё. Поэтому двойник кидает голый `RuntimeError`: недостающий бинарник
+    в `MCPError` как раз переводится и старую ветку бы не покинул.
+    """
+    from advent_core import mcp_client
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("anyio: no running event loop")
+
+    monkeypatch.setattr(mcp_client, "call_tool_once", boom)
+
+    outcome = cli._mcp_bridge(["no-such-binary-xyz"])("git_log", {"n": 3})
+
+    assert outcome.is_error is True
+    assert outcome.text, "текст ошибки пуст — модели не на что реагировать"
+
+
+def test_the_tool_bridge_reports_a_missing_server_as_a_tool_error(monkeypatch):
+    """Тот же контракт на настоящем отказе транспорта, без подмены."""
+    outcome = cli._mcp_bridge(["no-such-binary-xyz"])("git_log", {"n": 3})
+
+    assert outcome.is_error is True
+    assert outcome.text
+
+
+def test_a_turn_with_tools_journals_every_round_and_every_call(monkeypatch, tmp_path, capsys):
+    rows = []
+    monkeypatch.setattr(
+        cli, "log_call", lambda result, messages, **kw: rows.append(kw.get("extra"))
+    )
+    seen = []
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        complete=_tool_rounds_complete(
+            [
+                [("git_log", '{"n": 100}')],
+                [("git_log", '{"n": 20}')],
+                "последние коммиты: abc1234",
+            ],
+            seen,
+        ),
+    )
+    _fake_tool(shell, outcomes=[("n должен быть от 1 до 20, получено 100", True)])
+    capsys.readouterr()
+
+    cli._turn(shell, "покажи последние коммиты")
+
+    kinds = [row.get("kind") if row else None for row in rows]
+    assert kinds.count("mcp_tool_round") == 2
+    assert kinds.count("mcp_tool") == 2
+    tool_rows = [row for row in rows if row and row.get("kind") == "mcp_tool"]
+    assert [row["arguments"] for row in tool_rows] == [{"n": 100}, {"n": 20}]
+    assert [row["is_error"] for row in tool_rows] == [True, False]
+    assert tool_rows[0]["tool"] == "git_log"
+    assert tool_rows[1]["result_chars"] > 0
+    round_rows = [row for row in rows if row and row.get("kind") == "mcp_tool_round"]
+    assert [row["round"] for row in round_rows] == [1, 2]
+    # tools ушли в КАЖДЫЙ из трёх запросов, стриминг не использован.
+    assert len(seen) == 3
+    assert all(step["tool_choice"] == "auto" for step in seen)
+
+    assert shell.mcp_rounds == 2
+    assert shell.mcp_tool_calls == 2
+    assert shell.mcp_tool_errors == 1
+    # Оба платных раунда: 2 × 10/5, финальный идёт обычной строкой хода.
+    assert shell.mcp_prompt_tokens == 20
+    assert shell.mcp_completion_tokens == 10
+    assert "ход 30/15 (раундов 3)" in _flat(capsys.readouterr().err)
+
+    cli._dispatch("/tokens", shell)
+    tokens_out = _flat(capsys.readouterr().err)
+    assert "лишних раундов 2, стоили 20/10" in tokens_out
+    assert "вызовов инструмента 2, из них ошибок 1" in tokens_out
+
+    # Деньги потрачены — `/mcp off` их не отменяет. Ранний return на
+    # выключенных инструментах прятал всю накопленную цену разом.
+    cli._dispatch("/mcp off", shell)
+    capsys.readouterr()
+    cli._dispatch("/tokens", shell)
+    after_off = _flat(capsys.readouterr().err)
+    assert "выключены (/mcp on)" in after_off
+    assert "лишних раундов 2, стоили 20/10" in after_off
+    assert "вызовов инструмента 2, из них ошибок 1" in after_off
+
+
+def test_mcp_off_drops_the_stale_reconciliation(monkeypatch, tmp_path):
+    """Сверка, показанная `/tokens`, сделана ДО `/mcp on`.
+
+    Ходы с инструментами сверку пропускают, поэтому после `/mcp off` кэш
+    остался бы от прошлой личности разговора и печатался бы как свежий.
+    """
+    shell = _shell(monkeypatch, tmp_path)
+    _fake_tool(shell)
+    shell.last_check = TokenCheck(local=100, server=100, exact=True)
+
+    cli._dispatch("/mcp off", shell)
+
+    assert shell.last_check is None
+
+
+def test_a_tool_round_row_hides_the_synthetic_task_block(monkeypatch, tmp_path, capsys):
+    """Раунд 1 везёт ВЕСЬ payload хода — вместе с блоком `/task`.
+
+    Строка хода фильтруется через `_journal_messages`, а строка
+    `mcp_tool_round` писала `sent_messages` сырьём: приватный контекст уезжал
+    в logs/calls.jsonl через заднюю дверь.
+    """
+    rows = []
+    monkeypatch.setattr(
+        cli,
+        "log_call",
+        lambda result, messages, **kw: rows.append((kw.get("extra"), messages)),
+    )
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        complete=_tool_rounds_complete([[("git_log", '{"n": 3}')], "последние коммиты"]),
+    )
+    _fake_tool(shell)
+    cli._dispatch("/task start Секретная цель :: Шаг :: Ожидание", shell)
+    assert shell.task is not None
+    capsys.readouterr()
+
+    cli._turn(shell, "покажи последние коммиты")
+
+    round_rows = [msgs for extra, msgs in rows if extra and extra.get("kind") == "mcp_tool_round"]
+    assert len(round_rows) == 1
+    flat = " ".join(str(message.get("content", "")) for message in round_rows[0])
+    assert "Секретная цель" not in flat, "синтетический блок /task уехал в журнал"
+    assert "покажи последние коммиты" in flat
+
+
+def test_the_exhausted_last_round_is_not_billed_twice(monkeypatch, tmp_path, capsys):
+    """MAX_TOOL_ROUNDS исчерпан — последний раунд И запаркован, И стал ответом.
+
+    Сложить его дважды значило бы приписать ходу чужие токены; проверка идёт
+    по identity, потому что это буквально один объект.
+    """
+    rows = []
+    monkeypatch.setattr(
+        cli, "log_call", lambda result, messages, **kw: rows.append(kw.get("extra"))
+    )
+    shell = _shell(
+        monkeypatch,
+        tmp_path,
+        complete=_tool_rounds_complete([[("git_log", "{}")]] * 3),
+    )
+    _fake_tool(shell)
+    capsys.readouterr()
+
+    cli._turn(shell, "покажи коммиты")
+
+    kinds = [row.get("kind") if row else None for row in rows]
+    assert kinds.count("mcp_tool_round") == 2  # не 3: финальный уже учтён ходом
+    assert kinds.count("mcp_tool") == 3
+    assert shell.mcp_rounds == 2
+    assert shell.mcp_prompt_tokens == 20
+    assert "ход 30/15 (раундов 3)" in _flat(capsys.readouterr().err)
+
+
+def test_mcp_stays_allowed_while_a_task_is_paused(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _start_task(shell)
+    cli._dispatch("/task pause ждём", shell)
+    _fake_tool(shell)
+    capsys.readouterr()
+
+    cli._dispatch("/mcp off", shell)
+    assert shell.agent.mcp_enabled is False
+    cli._dispatch("/mcp", shell)
+    assert "blocked" not in _flat(capsys.readouterr().err)
+
+    # Форма с аргументом обязана проходить тоже: список разрешённых команд без
+    # аргументов пропустил бы только голую /mcp и заблокировал ровно то, что
+    # что-то делает.
+    assert cli._paused_command_allowed(["/mcp", "on"], shell) is True
+    assert cli._paused_command_allowed(["/mcp", "wat"], shell) is False
+
+
+def test_session_mcp_flag_has_three_cases_like_context_limit(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _fake_tool(shell)
+    shell.session.state["mcp_enabled"] = True
+    shell.session.save()
+
+    # Ключ есть и True — восстанавливаем через тот же путь, что и /mcp on.
+    enabled = []
+    monkeypatch.setattr(cli, "_mcp_enable", lambda s: enabled.append(s) or True)
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+    second = cli.AgentShell(_config(), directory=tmp_path)
+    assert enabled == [second]
+
+    # Ключ есть и null — честное «выключено».
+    second.session.state["mcp_enabled"] = None
+    second.session.save()
+    enabled.clear()
+    third = cli.AgentShell(_config(), directory=tmp_path)
+    assert enabled == []
+    assert third.agent.mcp_enabled is False
+
+    # Ключ есть и мусор — предупреждение, а не молчаливое применение.
+    third.session.state["mcp_enabled"] = "on"
+    third.session.save()
+    capsys.readouterr()
+    fourth = cli.AgentShell(_config(), directory=tmp_path)
+    assert fourth.agent.mcp_enabled is False
+    assert "негодное mcp_enabled" in _flat(capsys.readouterr().err)
+
+
+def test_an_unreachable_server_at_startup_does_not_erase_the_saved_preference(
+    monkeypatch, tmp_path, capsys
+):
+    """Сервер лежит сейчас — настройка пользователя от этого не пропадает.
+
+    `_save_state` бежит после каждого хода и писал живой флаг агента: одна
+    неудачная попытка восстановления — и сохранённое `/mcp on` молча
+    становилось `false` навсегда.
+    """
+    session = Session.new("default", directory=tmp_path)
+    session.state["mcp_enabled"] = True
+    session.save()
+    monkeypatch.setattr(cli.chat_core, "complete", _complete())
+    monkeypatch.setattr(cli, "_mcp_enable", lambda _shell: False)
+    capsys.readouterr()
+
+    shell = cli.AgentShell(_config(), directory=tmp_path)
+
+    assert shell.agent.mcp_enabled is False, "инструменты не подключились — флаг честный"
+    assert shell.mcp_restore is True, "желание пользователя стёрли"
+    assert "не восстановлено" in _flat(capsys.readouterr().err)
+
+    cli._save_state(shell)
+    assert shell.session.state["mcp_enabled"] is True
+
+
+def test_a_paid_round_survives_a_turn_that_then_fails(monkeypatch, tmp_path, capsys):
+    """Раунд 1 оплачен, раунд 2 упал по сети — цена не должна исчезнуть.
+
+    Без салваджа строки `mcp_tool_round` не было бы вовсе, а список остался бы
+    грязным на агенте: следующий удачный ход записал бы чужие токены себе.
+    """
+    rows = []
+    monkeypatch.setattr(
+        cli, "log_call", lambda result, messages, **kw: rows.append(kw.get("extra"))
+    )
+    inner = _tool_rounds_complete([[("git_log", "{}")], "не дойдёт"])
+
+    def complete(config, messages, capabilities=None, *, tools=None, tool_choice=None):
+        if any(message.get("role") == "tool" for message in messages):
+            raise AdventError("сеть отвалилась")
+        return inner(config, messages, capabilities, tools=tools, tool_choice=tool_choice)
+
+    shell = _shell(monkeypatch, tmp_path, complete=complete)
+    _fake_tool(shell)
+    capsys.readouterr()
+
+    cli._turn(shell, "покажи коммиты")
+
+    kinds = [row.get("kind") if row else None for row in rows]
+    assert kinds.count("mcp_tool_round") == 1
+    assert shell.mcp_rounds == 1
+    assert shell.mcp_prompt_tokens == 10
+    # Список отдан ровно один раз — следующий ход начинается с чистого.
+    assert shell.agent.pending_tool_rounds == []
+
+
+def test_after_mcp_off_an_ordinary_turn_is_reconciled_again(monkeypatch, tmp_path, capsys):
+    """`/mcp off` возвращает не только стрим, но и сверку счёта с сервером.
+
+    Пока инструменты включены, сверка пропускается (схемы tools в локальный
+    счёт не попадают). Проверяется поведение хода, а не только флаг.
+    """
+    shell = _shell(monkeypatch, tmp_path, complete=_tool_rounds_complete(["ответ", "ответ"]))
+    _fake_tool(shell)
+    capsys.readouterr()
+
+    cli._turn(shell, "вопрос с инструментами")
+    assert shell.last_check is None
+
+    cli._dispatch("/mcp off", shell)
+    cli._turn(shell, "обычный вопрос")
+
+    assert shell.last_check is not None
+    assert shell.last_check.server == 10
+    cli._dispatch("/tokens", shell)
+    assert "сверка с сервером пропущена" not in _flat(capsys.readouterr().err)
