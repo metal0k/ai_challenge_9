@@ -162,6 +162,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 4 and day == 17:
+        return _demo_steps_w04d17()
     if week == 4 and day == 16:
         return _demo_steps_w04d16()
     if week == 1 and day == 5:
@@ -1568,6 +1570,77 @@ def _demo_steps_w04d16() -> list[Step]:
             args=["tools", "--raw"],
             timeout=60,
             line_pause=6.0,
+        ),
+    ]
+
+
+
+# How long each line of the tool-use step holds the screen. The first take
+# (2026-09-23) used the shared 3 s pause across the whole step, and it was
+# unreadable: the answer printed, then /tokens (~15 lines) scrolled it away
+# a beat later — same class of bug CLAUDE.md already documents for day 09's
+# dialog, same fix (a longer per-step pause), except here it also has to sit
+# in the SAME process as /tokens: the tool-round accounting
+# (`shell.mcp_rounds` et al.) lives only in the running AgentShell, not in
+# the session file, so splitting the question and /tokens into separate
+# processes (tried and reverted) makes the "раундов 2, стоили ..." line
+# vanish from /tokens entirely, not just print unread.
+_DEMO_D17_LINE_PAUSE = 14.0
+
+
+def _demo_steps_w04d17() -> list[Step]:
+    """Day 17 — git_log MCP tool wired into the persistent agent via function-calling.
+
+    Step 1 reuses day 16's own machinery (adventmcp tools) to show the new 4th
+    tool on the server side — no new demo code needed for that half.
+    Step 2 is /mcp's own off→on toggle at a brisk pace (nothing there needs a
+    long hold). Step 3 is the whole rest of the scenario in ONE process —
+    the question, /tokens and /mcp off — precisely so the paid tool-round
+    counters /tokens reports are still the ones this same turn just
+    accumulated: a question asking for MORE commits than GIT_LOG_MAX allows,
+    so the model calls git_log(n=100), sees the tool's own error, retries
+    with a smaller n on its own (SPEC-w04d17.md §"Решения интервью" #8), and
+    /tokens afterwards shows BOTH paid rounds, not just the one that answered.
+    """
+    session_args = ["--session", "w04d17-demo", "--max-tokens", "300"]
+    return [
+        Step(
+            title="1. Сервер: git_log — четвёртый инструмент рядом с тремя из дня 16",
+            module="week_04.cli",
+            # A cold subprocess spawn measured 13-26 s wall time on this
+            # machine (antivirus/disk variance, not a regression — day 16's
+            # own default is the same 15 s); a generous explicit --timeout
+            # keeps a slow take from a spurious exit-8 instead of masking it.
+            args=["tools", "--timeout", "45"],
+            timeout=90,
+            line_pause=5.0,
+        ),
+        Step(
+            title="2. Агент: /mcp начинает выключенным, затем /mcp on",
+            module="week_02.cli",
+            args=session_args,
+            stdin_lines=["/new", "/mcp", "/mcp on", "/exit"],
+            timeout=90,
+            line_pause=3.0,
+        ),
+        Step(
+            title=(
+                "3. Модель сама вызывает git_log: ошибка n=100 → повтор n=20 → "
+                "ответ, /tokens считает оба раунда"
+            ),
+            module="week_02.cli",
+            args=session_args,
+            stdin_lines=[
+                (
+                    "Покажи 100 последних коммитов этого репозитория. "
+                    "Перечисли хотя бы 5 из них: хэш и тему одной строкой каждый."
+                ),
+                "/tokens",
+                "/mcp off",
+                "/exit",
+            ],
+            timeout=180,
+            line_pause=_DEMO_D17_LINE_PAUSE,
         ),
     ]
 
