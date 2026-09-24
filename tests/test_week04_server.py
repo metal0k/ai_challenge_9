@@ -5,12 +5,13 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from week_04 import server
+from week_04 import scheduler, server
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -31,8 +32,15 @@ third
 """
 
 
-def test_tool_names_constant_has_all_four_tools():
-    assert server.TOOL_NAMES == ("list_days", "get_task", "count_tokens", "git_log")
+def test_tool_names_constant_has_all_six_tools():
+    assert server.TOOL_NAMES == (
+        "list_days",
+        "get_task",
+        "count_tokens",
+        "git_log",
+        "schedule_job",
+        "repo_activity_summary",
+    )
 
 
 def test_extract_day_returns_only_that_section():
@@ -149,3 +157,142 @@ def test_server_writes_nothing_to_stdout_without_a_client():
         timeout=60,
     )
     assert proc.stdout == ""
+
+
+# --- Day 18: scheduler tools -------------------------------------------------
+
+
+def _iso(minutes_ago: float) -> str:
+    moment = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+    return moment.isoformat(timespec="seconds")
+
+
+@pytest.fixture
+def job_file(tmp_path, monkeypatch):
+    path = tmp_path / "repo_activity.json"
+    monkeypatch.setattr(scheduler, "JOB_FILE", path)
+    return path
+
+
+@pytest.mark.parametrize("bad", [0, 4, 3601, -10])
+def test_schedule_job_rejects_out_of_range_interval(job_file, bad):
+    with pytest.raises(ToolError, match=f"от 5 до 3600, получено {bad}"):
+        server.schedule_job(bad)
+    assert not job_file.exists()
+
+
+@pytest.mark.parametrize("edge", [5, 3600])
+def test_schedule_job_accepts_bounds(job_file, edge):
+    assert f"интервал {edge} с" in server.schedule_job(edge)
+
+
+def test_schedule_job_create_same_change_messages(job_file):
+    assert server.schedule_job(15) == (
+        "job repo_activity создан: интервал 15 с. Демон подхватит его на следующем опросе."
+    )
+    assert server.schedule_job(15) == "job repo_activity: интервал уже 15 с, без изменений."
+    assert server.schedule_job(60) == "job repo_activity: интервал изменён 15 → 60 с."
+    assert scheduler.load_state().job.interval_seconds == 60
+
+
+def test_summary_without_job_raises(job_file):
+    with pytest.raises(ToolError, match="schedule_job"):
+        server.repo_activity_summary()
+
+
+@pytest.mark.parametrize("bad", [0, -5])
+def test_summary_rejects_non_positive_minutes(job_file, bad):
+    with pytest.raises(ToolError, match="положительным"):
+        server.repo_activity_summary(bad)
+
+
+def test_summary_job_without_runs_says_no_ticks(job_file):
+    server.schedule_job(15)
+    assert "тиков ещё не было" in server.repo_activity_summary()
+
+
+def _seed_runs(runs):
+    state = scheduler.load_state()
+    scheduler.save_state(scheduler.SchedulerState(job=state.job, runs=runs))
+
+
+def test_summary_aggregates_recorded_runs(job_file):
+    server.schedule_job(15)
+    _seed_runs(
+        [
+            scheduler.Run(
+                ts=_iso(3),
+                new_commits=0,
+                total_commits=40,
+                head_hash="a" * 40,
+            ),
+            scheduler.Run(
+                ts=_iso(2),
+                new_commits=2,
+                total_commits=42,
+                commits=[
+                    "bbb1111  2026-09-23  Denis  second feature",
+                    "ccc2222  2026-09-23  Denis  first feature",
+                ],
+                head_hash="b" * 40,
+            ),
+            scheduler.Run(
+                ts=_iso(1),
+                new_commits=1,
+                total_commits=43,
+                commits=["ddd3333  2026-09-23  Denis  third feature"],
+                head_hash="c" * 40,
+            ),
+        ]
+    )
+    text = server.repo_activity_summary()
+    assert "тиков в окне: 3 (" in text
+    assert "новых коммитов: 3\n" in text
+    assert "всего коммитов в репозитории: 43\n" in text
+    assert "  ddd3333  2026-09-23  Denis  third feature" in text
+    assert "  ccc2222  2026-09-23  Denis  first feature" in text
+
+
+def test_summary_minutes_filter_drops_old_runs(job_file):
+    server.schedule_job(15)
+    _seed_runs(
+        [
+            scheduler.Run(
+                ts=_iso(180),
+                new_commits=1,
+                total_commits=10,
+                commits=["old0001  2026-09-23  Denis  ancient commit"],
+                head_hash="a" * 40,
+            ),
+            scheduler.Run(
+                ts=_iso(1),
+                new_commits=1,
+                total_commits=11,
+                commits=["new0002  2026-09-23  Denis  fresh commit"],
+                head_hash="b" * 40,
+            ),
+        ]
+    )
+    text = server.repo_activity_summary(minutes=10)
+    assert "тиков в окне: 1 (" in text
+    assert "новых коммитов: 1\n" in text
+    assert "fresh commit" in text
+    assert "ancient commit" not in text
+    assert "ancient commit" in server.repo_activity_summary()
+
+
+def test_summary_minutes_window_empty_reports_no_ticks(job_file):
+    server.schedule_job(15)
+    _seed_runs([scheduler.Run(ts=_iso(180), new_commits=1, total_commits=10, head_hash="a" * 40)])
+    assert "тиков за последние 10 мин не найдено" in server.repo_activity_summary(minutes=10)
+
+
+def test_tools_turn_oserror_into_toolerror(job_file, monkeypatch):
+    def boom(*a, **k):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(scheduler, "load_state", boom)
+    with pytest.raises(ToolError, match="не удалось обновить состояние"):
+        server.schedule_job(15)
+    with pytest.raises(ToolError, match="не удалось прочитать состояние"):
+        server.repo_activity_summary()

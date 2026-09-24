@@ -15,10 +15,20 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from advent_core import tokens
+from week_04 import scheduler
 
 SERVER_NAME = "advent-repo"
 # The client's default `--expect` list; tests assert the literal names.
-TOOL_NAMES = ("list_days", "get_task", "count_tokens", "git_log")
+TOOL_NAMES = (
+    "list_days",
+    "get_task",
+    "count_tokens",
+    "git_log",
+    "schedule_job",
+    "repo_activity_summary",
+)
+SCHEDULE_MIN = scheduler.MIN_INTERVAL_SECONDS
+SCHEDULE_MAX = scheduler.MAX_INTERVAL_SECONDS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TAG_RE = re.compile(r"^w\d{2}d\d{2}$")
@@ -130,6 +140,51 @@ def git_log(n: int = 5) -> str:
     if proc.returncode != 0:
         raise ToolError(f"git log завершился с ошибкой: {proc.stderr.strip()}")
     return proc.stdout
+
+
+@mcp.tool(
+    description="Запланировать периодический сбор активности репозитория (git log) "
+    "с заданным интервалом в секундах; повторный вызов меняет интервал "
+    "уже существующего job'а."
+)
+def schedule_job(interval_seconds: int) -> str:
+    if not SCHEDULE_MIN <= interval_seconds <= SCHEDULE_MAX:
+        raise ToolError(
+            f"interval_seconds должен быть от {SCHEDULE_MIN} до {SCHEDULE_MAX}, "
+            f"получено {interval_seconds}"
+        )
+    try:
+        previous = scheduler.load_state().job
+        scheduler.upsert_job(interval_seconds)
+    except OSError as exc:
+        raise ToolError(f"не удалось обновить состояние планировщика: {exc}") from exc
+    if previous is None:
+        return (
+            f"job repo_activity создан: интервал {interval_seconds} с. "
+            "Демон подхватит его на следующем опросе."
+        )
+    if previous.interval_seconds == interval_seconds:
+        return f"job repo_activity: интервал уже {interval_seconds} с, без изменений."
+    return (
+        f"job repo_activity: интервал изменён {previous.interval_seconds} → {interval_seconds} с."
+    )
+
+
+@mcp.tool(
+    description="Агрегированная сводка по периодически собираемой активности "
+    "репозитория: сколько новых коммитов и за сколько тиков "
+    "(опционально — только за последние N минут)."
+)
+def repo_activity_summary(minutes: int | None = None) -> str:
+    if minutes is not None and minutes <= 0:
+        raise ToolError(f"minutes должен быть положительным, получено {minutes}")
+    try:
+        state = scheduler.load_state()
+    except OSError as exc:
+        raise ToolError(f"не удалось прочитать состояние планировщика: {exc}") from exc
+    if state.job is None:
+        raise ToolError("job repo_activity ещё не создан — сначала вызови schedule_job")
+    return scheduler.summarize(state, minutes=minutes)
 
 
 if __name__ == "__main__":

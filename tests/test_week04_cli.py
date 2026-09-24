@@ -7,6 +7,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from typer.testing import CliRunner
+
+from week_04 import cli, scheduler
+
 ROOT = Path(__file__).resolve().parent.parent
 ENV = {**os.environ, "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1", "COLUMNS": "200"}
 
@@ -30,12 +34,18 @@ def own_server_arg() -> str:
 def test_default_server_lists_tools_and_verifies_them():
     proc = run_cli("tools")
     assert proc.returncode == 0
-    # Четвёртый инструмент — git_log дня 17; счётчик сверки растёт вместе с
-    # TOOL_NAMES, и число здесь литеральное намеренно: взятое из того же
-    # списка, что и код, оно не могло бы покраснеть никогда.
-    for name in ("list_days", "get_task", "count_tokens", "git_log"):
+    # Счётчик сверки растёт вместе с TOOL_NAMES, и число здесь литеральное
+    # намеренно: взятое из того же списка, что и код, оно не могло бы покраснеть.
+    for name in (
+        "list_days",
+        "get_task",
+        "count_tokens",
+        "git_log",
+        "schedule_job",
+        "repo_activity_summary",
+    ):
         assert name in proc.stdout
-    assert "✓ 4 из 4 инструментов совпадают с ожидаемыми" in proc.stdout
+    assert "✓ 6 из 6 инструментов совпадают с ожидаемыми" in proc.stdout
     assert "week: integer · обязательный" in proc.stdout
     assert "model: string · опциональный" in proc.stdout
     assert "по умолчанию ministral-14b-latest" in proc.stdout
@@ -135,5 +145,108 @@ def test_chatty_server_gives_one_clean_error_without_sdk_traceback(tmp_path):
 def test_raw_tools_list_frame_shows_every_tool_name_on_the_wire():
     proc = run_cli("tools", "--raw")
     frame = next(line for line in proc.stderr.splitlines() if '"tools":[' in line)
-    for name in ('"name":"list_days"', '"name":"get_task"', '"name":"count_tokens"'):
-        assert name in frame
+    # Six tools no longer fit RAW_LINE_LIMIT: the middle is elided, so only the
+    # head of the list is guaranteed on screen.
+    assert '"name":"list_days"' in frame
+
+
+def test_scheduler_help_lists_run_and_flags():
+    proc = run_cli("scheduler", "run", "--help")
+    assert proc.returncode == 0
+    assert "--once" in proc.stdout
+    assert "--interval" in proc.stdout
+
+
+def test_scheduler_without_subcommand_shows_help():
+    proc = run_cli("scheduler")
+    assert "run" in proc.stdout + proc.stderr
+
+
+def test_tools_stays_a_real_subcommand_next_to_scheduler():
+    proc = run_cli("--help")
+    assert "tools" in proc.stdout
+    assert "scheduler" in proc.stdout
+
+
+def test_scheduler_once_runs_one_due_tick_without_sleeping(tmp_path, monkeypatch):
+    job_file = tmp_path / "job.json"
+    monkeypatch.setattr(scheduler, "JOB_FILE", job_file)
+    scheduler.upsert_job(5, now=lambda: 0, path=job_file)  # created in 1970: due now
+
+    def no_sleep(_seconds):
+        raise AssertionError("--once must not sleep")
+
+    monkeypatch.setattr(cli.time, "sleep", no_sleep)
+    result = CliRunner().invoke(cli.app, ["scheduler", "run", "--once"])
+    assert result.exit_code == 0
+    state = scheduler.load_state(job_file)
+    assert len(state.runs) == 1
+    assert state.job is not None and state.job.last_run_at is not None
+
+
+def test_scheduler_once_without_job_exits_0_and_writes_nothing(tmp_path, monkeypatch):
+    job_file = tmp_path / "job.json"
+    monkeypatch.setattr(scheduler, "JOB_FILE", job_file)
+    result = CliRunner().invoke(cli.app, ["scheduler", "run", "--once"])
+    assert result.exit_code == 0
+    assert not job_file.exists()
+
+
+def test_scheduler_interval_out_of_bounds_exits_1_and_creates_no_job(tmp_path, monkeypatch):
+    job_file = tmp_path / "job.json"
+    monkeypatch.setattr(scheduler, "JOB_FILE", job_file)
+    for bad in ("1", "3601"):
+        result = CliRunner().invoke(cli.app, ["scheduler", "run", "--once", "--interval", bad])
+        assert result.exit_code == 1
+    assert not job_file.exists()
+
+
+def test_scheduler_interval_upserts_job_before_once(tmp_path, monkeypatch):
+    job_file = tmp_path / "job.json"
+    monkeypatch.setattr(scheduler, "JOB_FILE", job_file)
+    result = CliRunner().invoke(cli.app, ["scheduler", "run", "--once", "--interval", "30"])
+    assert result.exit_code == 0
+    state = scheduler.load_state(job_file)
+    assert state.job is not None and state.job.interval_seconds == 30
+
+
+def test_scheduler_ctrl_c_exits_130(monkeypatch):
+    def boom(**_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scheduler, "scheduler_loop", boom)
+    result = CliRunner().invoke(cli.app, ["scheduler", "run"])
+    assert result.exit_code == 130
+
+
+def test_tick_line_formats_ok_overflow_and_error_runs():
+    ok = scheduler.Run(ts="T", new_commits=2, total_commits=9)
+    assert cli._tick_line(ok) == "тик T: новых коммитов 2, всего 9"
+    over = scheduler.Run(ts="T", new_commits=20, total_commits=90, overflow=True)
+    assert cli._tick_line(over) == "тик T: новых коммитов 20+, всего 90"
+    bad = scheduler.Run(ts="T", new_commits=None, total_commits=None, error="[boom]")
+    assert cli._tick_line(bad) == "тик T: ошибка — \[boom]"  # rich-escaped
+
+
+def test_once_tick_line_goes_to_stderr_and_stdout_stays_empty(tmp_path, monkeypatch, capsys):
+    job_file = tmp_path / "job.json"
+    monkeypatch.setattr(scheduler, "JOB_FILE", job_file)
+    scheduler.upsert_job(5, now=lambda: 0, path=job_file)
+    fake = scheduler.Run(ts="T1", new_commits=1, total_commits=3, head_hash="h")
+    monkeypatch.setattr(scheduler, "run_tick", lambda job, **_k: fake)
+    result = CliRunner().invoke(cli.app, ["scheduler", "run", "--once"])
+    captured = capsys.readouterr()
+    assert result.exit_code == 0
+    assert result.stdout == "" and captured.out == ""
+    assert "тик T1: новых коммитов 1, всего 3" in result.stderr + captured.err
+
+
+def test_interval_bounds_error_is_on_stderr_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    job_file = tmp_path / "job.json"
+    monkeypatch.setattr(scheduler, "JOB_FILE", job_file)
+    result = CliRunner().invoke(cli.app, ["scheduler", "run", "--once", "--interval", "3601"])
+    captured = capsys.readouterr()
+    assert result.exit_code == 1
+    assert result.stdout == "" and captured.out == ""
+    assert "от 5 до 3600, получено 3601" in result.stderr + captured.err
+    assert not job_file.exists()

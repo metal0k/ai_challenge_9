@@ -1292,3 +1292,81 @@ def test_day_14_rehearsal_replays_live_contract_in_an_isolated_session():
         assert rehearsed.stdin_lines == [
             line.replace("w03d14-live", "w03d14-rehearsal") for line in recorded.stdin_lines
         ]
+
+
+# --------------------------------------------------------------------------
+# Week 04, Day 18: scheduler demo (daemon started by the operator beforehand).
+# --------------------------------------------------------------------------
+
+
+def test_day_18_steps_use_one_fresh_session_and_literal_pauses():
+    steps = record_mod.demo_steps(4, 18)
+    assert len(steps) == 4
+    assert all(step.module == "week_02.cli" for step in steps)
+    assert all(step.args == ["--session", "w04d18-demo", "--max-tokens", "300"] for step in steps)
+    assert [step.stdin_lines for step in steps] == [
+        ["/new", "/mcp on", "/exit"],
+        ["Настрой сбор активности репозитория каждые 15 секунд.", "/exit"],
+        ["Дай сводку активности репозитория.", "/exit"],
+        ["Дай сводку активности репозитория.", "/mcp off", "/exit"],
+    ]
+    assert [step.line_pause for step in steps] == [3.0, 12.0, 12.0, 12.0]
+    assert [step.timeout for step in steps] == [90, 120, 120, 120]
+
+
+def test_day_18_has_no_tokens_table_and_short_numbered_titles():
+    steps = record_mod.demo_steps(4, 18)
+    assert all("/tokens" not in step.stdin_lines for step in steps)
+    assert [step.title[:2] for step in steps] == ["1.", "2.", "3.", "4."]
+    assert all(len(step.title) < 100 for step in steps)
+
+
+def _state_file(tmp_path, monkeypatch, body: str | None):
+    path = tmp_path / "repo_activity.json"
+    if body is not None:
+        path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(record_mod, "_SCHEDULER_STATE", path)
+
+
+def _capture_warnings(monkeypatch) -> list[str]:
+    seen: list[str] = []
+    monkeypatch.setattr(console, "warn", seen.append)
+    return seen
+
+
+def test_scheduler_preflight_warns_when_state_file_is_absent(tmp_path, monkeypatch):
+    _state_file(tmp_path, monkeypatch, None)
+    seen = _capture_warnings(monkeypatch)
+    record_mod._warn_if_scheduler_idle(4, 18)
+    assert len(seen) == 1
+    assert "adventmcp scheduler run --interval 15" in seen[0]
+
+
+def test_scheduler_preflight_warns_when_last_tick_is_older_than_two_intervals(
+    tmp_path, monkeypatch
+):
+    _state_file(
+        tmp_path, monkeypatch, '{"job": null, "runs": [{"ts": "2026-09-23T10:00:00+00:00"}]}'
+    )
+    seen = _capture_warnings(monkeypatch)
+    now = record_mod.datetime.fromisoformat("2026-09-23T10:00:31+00:00").timestamp()
+    record_mod._warn_if_scheduler_idle(4, 18, now=now)
+    assert len(seen) == 1 and "31 с" in seen[0]
+
+
+def test_scheduler_preflight_is_silent_for_a_fresh_tick_and_other_days(tmp_path, monkeypatch):
+    _state_file(
+        tmp_path, monkeypatch, '{"job": null, "runs": [{"ts": "2026-09-23T10:00:00+00:00"}]}'
+    )
+    seen = _capture_warnings(monkeypatch)
+    now = record_mod.datetime.fromisoformat("2026-09-23T10:00:29+00:00").timestamp()
+    record_mod._warn_if_scheduler_idle(4, 18, now=now)
+    record_mod._warn_if_scheduler_idle(4, 17, now=now + 10_000)
+    assert seen == []
+
+
+def test_scheduler_preflight_warns_on_corrupt_state_and_never_raises(tmp_path, monkeypatch):
+    _state_file(tmp_path, monkeypatch, "{not json")
+    seen = _capture_warnings(monkeypatch)
+    record_mod._warn_if_scheduler_idle(4, 18)
+    assert len(seen) == 1

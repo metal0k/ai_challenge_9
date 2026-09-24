@@ -7,6 +7,7 @@ header, raw wire frames and errors go to stderr, as everywhere in this repo.
 from __future__ import annotations
 
 import subprocess
+import time
 
 import typer
 from rich.markup import escape as rich_escape
@@ -15,6 +16,7 @@ from rich.table import Table
 from advent_core import console
 from advent_core.errors import AdventError
 from week_04 import client as mcp_client
+from week_04 import scheduler
 from week_04.server import TOOL_NAMES
 
 DEFAULT_TIMEOUT = 15.0
@@ -28,6 +30,14 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+
+scheduler_app = typer.Typer(
+    help="Демон-планировщик: выполняет job'ы по расписанию.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(scheduler_app, name="scheduler")
 
 
 @app.callback()
@@ -134,6 +144,53 @@ def tools_command(
         console.out.print(f"[green]{verdict}[/green]" if ok else f"[bold red]{verdict}[/bold red]")
         if not ok:
             raise typer.Exit(1)
+
+
+def _tick_line(run: scheduler.Run) -> str:
+    if run.error is not None:
+        return f"тик {run.ts}: ошибка — {rich_escape(run.error)}"
+    plus = "+" if run.overflow else ""
+    return f"тик {run.ts}: новых коммитов {run.new_commits}{plus}, всего {run.total_commits}"
+
+
+def _on_tick(run: scheduler.Run) -> None:
+    console.note(_tick_line(run))
+
+
+@scheduler_app.command("run")
+def scheduler_run(
+    once: bool = typer.Option(
+        False, "--once", help="Одна проверка и выход, без бесконечного цикла."
+    ),
+    interval: int | None = typer.Option(
+        None,
+        "--interval",
+        help="Создать/перенастроить job на старте (удобство, не обязателен — "
+        "обычно job ставит сам агент через schedule_job).",
+    ),
+) -> None:
+    """Запустить демон: раз в секунду перечитывает файл job'а и выполняет тик, когда пора."""
+    if interval is not None:
+        lo, hi = scheduler.MIN_INTERVAL_SECONDS, scheduler.MAX_INTERVAL_SECONDS
+        if not lo <= interval <= hi:
+            console.err.print(
+                f"interval_seconds должен быть от {lo} до {hi}, получено {interval}",
+                highlight=False,
+            )
+            raise typer.Exit(code=1)
+        scheduler.upsert_job(interval)
+        console.note(f"job {scheduler.JOB_ID}: интервал {interval} с")
+    try:
+        if once:
+            run = scheduler.run_once_check(on_tick=_on_tick)
+            if run is None:
+                console.note("тик не выполнен: job нет, он выключен или ещё не пора")
+            return
+        console.note("демон запущен, остановка — Ctrl+C")
+        scheduler.scheduler_loop(now=time.time, sleep=time.sleep, on_tick=_on_tick)
+    except KeyboardInterrupt:
+        console.note("\nпрервано")
+        raise SystemExit(130) from None
 
 
 def main() -> None:

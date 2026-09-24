@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -15,6 +16,7 @@ import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -162,6 +164,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 4 and day == 18:
+        return _demo_steps_w04d18()
     if week == 4 and day == 17:
         return _demo_steps_w04d17()
     if week == 4 and day == 16:
@@ -1574,7 +1578,6 @@ def _demo_steps_w04d16() -> list[Step]:
     ]
 
 
-
 # How long each line of the tool-use step holds the screen. The first take
 # (2026-09-23) used the shared 3 s pause across the whole step, and it was
 # unreadable: the answer printed, then /tokens (~15 lines) scrolled it away
@@ -1643,6 +1646,87 @@ def _demo_steps_w04d17() -> list[Step]:
             line_pause=_DEMO_D17_LINE_PAUSE,
         ),
     ]
+
+
+# Day 18: the scheduler daemon runs OUTSIDE the take (started by the operator
+# beforehand), so the ticks between the two summaries accumulate in real time.
+# Each REPL line holds the screen 12 s: the schedule step (question + /exit)
+# and the first summary step (question + /exit) therefore sit ~24 s each,
+# which is the 20-25 s gap that lets a 15 s interval add a visible tick.
+# No /tokens here: its table scrolled the answer away on day 17.
+_DEMO_D18_LINE_PAUSE = 12.0
+_D18_INTERVAL = 15
+_D18_SESSION_ARGS = ["--session", "w04d18-demo", "--max-tokens", "300"]
+_SCHEDULER_STATE = PROJECT_ROOT / "logs" / "scheduler" / "repo_activity.json"
+
+
+def _demo_steps_w04d18() -> list[Step]:
+    """Day 18 — background scheduler: the agent schedules a job, then reads its ticks.
+
+    One fresh session, four processes (MCP mode persists in the session file;
+    day 17 relies on the same). The wait for new ticks is the trailing
+    line_pause of steps 2 and 3, not a sleep.
+    """
+    return [
+        Step(
+            title="1. Агент: /mcp on",
+            module="week_02.cli",
+            args=_D18_SESSION_ARGS,
+            stdin_lines=["/new", "/mcp on", "/exit"],
+            timeout=90,
+            line_pause=3.0,
+        ),
+        Step(
+            title="2. Модель сама ставит фоновую задачу через schedule_job",
+            module="week_02.cli",
+            args=_D18_SESSION_ARGS,
+            stdin_lines=[
+                "Настрой сбор активности репозитория каждые 15 секунд.",
+                "/exit",
+            ],
+            timeout=120,
+            line_pause=_DEMO_D18_LINE_PAUSE,
+        ),
+        Step(
+            title="3. Сводка активности репозитория: repo_activity_summary",
+            module="week_02.cli",
+            args=_D18_SESSION_ARGS,
+            stdin_lines=["Дай сводку активности репозитория.", "/exit"],
+            timeout=120,
+            line_pause=_DEMO_D18_LINE_PAUSE,
+        ),
+        Step(
+            title="4. Та же сводка после паузы: тиков стало больше, /mcp off",
+            module="week_02.cli",
+            args=_D18_SESSION_ARGS,
+            stdin_lines=["Дай сводку активности репозитория.", "/mcp off", "/exit"],
+            timeout=120,
+            line_pause=_DEMO_D18_LINE_PAUSE,
+        ),
+    ]
+
+
+def _warn_if_scheduler_idle(week: int, day: int, *, now: float | None = None) -> None:
+    """Day 18 preflight: warn (never abort) when the daemon does not look alive."""
+    if (week, day) != (4, 18):
+        return
+    hint = "запусти в другом терминале: adventmcp scheduler run --interval 15"
+    if not _SCHEDULER_STATE.exists():
+        console.warn(f"планировщик не запущен: нет {_SCHEDULER_STATE.name}; {hint}")
+        return
+    latest: float | None = None
+    with suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
+        raw = json.loads(_SCHEDULER_STATE.read_text(encoding="utf-8"))
+        runs = raw.get("runs") or []
+        stamp = runs[-1]["ts"] if runs else (raw.get("job") or {}).get("last_run_at")
+        if stamp:
+            latest = datetime.fromisoformat(stamp).timestamp()
+    if latest is None:
+        console.warn(f"в {_SCHEDULER_STATE.name} нет ни одного тика; {hint}")
+        return
+    age = (time.time() if now is None else now) - latest
+    if age > 2 * _D18_INTERVAL:
+        console.warn(f"последний тик планировщика {int(age)} с назад: демон не запущен? {hint}")
 
 
 def _demo_steps_w03d15(*, session: str = "w03d15-live") -> list[Step]:
@@ -1904,6 +1988,7 @@ def record(
     # Keep the existing target and its monkeypatch/test contract untouched for
     # every offline day.  A live Day 11 take is always a separate deliverable.
     target = _target_path(week, day, live=True) if live else _target_path(week, day)
+    _warn_if_scheduler_idle(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")
