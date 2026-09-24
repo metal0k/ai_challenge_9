@@ -946,3 +946,27 @@ line and inside every ISO timestamp. Assert the full labelled substring
 `path=JOB_FILE` default binds at import, so `monkeypatch` of the constant never
 reaches it. Use `path=None` and read the module constant inside the body; unit
 tests then pass `path=` explicitly and tool-level tests patch the constant.
+
+**An `@mcp.tool`-decorated function stays a plain, directly-callable Python
+function — composing tools does not need a second MCP round-trip.** Verified
+by reading `mcp.server.MCPServer.tool`'s source: the decorator's inner
+`decorator(fn)` calls `self.add_tool(fn, ...)` to register it, then
+`return fn` — the object bound to the module-level name is untouched. Day
+19's `commit_digest` calls `summarize_text(...)` and `save_to_file(...)`
+exactly like `list_days()`/`submitted_days()` already did across the private
+vs. public split (days 16-18): the same function the MCP protocol sees, called
+directly, not a copy or a proxy.
+
+**A composed tool has an architectural reason beyond "the chat comment said
+so."** Day 19's task asked for a search → summarize → saveToFile pipeline; a
+course-chat aside ("да да тут в рамках одного mcp-tool") settled whether that
+should be three function-calling rounds or one tool call. Independently of
+that aside, `advent_core/mcp_client.py::call_tool_once` spawns a **fresh
+subprocess per tool call** — "spawn, handshake, call, close. No long-lived
+connection," literally from its own docstring (days 16/17's architecture
+decision). Three chained tool calls from the agent would mean three spawns of
+`week_04.server` (three `load_dotenv`, three handshakes) instead of one; a
+composed tool that calls the underlying functions in-process is not just the
+answer to a course-chat question, it is measurably cheaper. Any future day
+that chains several MCP tools should default to composing them server-side
+for this reason, independent of what the task text literally asks for.
