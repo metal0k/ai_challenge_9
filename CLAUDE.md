@@ -919,3 +919,30 @@ future day that sends `tools=` has to skip `reconcile()`/`calibrate()` on
 those turns (a mismatch there is not "the tokenizer table drifted", it is
 "the schema was never counted") rather than let it print a false-positive
 warning on camera.
+
+**Two processes doing read-modify-write on one file lose updates, and an
+atomic `os.replace` does not prevent it.** Day 18's scheduler daemon loaded
+the state file, ran git for up to 20 s, then saved its stale snapshot — over a
+`schedule_job` interval change another process had written in between. Atomic
+replace only guarantees no torn *read*. The daemon now reloads right before the
+save and touches only the fields it owns (`last_run_at`, `cursor_hash`, its
+own run); a test makes the tick itself call `upsert_job` mid-run and goes red
+without the reload.
+
+**A transient `OSError` on read is not a corrupt file.** `load_state` treated
+every `OSError` like bad JSON and returned an empty state; on Windows a read
+racing `os.replace` raises `PermissionError`, and `upsert_job` would then have
+saved a fresh job over the real history. Only `FileNotFoundError` means "empty",
+only parse/shape errors mean "corrupt"; anything else is retried and re-raised.
+The same loop must not die on one failed iteration: catch per iteration, report
+on stderr, keep polling.
+
+**`assert "3" in text` passes on "43".** A day-18 summary test claimed to check
+the tick count and could not go red: the digit sat inside the total-commits
+line and inside every ISO timestamp. Assert the full labelled substring
+(`"тиков в окне: 3"`), not the bare value.
+
+**Two sources of truth for a state file's path defeat test isolation.** A
+`path=JOB_FILE` default binds at import, so `monkeypatch` of the constant never
+reaches it. Use `path=None` and read the module constant inside the body; unit
+tests then pass `path=` explicitly and tool-level tests patch the constant.
