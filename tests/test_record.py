@@ -1321,6 +1321,35 @@ def test_day_18_has_no_tokens_table_and_short_numbered_titles():
     assert all(len(step.title) < 100 for step in steps)
 
 
+# --------------------------------------------------------------------------
+# Week 04, Day 19: composed MCP tool (search -> summarize -> saveToFile).
+# --------------------------------------------------------------------------
+
+
+def test_day_19_steps_pin_module_args_and_tool_count():
+    steps = record_mod.demo_steps(4, 19)
+    assert len(steps) == 3
+    assert steps[0].module == "week_04.cli"
+    assert steps[0].args == ["tools", "--timeout", "45"]
+    assert all(step.module == "week_02.cli" for step in steps[1:])
+    assert all(
+        step.args == ["--session", "w04d19-demo", "--max-tokens", "400"] for step in steps[1:]
+    )
+    assert [step.title[:2] for step in steps] == ["1.", "2.", "3."]
+
+
+def test_day_19_step3_asks_for_the_full_summary_and_toggles_mcp_off():
+    steps = record_mod.demo_steps(4, 19)
+    assert steps[1].stdin_lines == ["/new", "/mcp on", "/exit"]
+    turn3 = steps[2].stdin_lines
+    assert turn3[-2:] == ["/mcp off", "/exit"]
+    # Composed-tool day: exactly one substantive user turn, not three separate
+    # search/summarize/save requests — that is the whole point being shown.
+    assert len(turn3) == 3
+    assert "полный текст сводки" in turn3[0]
+    assert "MCP" in turn3[0]
+
+
 def _state_file(tmp_path, monkeypatch, body: str | None):
     path = tmp_path / "repo_activity.json"
     if body is not None:

@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from advent_core import tokens
+from advent_core import chat as chat_core
+from advent_core import journal, tokens
+from advent_core.config import Config, ConfigError
+from advent_core.errors import AdventError
 from week_04 import scheduler
 
 SERVER_NAME = "advent-repo"
@@ -26,6 +30,9 @@ TOOL_NAMES = (
     "git_log",
     "schedule_job",
     "repo_activity_summary",
+    "summarize_text",
+    "save_to_file",
+    "commit_digest",
 )
 SCHEDULE_MIN = scheduler.MIN_INTERVAL_SECONDS
 SCHEDULE_MAX = scheduler.MAX_INTERVAL_SECONDS
@@ -35,6 +42,23 @@ TAG_RE = re.compile(r"^w\d{2}d\d{2}$")
 DEFAULT_MODEL = "ministral-14b-latest"
 GIT_TIMEOUT = 10.0
 GIT_LOG_MAX = 20
+DIGEST_DEFAULT_N = GIT_LOG_MAX
+
+SUMMARIZE_MODEL = DEFAULT_MODEL
+SUMMARIZE_MAX_TOKENS = 300
+SUMMARIZE_SYSTEM_PROMPT = (
+    "Сделай краткую сводку текста ниже на русском языке: 3-5 предложений, "
+    "по существу, без вступлений и оценок от себя. Отвечай только текстом "
+    "сводки, без заголовков и пояснений."
+)
+
+PIPELINE_DIR = REPO_ROOT / "logs" / "pipeline"  # logs/ is fully gitignored
+# Derived once from the real PIPELINE_DIR, not restated as a literal: the
+# confirmation message must stay "logs/pipeline/..." even when tests
+# monkeypatch PIPELINE_DIR to a tmp_path outside REPO_ROOT for isolation —
+# `target.relative_to(REPO_ROOT)` would raise ValueError there (not OSError,
+# so save_to_file's except would not catch it).
+PIPELINE_REL = PIPELINE_DIR.relative_to(REPO_ROOT).as_posix()
 
 mcp = MCPServer(
     SERVER_NAME,
@@ -121,24 +145,41 @@ def count_tokens(
     return f"{total} токенов ({kind}, {model})"
 
 
-@mcp.tool(description="Последние N коммитов этого репозитория: hash, дата, автор, тема.")
-def git_log(n: int = 5) -> str:
+def _git_log_process(n: int, query: str | None = None) -> subprocess.CompletedProcess[str]:
+    """Shared git call for git_log and commit_digest — raw CompletedProcess,
+    no interpretation of returncode/empty output (the caller decides that)."""
+    cmd = ["git", "log", f"-{n}"]
+    if query:
+        # -F: literal substring, not regex — the user types "MCP", not a
+        # pattern; -i: case-insensitive, as expected of commit-message search.
+        cmd += [f"--grep={query}", "-i", "-F"]
+    cmd += ["--pretty=format:%h  %ad  %an  %s", "--date=short"]
+    return subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=GIT_TIMEOUT,
+        check=False,
+    )
+
+
+@mcp.tool(
+    description="Последние N коммитов этого репозитория; с query — только те, "
+    "чьё сообщение содержит подстроку (без учёта регистра)."
+)
+def git_log(n: int = 5, query: str | None = None) -> str:
     if not 1 <= n <= GIT_LOG_MAX:
         raise ToolError(f"n должен быть от 1 до {GIT_LOG_MAX}, получено {n}")
     try:
-        proc = subprocess.run(
-            ["git", "log", f"-{n}", "--pretty=format:%h  %ad  %an  %s", "--date=short"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=GIT_TIMEOUT,
-            check=False,
-        )
+        proc = _git_log_process(n, query)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ToolError(f"git log не выполнился: {exc}") from exc
     if proc.returncode != 0:
         raise ToolError(f"git log завершился с ошибкой: {proc.stderr.strip()}")
+    if query and not proc.stdout.strip():
+        return f"коммитов по запросу «{query}» не найдено (среди последних {n})"
     return proc.stdout
 
 
@@ -185,6 +226,102 @@ def repo_activity_summary(minutes: int | None = None) -> str:
     if state.job is None:
         raise ToolError("job repo_activity ещё не создан — сначала вызови schedule_job")
     return scheduler.summarize(state, minutes=minutes)
+
+
+@mcp.tool(
+    description="Сжать произвольный текст в краткую сводку на русском "
+    "(реальный вызов Mistral, ~300 токенов ответа)."
+)
+def summarize_text(text: str) -> str:
+    if not text.strip():
+        raise ToolError("text пустой — нечего сжимать")
+    try:
+        config = Config.resolve(
+            model=SUMMARIZE_MODEL, max_tokens=SUMMARIZE_MAX_TOKENS, stream=False
+        )
+    except ConfigError as exc:
+        raise ToolError(str(exc)) from exc
+    messages = chat_core.build_messages(text, system=SUMMARIZE_SYSTEM_PROMPT)
+    try:
+        result = chat_core.complete(config, messages)
+    except AdventError as exc:
+        raise ToolError(f"не удалось получить сводку: {exc}") from exc
+    journal.log_call(result, messages, week=4, day=19, extra={"kind": "mcp_summarize"})
+    return result.text.strip()
+
+
+def _safe_filename(filename: str) -> str:
+    name = filename.strip()
+    if not name or Path(name).name != name or ".." in name:
+        raise ToolError(f"недопустимое имя файла: {filename!r}")
+    return name
+
+
+@mcp.tool(
+    description="Сохранить текст в файл под logs/pipeline/. filename — только "
+    "имя файла (без подкаталогов и без '..')."
+)
+def save_to_file(content: str, filename: str) -> str:
+    if not content.strip():
+        raise ToolError("content пустой — нечего сохранять")
+    name = _safe_filename(filename)
+    target = PIPELINE_DIR / name
+    try:
+        PIPELINE_DIR.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise ToolError(f"не удалось сохранить файл: {exc}") from exc
+    return f"Сохранено: {PIPELINE_REL}/{name} ({len(content)} симв.)"
+
+
+def _slugify(text: str) -> str:
+    # \w is Unicode-aware for str patterns — keeps Cyrillic letters, not just
+    # ASCII, so a Russian-language query still yields a query-derived name
+    # instead of always collapsing to the "digest" fallback.
+    slug = re.sub(r"[^\w]+", "-", text.lower()).strip("-_")
+    return slug[:40] or "digest"
+
+
+@mcp.tool(
+    description="Пайплайн в один вызов: находит коммиты по запросу (git log --grep), "
+    "сжимает найденное сводкой (Mistral) и сохраняет результат в logs/pipeline/. "
+    "Если совпадений нет — Mistral и файл не задействуются."
+)
+def commit_digest(query: str, n: int = DIGEST_DEFAULT_N) -> str:
+    if not query.strip():
+        raise ToolError("query пустой")
+    if not 1 <= n <= GIT_LOG_MAX:
+        raise ToolError(f"n должен быть от 1 до {GIT_LOG_MAX}, получено {n}")
+
+    # Step 1 — search: same git call as git_log, WITHOUT going through the
+    # decorated wrapper (needs the raw CompletedProcess, not a ready-made
+    # string/"not found" text — control over the empty result stays here).
+    try:
+        proc = _git_log_process(n, query)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ToolError(f"git log не выполнился: {exc}") from exc
+    if proc.returncode != 0:
+        raise ToolError(f"git log завершился с ошибкой: {proc.stderr.strip()}")
+    commits = [line for line in proc.stdout.splitlines() if line]
+    if not commits:
+        return f"Коммитов по запросу «{query}» не найдено — Mistral и файл не задействованы."
+
+    # Step 2 — summarize: a plain Python function call (still a tool — the
+    # @mcp.tool decorator returns the function unchanged).
+    commit_block = "\n".join(commits)
+    summary = summarize_text(f"Список коммитов по запросу «{query}»:\n\n{commit_block}")
+
+    # Step 3 — saveToFile.
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"{_slugify(query)}-{stamp}.md"
+    commit_list = "\n".join(f"- {line}" for line in commits)
+    content = (
+        f"# Сводка по запросу «{query}»\n\n{summary}\n\n"
+        f"## Исходные коммиты ({len(commits)})\n\n{commit_list}\n"
+    )
+    saved = save_to_file(content, filename)
+
+    return f"{saved}\n\nСводка:\n{summary}"
 
 
 if __name__ == "__main__":

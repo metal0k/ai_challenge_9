@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+from advent_core.telemetry import CallResult
 from week_04 import scheduler, server
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,7 +34,7 @@ third
 """
 
 
-def test_tool_names_constant_has_all_six_tools():
+def test_tool_names_constant_has_all_nine_tools():
     assert server.TOOL_NAMES == (
         "list_days",
         "get_task",
@@ -40,6 +42,9 @@ def test_tool_names_constant_has_all_six_tools():
         "git_log",
         "schedule_job",
         "repo_activity_summary",
+        "summarize_text",
+        "save_to_file",
+        "commit_digest",
     )
 
 
@@ -144,6 +149,54 @@ def test_git_log_raises_on_nonzero_returncode(monkeypatch):
     monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: Failed())
     with pytest.raises(ToolError, match="fatal: not a git repository"):
         server.git_log(5)
+
+
+def test_git_log_query_none_is_the_pinned_day17_argv(monkeypatch):
+    calls = []
+
+    class Done:
+        returncode = 0
+        stdout = "x"
+        stderr = ""
+
+    monkeypatch.setattr(server.subprocess, "run", lambda cmd, **k: calls.append(cmd) or Done())
+    server.git_log(5)
+    assert calls[0] == ["git", "log", "-5", "--pretty=format:%h  %ad  %an  %s", "--date=short"]
+
+
+def test_git_log_query_filters_via_grep(monkeypatch):
+    calls = []
+
+    class Done:
+        returncode = 0
+        stdout = "abc1234  2026-09-24  Denis  fix MCP thing\n"
+        stderr = ""
+
+    monkeypatch.setattr(server.subprocess, "run", lambda cmd, **k: calls.append(cmd) or Done())
+    result = server.git_log(5, "MCP")
+    assert result == Done.stdout
+    assert calls[0] == [
+        "git",
+        "log",
+        "-5",
+        "--grep=MCP",
+        "-i",
+        "-F",
+        "--pretty=format:%h  %ad  %an  %s",
+        "--date=short",
+    ]
+
+
+def test_git_log_query_not_found_returns_message(monkeypatch):
+    class Empty:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: Empty())
+    assert server.git_log(5, "no-such-thing") == (
+        "коммитов по запросу «no-such-thing» не найдено (среди последних 5)"
+    )
 
 
 def test_server_writes_nothing_to_stdout_without_a_client():
@@ -296,3 +349,184 @@ def test_tools_turn_oserror_into_toolerror(job_file, monkeypatch):
         server.schedule_job(15)
     with pytest.raises(ToolError, match="не удалось прочитать состояние"):
         server.repo_activity_summary()
+
+
+# --- Day 19: summarize_text / save_to_file / commit_digest ------------------
+
+
+def _fake_result(text: str = "краткая сводка") -> CallResult:
+    return CallResult(text=text, model_requested=server.SUMMARIZE_MODEL)
+
+
+def test_summarize_text_rejects_empty_input():
+    with pytest.raises(ToolError, match="text пустой"):
+        server.summarize_text("   ")
+
+
+def test_summarize_text_config_error_becomes_tool_error(monkeypatch):
+    from advent_core.config import ConfigError
+
+    def boom(**kwargs):
+        raise ConfigError("нет ключа")
+
+    monkeypatch.setattr(server.Config, "resolve", boom)
+    with pytest.raises(ToolError, match="нет ключа"):
+        server.summarize_text("текст для сводки")
+
+
+def test_summarize_text_advent_error_becomes_tool_error(monkeypatch):
+    from advent_core.errors import AdventError
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+
+    def boom(*a, **k):
+        raise AdventError("сеть недоступна")
+
+    monkeypatch.setattr(server.chat_core, "complete", boom)
+    monkeypatch.setattr(server.journal, "log_call", lambda *a, **k: None)
+    with pytest.raises(ToolError, match="не удалось получить сводку: сеть недоступна"):
+        server.summarize_text("текст для сводки")
+
+
+def test_summarize_text_happy_path_calls_chat_and_journal(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setattr(
+        server.chat_core, "complete", lambda *a, **k: _fake_result("  готовая сводка  ")
+    )
+    logged = []
+    monkeypatch.setattr(server.journal, "log_call", lambda *a, **k: logged.append(k))
+    assert server.summarize_text("длинный текст") == "готовая сводка"
+    assert logged[0]["week"] == 4
+    assert logged[0]["day"] == 19
+    assert logged[0]["extra"] == {"kind": "mcp_summarize"}
+
+
+@pytest.mark.parametrize("bad", ["../x", "a/b", ""])
+def test_save_to_file_rejects_unsafe_filenames(tmp_path, monkeypatch, bad):
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+    with pytest.raises(ToolError, match="недопустимое имя файла"):
+        server.save_to_file("content", bad)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="backslash is only a path separator on Windows")
+def test_save_to_file_rejects_backslash_on_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+    with pytest.raises(ToolError, match="недопустимое имя файла"):
+        server.save_to_file("content", "a\\b")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_to_file_rejects_empty_content(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+    with pytest.raises(ToolError, match="content пустой"):
+        server.save_to_file("   ", "note.md")
+
+
+def test_save_to_file_accepts_plain_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+    result = server.save_to_file("hello", "note.md")
+    assert result == "Сохранено: logs/pipeline/note.md (5 симв.)"
+    assert (tmp_path / "note.md").read_text(encoding="utf-8") == "hello"
+
+
+def test_commit_digest_rejects_empty_query(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+    with pytest.raises(ToolError, match="query пустой"):
+        server.commit_digest("   ")
+
+
+def test_commit_digest_short_circuits_on_no_matches(tmp_path, monkeypatch):
+    class Empty:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: Empty())
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+
+    def must_not_be_called(*a, **k):
+        raise AssertionError("summarize_text must not call chat_core.complete")
+
+    monkeypatch.setattr(server.chat_core, "complete", must_not_be_called)
+
+    def save_must_not_be_called(*a, **k):
+        raise AssertionError("save_to_file must not be called")
+
+    monkeypatch.setattr(server, "save_to_file", save_must_not_be_called)
+
+    result = server.commit_digest("no-such-query")
+    assert result == (
+        "Коммитов по запросу «no-such-query» не найдено — Mistral и файл не задействованы."
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_commit_digest_happy_path_writes_file_and_returns_summary(tmp_path, monkeypatch):
+    class Done:
+        returncode = 0
+        stdout = "abc1234  2026-09-24  Denis  fix MCP thing\n"
+        stderr = ""
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: Done())
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+
+    sent_messages = []
+
+    def fake_complete(config, messages, *a, **k):
+        sent_messages.append(messages)
+        return _fake_result("итоговая сводка")
+
+    monkeypatch.setattr(server.chat_core, "complete", fake_complete)
+    monkeypatch.setattr(server.journal, "log_call", lambda *a, **k: None)
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+
+    result = server.commit_digest("MCP", n=5)
+    assert result.startswith("Сохранено: logs/pipeline/mcp-")
+    assert "Сводка:\nитоговая сводка" in result
+
+    # Data-handoff check (the day's own headline claim): the commit found in
+    # step 1 must be what actually reached summarize_text/chat_core.complete
+    # in step 2, not just what step 3 independently re-derives from `commits`.
+    assert len(sent_messages) == 1
+    sent_text = " ".join(m["content"] for m in sent_messages[0])
+    assert "abc1234  2026-09-24  Denis  fix MCP thing" in sent_text
+    assert "MCP" in sent_text
+
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    content = files[0].read_text(encoding="utf-8")
+    assert "итоговая сводка" in content
+    assert "abc1234  2026-09-24  Denis  fix MCP thing" in content
+
+
+def test_commit_digest_survives_missing_git(tmp_path, monkeypatch):
+    def no_git(*a, **k):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(server.subprocess, "run", no_git)
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+    with pytest.raises(ToolError, match="git log не выполнился"):
+        server.commit_digest("MCP")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_commit_digest_raises_on_nonzero_returncode(tmp_path, monkeypatch):
+    class Failed:
+        returncode = 128
+        stdout = ""
+        stderr = "fatal: not a git repository\n"
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: Failed())
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+    with pytest.raises(ToolError, match="fatal: not a git repository"):
+        server.commit_digest("MCP")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("bad_n", [0, 21])
+def test_commit_digest_rejects_out_of_range_n(tmp_path, monkeypatch, bad_n):
+    monkeypatch.setattr(server, "PIPELINE_DIR", tmp_path)
+    with pytest.raises(ToolError, match=f"n должен быть от 1 до 20, получено {bad_n}"):
+        server.commit_digest("MCP", n=bad_n)
+    assert list(tmp_path.iterdir()) == []

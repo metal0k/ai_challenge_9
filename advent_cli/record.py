@@ -164,6 +164,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 4 and day == 19:
+        return _demo_steps_w04d19()
     if week == 4 and day == 18:
         return _demo_steps_w04d18()
     if week == 4 and day == 17:
@@ -1702,6 +1704,63 @@ def _demo_steps_w04d18() -> list[Step]:
             stdin_lines=["Дай сводку активности репозитория.", "/mcp off", "/exit"],
             timeout=120,
             line_pause=_DEMO_D18_LINE_PAUSE,
+        ),
+    ]
+
+
+_DEMO_D19_LINE_PAUSE = 8.0
+_DEMO_D19_SESSION_ARGS = ["--session", "w04d19-demo", "--max-tokens", "400"]
+
+
+def _demo_steps_w04d19() -> list[Step]:
+    """Day 19 — composed MCP tool: search → summarize → saveToFile in one call.
+
+    Step 1 reuses day 16's own machinery to show all nine tools (git_log's
+    new `query` param plus summarize_text/save_to_file/commit_digest) on the
+    server side. Step 3 asks the model, in one turn, to also quote the full
+    summary text in its reply — commit_digest's own return value already
+    carries it (`"...\\n\\nСводка:\\n{summary}"`), so this is a formatting ask,
+    not new capability; without it a live rehearsal (2026-09-24) showed the
+    model paraphrasing to just "сохранено, файл такой-то", which reads as
+    "trust me" rather than showing the pipeline's actual output on camera.
+    max_tokens=400 (vs day 17/18's 300): the multi-paragraph summary plus the
+    save confirmation ran to 224 completion tokens on the same rehearsal —
+    300 risked a mid-sentence cutoff.
+    """
+    return [
+        Step(
+            title="1. Сервер: 9 инструментов — git_log(query), summarize_text, "
+            "save_to_file, commit_digest",
+            module="week_04.cli",
+            args=["tools", "--timeout", "45"],
+            timeout=90,
+            line_pause=5.0,
+        ),
+        Step(
+            title="2. Агент: /mcp on",
+            module="week_02.cli",
+            args=_DEMO_D19_SESSION_ARGS,
+            stdin_lines=["/new", "/mcp on", "/exit"],
+            timeout=90,
+            line_pause=3.0,
+        ),
+        Step(
+            title=(
+                "3. Один вызов commit_digest — поиск по git log, сводка Mistral и "
+                "сохранение в файл внутри одного tool-call, не три раунда"
+            ),
+            module="week_02.cli",
+            args=_DEMO_D19_SESSION_ARGS,
+            stdin_lines=[
+                (
+                    "Найди коммиты про MCP, сделай краткую сводку и сохрани её в файл. "
+                    "В ответе приведи полный текст сводки, не только путь к файлу."
+                ),
+                "/mcp off",
+                "/exit",
+            ],
+            timeout=180,
+            line_pause=_DEMO_D19_LINE_PAUSE,
         ),
     ]
 

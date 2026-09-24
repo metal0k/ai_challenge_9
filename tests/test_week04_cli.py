@@ -45,7 +45,7 @@ def test_default_server_lists_tools_and_verifies_them():
         "repo_activity_summary",
     ):
         assert name in proc.stdout
-    assert "✓ 6 из 6 инструментов совпадают с ожидаемыми" in proc.stdout
+    assert "✓ 9 из 9 инструментов совпадают с ожидаемыми" in proc.stdout
     assert "week: integer · обязательный" in proc.stdout
     assert "model: string · опциональный" in proc.stdout
     assert "по умолчанию ministral-14b-latest" in proc.stdout
@@ -67,7 +67,11 @@ def test_initialize_header_goes_to_stderr_not_stdout():
 def test_mismatch_prints_missing_and_extra_and_exits_1():
     proc = run_cli("tools", "--expect", "list_days,get_task,delete_all")
     assert proc.returncode == 1
-    assert "✗ совпало 2 из 3; не хватает: delete_all; лишние: count_tokens" in proc.stdout
+    assert (
+        "✗ совпало 2 из 3; не хватает: delete_all; "
+        "лишние: commit_digest, count_tokens, git_log, repo_activity_summary, "
+        "save_to_file, schedule_job, summarize_text"
+    ) in proc.stdout
 
 
 def test_foreign_server_without_expect_is_not_verified():
@@ -81,7 +85,10 @@ def test_foreign_server_without_expect_is_not_verified():
 def test_expect_applies_to_a_foreign_server_too():
     proc = run_cli("tools", "--server", own_server_arg(), "--expect", "list_days")
     assert proc.returncode == 1
-    assert "лишние: count_tokens, get_task" in proc.stdout
+    assert (
+        "лишние: commit_digest, count_tokens, get_task, git_log, "
+        "repo_activity_summary, save_to_file, schedule_job, summarize_text"
+    ) in proc.stdout
 
 
 def test_nonexistent_command_exits_8_with_readable_reason_and_no_traceback():
