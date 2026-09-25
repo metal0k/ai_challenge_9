@@ -29,8 +29,15 @@ from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from advent_core import chat as chat_core
-from advent_core import console, formats, profiles, tokens
-from advent_core.agent import Agent, AgentReply, Compaction, FactsFailure, FactsUpdate
+from advent_core import console, formats, mcp_router, profiles, tokens
+from advent_core.agent import (
+    MAX_TOOL_ROUNDS,
+    Agent,
+    AgentReply,
+    Compaction,
+    FactsFailure,
+    FactsUpdate,
+)
 from advent_core.client import (
     capabilities_of,
     chat_models,
@@ -131,6 +138,7 @@ INVARIANT_DAY = 14
 # the agent it hangs on is this week's. Ordinary turns keep WEEK/DAY.
 MCP_WEEK = 4
 MCP_DAY = 17
+MCP_ROUTER_DAY = 20
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -336,6 +344,11 @@ class AgentShell:
     mcp_server_name: str | None = None
     # The session file's wish, parsed before the agent exists at startup.
     mcp_restore: bool = False
+    # Day 20: set while the tools come from the multi-server registry. None
+    # means the day 17-19 single-server path.
+    mcp_router: mcp_router.Router | None = None
+    # User's `/mcp rounds N`; None keeps the mode's default (3, or 8 with a registry).
+    mcp_max_rounds: int | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -789,6 +802,7 @@ class AgentShell:
         exists, and attaching the tools needs it. `_restore_mcp()` does that.
         """
         self.mcp_restore = self.agent.mcp_enabled if hasattr(self, "agent") else False
+        self._apply_session_mcp_rounds(session)
         if "mcp_enabled" not in session.state:
             return
         raw = session.state["mcp_enabled"]
@@ -798,6 +812,24 @@ class AgentShell:
             self.mcp_restore = raw
         else:
             console.warn(f"в файле сессии {session.name} негодное mcp_enabled={raw!r} — игнор")
+
+    def _apply_session_mcp_rounds(self, session: Session) -> None:
+        """`mcp_max_rounds`: absent keeps what is loaded, null lifts the override, int applies.
+
+        Additive key (no SESSION_VERSION bump): older files simply lack it.
+        """
+        if "mcp_max_rounds" not in session.state:
+            return
+        raw = session.state["mcp_max_rounds"]
+        if raw is None:
+            self.mcp_max_rounds = None
+        elif isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+            self.mcp_max_rounds = raw
+        else:
+            console.warn(f"в файле сессии {session.name} негодное mcp_max_rounds={raw!r} — игнор")
+            return
+        if hasattr(self, "agent"):
+            _mcp_apply_rounds(self)
 
     def _restore_mcp(self) -> None:
         """Brings the live agent in line with the session's `mcp_enabled`.
@@ -1615,6 +1647,9 @@ def _save_state(shell: AgentShell) -> None:
     # silently overwrite the user's saved preference with False. `/mcp off`
     # clears mcp_restore first, so an explicit off still writes False.
     shell.session.state["mcp_enabled"] = shell.agent.mcp_enabled or shell.mcp_restore
+    # Day 20, additive (no SESSION_VERSION bump): the rounds override.
+    # Absent in older files; null here means "no override".
+    shell.session.state["mcp_max_rounds"] = shell.mcp_max_rounds
     shell.session.state["active_profile"] = shell.active_profile
     # Summary and its coverage boundary are conversation CONTENT, not a
     # setting: Session.clear() wipes them along with the turns
@@ -2216,6 +2251,14 @@ def _cmd_strategy(shell: AgentShell, args: list[str]) -> bool:
 # server is a local subprocess, and only its startup is worth guarding.
 MCP_TIMEOUT = 15.0
 
+# Day 20: when this file exists `/mcp on` builds the tools from the multi-server
+# registry; otherwise days 17-19 behave exactly as before.
+MCP_REGISTRY_PATH = mcp_router.DEFAULT_REGISTRY
+# A long cross-server flow needs more than day 17's 3 rounds (list -> summarize
+# -> list dir -> write -> read -> answer).
+REGISTRY_MAX_ROUNDS = 8
+MAX_ROUNDS_CEILING = 20
+
 
 def _mcp_function_tools(tools: list) -> list[dict]:
     """MCP ToolInfo -> Mistral FunctionTool.
@@ -2261,6 +2304,86 @@ def _mcp_bridge(command: list[str]) -> Callable[[str, dict], object]:
     return call
 
 
+def _mcp_apply_rounds(shell: AgentShell) -> None:
+    """Round limit in effect: the user's override, else 8 with a registry, else the default."""
+    if shell.mcp_max_rounds is not None:
+        shell.agent.max_tool_rounds = shell.mcp_max_rounds
+    elif shell.mcp_router is not None:
+        shell.agent.max_tool_rounds = REGISTRY_MAX_ROUNDS
+    else:
+        shell.agent.max_tool_rounds = MAX_TOOL_ROUNDS
+
+
+JOURNAL_ARG_LIMIT = 200
+
+
+def _mcp_short_arguments(arguments: dict) -> dict:
+    """Long string arguments (file bodies, summarized text) are capped; the length stays."""
+    out: dict = {}
+    for key, value in arguments.items():
+        if isinstance(value, str) and len(value) > JOURNAL_ARG_LIMIT:
+            value = f"{value[:JOURNAL_ARG_LIMIT]}… ({len(value)} симв.)"
+        out[key] = value
+    return out
+
+
+def _mcp_route_journal(shell: AgentShell) -> Callable[[mcp_router.RouteRecord], None]:
+    def write(record: mcp_router.RouteRecord) -> None:
+        log_call(
+            CallResult(model_requested=shell.config.model),
+            [],
+            week=MCP_WEEK,
+            day=MCP_ROUTER_DAY,
+            extra={
+                "kind": "mcp_route",
+                "round": record.round,
+                "server": record.server,
+                "tool": record.tool,
+                "exposed": record.exposed,
+                "arguments": _mcp_short_arguments(record.arguments),
+                "is_error": record.is_error,
+                "result_bytes": record.result_bytes,
+                "seconds": round(record.seconds, 3),
+            },
+        )
+
+    return write
+
+
+def _mcp_enable_registry(shell: AgentShell) -> bool:
+    """`/mcp on` over the registry: every reachable server's allowed tools, prefixed."""
+    try:
+        specs = mcp_router.load_registry(Path(MCP_REGISTRY_PATH))
+    except MCPError as error:
+        console.warn(f"инструменты не подключены: {error.message}")
+        _warn_text(error.hint)
+        return False
+    console.note(f"подключаю серверов: {len(specs)} (первый запуск npx может занять до минуты)")
+    router = mcp_router.Router(
+        specs,
+        trace=console.note,
+        journal=_mcp_route_journal(shell),
+        current_round=lambda: shell.agent.tool_round,
+    )
+    report = router.connect()
+    for warning in report.warnings:
+        console.warn(warning)
+    if not report.tools:
+        console.warn("инструменты не подключены: ни один сервер не ответил")
+        return False
+    shell.mcp_router = router
+    shell.agent.tools = report.tools
+    shell.agent.call_tool = router.call
+    shell.agent.mcp_enabled = True
+    shell.mcp_tool_names = [route.exposed for route in report.routes]
+    shell.mcp_server_name = "реестр"
+    _mcp_apply_rounds(shell)
+    for server, names in report.server_tools.items():
+        console.note(f"  {server}: {', '.join(names)}")
+    _mcp_note_enabled(shell)
+    return True
+
+
 def _mcp_note_enabled(shell: AgentShell) -> None:
     """The one "tools are on" message, so both routes into `_mcp_enable` say
     the same thing — the cached-list route used to print strictly less."""
@@ -2287,11 +2410,17 @@ def _mcp_enable(shell: AgentShell) -> bool:
     """
     from advent_core import mcp_client
 
-    if shell.agent.tools and shell.agent.call_tool:
-        # Already fetched this run — a second server spawn buys nothing.
+    partial = shell.mcp_router is not None and bool(shell.mcp_router.failed)
+    if shell.agent.tools and shell.agent.call_tool and not partial:
+        # Already fetched this run — a second server spawn buys nothing. A partial
+        # registry connect is not cached: the missing server gets another try.
         shell.agent.mcp_enabled = True
+        _mcp_apply_rounds(shell)
         _mcp_note_enabled(shell)
         return True
+
+    if Path(MCP_REGISTRY_PATH).is_file():
+        return _mcp_enable_registry(shell)
 
     # The repo's one deliberate cross-week import: the agent's REPL has to
     # know how to launch ITS OWN week_04 MCP server, and that command is
@@ -2318,6 +2447,8 @@ def _mcp_enable(shell: AgentShell) -> bool:
     shell.agent.tools = _mcp_function_tools(listing.tools)
     shell.agent.call_tool = _mcp_bridge(command)
     shell.agent.mcp_enabled = True
+    shell.mcp_router = None
+    _mcp_apply_rounds(shell)
     shell.mcp_tool_names = [tool.name for tool in listing.tools]
     shell.mcp_server_name = listing.server_name
     _mcp_note_enabled(shell)
@@ -2343,7 +2474,7 @@ def _mcp_disable(shell: AgentShell) -> None:
 @command(
     "/mcp",
     "инструменты MCP: без значения — состояние и список, on|off — переключить",
-    usage="/mcp on | off",
+    usage="/mcp on | off | rounds N",
 )
 def _cmd_mcp(shell: AgentShell, args: list[str]) -> bool:
     """Shaped like `/strategy`: no argument prints, an argument switches.
@@ -2356,10 +2487,20 @@ def _cmd_mcp(shell: AgentShell, args: list[str]) -> bool:
         state = "включены" if shell.agent.mcp_enabled else "выключены"
         known = ", ".join(shell.mcp_tool_names) if shell.mcp_tool_names else "список не забран"
         console.note(f"инструменты MCP: {state} ({known})")
-        console.note("git_log — последние N коммитов этого репозитория: hash, дата, автор, тема")
+        if shell.mcp_router is not None:
+            console.note(
+                f"сервера из реестра, лимит раундов: {shell.agent.max_tool_rounds}; "
+                "вызовы идут как сервер__инструмент"
+            )
+        else:
+            console.note(
+                "git_log — последние N коммитов этого репозитория: hash, дата, автор, тема"
+            )
         return False
 
     value = args[0].strip().lower()
+    if value == "rounds":
+        return _cmd_mcp_rounds(shell, args[1:])
     _warn_extra_args("/mcp", args[1:])
     if value == "on":
         if shell.agent.mcp_enabled:
@@ -2375,10 +2516,37 @@ def _cmd_mcp(shell: AgentShell, args: list[str]) -> bool:
             return False
         _mcp_disable(shell)
     else:
-        console.warn(f"нужно: /mcp on | off; получено {args[0]!r}")
+        console.warn(f"нужно: /mcp on | off | rounds N; получено {args[0]!r}")
         return False
 
     shell.mcp_restore = shell.agent.mcp_enabled
+    _save_state(shell)
+    return False
+
+
+def _cmd_mcp_rounds(shell: AgentShell, args: list[str]) -> bool:
+    """`/mcp rounds` shows the limit; `/mcp rounds N|default` sets or lifts the override."""
+    if not args:
+        source = "заданный" if shell.mcp_max_rounds is not None else "по умолчанию"
+        console.note(f"лимит раундов инструментов: {shell.agent.max_tool_rounds} ({source})")
+        return False
+    _warn_extra_args("/mcp rounds", args[1:])
+    word = args[0].strip().lower()
+    if word == "default":
+        shell.mcp_max_rounds = None
+    else:
+        try:
+            number = int(word)
+        except ValueError:
+            number = 0
+        if not 1 <= number <= MAX_ROUNDS_CEILING:
+            console.warn(
+                f"нужно: /mcp rounds 1..{MAX_ROUNDS_CEILING} | default; получено {args[0]!r}"
+            )
+            return False
+        shell.mcp_max_rounds = number
+    _mcp_apply_rounds(shell)
+    console.note(f"лимит раундов инструментов: {shell.agent.max_tool_rounds}")
     _save_state(shell)
     return False
 
@@ -2447,6 +2615,34 @@ def _account_tool_rounds(shell: AgentShell, results: Sequence[CallResult]) -> No
         )
 
 
+def _print_route(shell: AgentShell, first_round_prompt: int | None = None) -> None:
+    """End-of-turn route table (registry mode): round, server, tool, status."""
+    router = shell.mcp_router
+    if router is None:
+        return
+    records = router.take_records()
+    if not records:
+        return
+    table = Table(title="Маршрут хода", title_justify="left")
+    for column in ("раунд", "сервер", "инструмент", "статус", "байт", "сек"):
+        table.add_column(column, no_wrap=True)
+    for record in records:
+        table.add_row(
+            str(record.round),
+            rich_escape(record.server),
+            rich_escape(record.tool),
+            "ошибка" if record.is_error else "ok",
+            str(record.result_bytes),
+            f"{record.seconds:.1f}",
+        )
+    console.err.print(table)
+    if first_round_prompt is not None:
+        console.note(
+            f"prompt_tokens раунда 1: {first_round_prompt} (схемы инструментов "
+            "внутри; локальный счёт их не видит)"
+        )
+
+
 def _salvage_tool_rounds(shell: AgentShell) -> None:
     """Keeps the rounds paid for before the turn crashed. Mirror of _salvage_compaction.
 
@@ -2458,6 +2654,7 @@ def _salvage_tool_rounds(shell: AgentShell) -> None:
     dedup needed here: there is no turn answer at all, so nothing is extra.
     """
     _account_tool_rounds(shell, shell.agent.take_pending_tool_rounds())
+    _print_route(shell)
 
 
 def _report_tool_use(shell: AgentShell, reply: AgentReply) -> None:
@@ -2472,7 +2669,8 @@ def _report_tool_use(shell: AgentShell, reply: AgentReply) -> None:
         shell.mcp_tool_calls += 1
         shell.mcp_tool_errors += bool(call.is_error)
         mark = " (ошибка)" if call.is_error else ""
-        console.note(f"инструмент {call.name}{mark}: {call.arguments}")
+        # The router already traced this call live; only its arguments are new.
+        console.note(f"инструмент {call.name}{mark}: {rich_escape(str(call.arguments))}")
         log_call(
             # Not a Mistral request: usage is empty by definition, and the
             # carrier exists only to give the journal row its usual shape.
@@ -2488,6 +2686,8 @@ def _report_tool_use(shell: AgentShell, reply: AgentReply) -> None:
                 "result_chars": len(call.result_text),
             },
         )
+    first = reply.tool_round_results[0] if reply.tool_round_results else reply.result
+    _print_route(shell, first.usage.prompt_tokens if reply.tool_calls else None)
 
 
 @command("/again", "повторить последний вопрос с текущими настройками, без истории")

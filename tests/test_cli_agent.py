@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import re
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -79,6 +80,8 @@ def no_network(monkeypatch):
     """Ни списка моделей по сети, ни скачивания токенизатора."""
     monkeypatch.setattr(cli, "list_models", lambda config: MODELS)
     monkeypatch.setattr(cli, "counter_for", lambda model, **kwargs: (EstimateCounter(), None))
+    # Days 17-19 tests exercise the single-server path; the day-20 registry is opt-in per test.
+    monkeypatch.setattr(cli, "MCP_REGISTRY_PATH", Path("no-such-registry.json"))
 
 
 def _config(**params) -> Config:
@@ -4327,3 +4330,196 @@ def test_after_mcp_off_an_ordinary_turn_is_reconciled_again(monkeypatch, tmp_pat
     assert shell.last_check.server == 10
     cli._dispatch("/tokens", shell)
     assert "сверка с сервером пропущена" not in _flat(capsys.readouterr().err)
+
+
+# --- Day 20: multi-server registry ------------------------------------------
+
+
+def _registry_shell(monkeypatch, tmp_path, down=()):
+    """A shell whose `/mcp on` reads a tmp registry with two fake servers."""
+    import json
+
+    from advent_core import mcp_client
+    from advent_core.errors import MCPError
+    from advent_core.mcp_client import ListResult, ToolCallOutcome, ToolInfo
+
+    registry = tmp_path / "servers.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {"name": "repo", "command": "cmd-repo"},
+                    {"name": "fs", "command": "cmd-fs", "allow": ["write_file"]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "MCP_REGISTRY_PATH", registry)
+    calls = []
+
+    def listing(command, **kwargs):
+        server = command[0].removeprefix("cmd-")
+        if server in down:
+            raise MCPError(f"{server} не отвечает")
+        names = {"repo": ["git_log"], "fs": ["write_file", "edit_file"]}[server]
+        return ListResult("s", "1", "p", None, [ToolInfo(n, "d", input_schema={}) for n in names])
+
+    def call(command, name, arguments, **kwargs):
+        calls.append((command[0].removeprefix("cmd-"), name))
+        return ToolCallOutcome(text="ок", is_error=False)
+
+    monkeypatch.setattr(mcp_client, "connect_and_list", listing)
+    monkeypatch.setattr(mcp_client, "call_tool_once", call)
+    return _shell(monkeypatch, tmp_path), calls
+
+
+def test_mcp_on_with_a_registry_attaches_prefixed_filtered_tools(monkeypatch, tmp_path):
+    shell, calls = _registry_shell(monkeypatch, tmp_path)
+    cli._dispatch("/mcp on", shell)
+    assert shell.agent.mcp_enabled is True
+    assert shell.mcp_tool_names == ["repo__git_log", "fs__write_file"]
+    assert [t["function"]["name"] for t in shell.agent.tools] == shell.mcp_tool_names
+    assert shell.agent.max_tool_rounds == cli.REGISTRY_MAX_ROUNDS
+    shell.agent.call_tool("fs__write_file", {})
+    assert calls == [("fs", "write_file")]
+    assert "mcp_tool_names" not in shell.session.state  # never read back: not persisted
+
+
+def test_registry_partial_connect_still_turns_tools_on_and_warns(monkeypatch, tmp_path, capsys):
+    shell, _ = _registry_shell(monkeypatch, tmp_path, down={"fs"})
+    cli._dispatch("/mcp on", shell)
+    assert shell.agent.mcp_enabled is True
+    assert shell.mcp_tool_names == ["repo__git_log"]
+    assert "fs недоступен" in _plain(capsys.readouterr().err)
+
+
+def test_a_partial_registry_connect_is_retried_on_the_next_mcp_on(monkeypatch, tmp_path):
+    down = {"fs"}
+    shell, _ = _registry_shell(monkeypatch, tmp_path, down=down)
+    cli._dispatch("/mcp on", shell)
+    assert shell.mcp_tool_names == ["repo__git_log"]
+    cli._dispatch("/mcp off", shell)
+    down.clear()  # the server recovered
+    cli._dispatch("/mcp on", shell)
+    assert shell.mcp_tool_names == ["repo__git_log", "fs__write_file"]
+    cli._dispatch("/mcp off", shell)
+    cli._dispatch("/mcp on", shell)  # complete now: the cached list is reused
+    assert shell.mcp_router.failed == []
+
+
+def test_route_journal_row_has_the_literal_labels_and_caps_long_arguments(monkeypatch, tmp_path):
+    rows: list[dict] = []
+    shell, _ = _registry_shell(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kwargs: rows.append(kwargs))
+    cli._dispatch("/mcp on", shell)
+    shell.agent.tool_round = 3
+    shell.agent.call_tool("fs__write_file", {"path": "a.md", "content": "x" * 500})
+    (row,) = rows
+    assert row["week"] == 4 and row["day"] == 20
+    extra = row["extra"]
+    assert extra["kind"] == "mcp_route"
+    assert (extra["server"], extra["tool"], extra["exposed"]) == (
+        "fs",
+        "write_file",
+        "fs__write_file",
+    )
+    assert extra["round"] == 3
+    assert extra["is_error"] is False
+    assert extra["arguments"]["path"] == "a.md"
+    assert extra["arguments"]["content"].endswith("(500 симв.)")
+    assert len(extra["arguments"]["content"]) < 300
+
+
+def test_registry_with_no_reachable_server_stays_off(monkeypatch, tmp_path):
+    shell, _ = _registry_shell(monkeypatch, tmp_path, down={"repo", "fs"})
+    assert cli._dispatch("/mcp on", shell) is False
+    assert shell.agent.mcp_enabled is False
+    assert shell.agent.tools is None
+
+
+def test_without_a_registry_file_mcp_on_keeps_the_single_server_path(monkeypatch, tmp_path):
+    from advent_core import mcp_client
+    from advent_core.mcp_client import ListResult, ToolInfo
+
+    monkeypatch.setattr(
+        mcp_client,
+        "connect_and_list",
+        lambda *a, **k: ListResult("srv", "1", "p", None, [ToolInfo("git_log", "d")]),
+    )
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/mcp on", shell)
+    assert shell.mcp_router is None
+    assert shell.mcp_tool_names == ["git_log"]
+    assert shell.agent.max_tool_rounds == cli.MAX_TOOL_ROUNDS
+
+
+def test_mcp_rounds_sets_persists_and_lifts_the_override(monkeypatch, tmp_path):
+    shell, _ = _registry_shell(monkeypatch, tmp_path)
+    cli._dispatch("/mcp on", shell)
+    cli._dispatch("/mcp rounds 5", shell)
+    assert shell.agent.max_tool_rounds == 5
+    assert shell.session.state["mcp_max_rounds"] == 5
+    cli._dispatch("/mcp rounds 0", shell)  # rejected, unchanged
+    cli._dispatch("/mcp rounds many", shell)
+    assert shell.agent.max_tool_rounds == 5
+    cli._dispatch("/mcp rounds default", shell)
+    assert shell.mcp_max_rounds is None
+    assert shell.agent.max_tool_rounds == cli.REGISTRY_MAX_ROUNDS
+    assert shell.session.state["mcp_max_rounds"] is None
+
+
+def test_session_key_mcp_max_rounds_has_three_cases_and_needs_no_version_bump(
+    monkeypatch, tmp_path, capsys
+):
+    from advent_core.session import SESSION_VERSION
+
+    assert SESSION_VERSION == 1  # the key was added without a bump (spec §3)
+    shell = _shell(monkeypatch, tmp_path)
+    assert (
+        "mcp_max_rounds" not in shell.session.state or shell.session.state["mcp_max_rounds"] is None
+    )
+    shell.mcp_max_rounds = 4
+    shell.session.state.pop("mcp_max_rounds", None)
+    shell._apply_session_mcp(shell.session)  # absent: keep what is loaded
+    assert shell.mcp_max_rounds == 4
+    shell.session.state["mcp_max_rounds"] = None  # null: lift
+    shell._apply_session_mcp(shell.session)
+    assert shell.mcp_max_rounds is None
+    shell.session.state["mcp_max_rounds"] = 6  # int: apply
+    shell._apply_session_mcp(shell.session)
+    assert shell.mcp_max_rounds == 6
+    assert shell.agent.max_tool_rounds == 6
+    for junk in (True, "3", 0, -1):  # anything else: warn, keep
+        shell.session.state["mcp_max_rounds"] = junk
+        shell._apply_session_mcp(shell.session)
+        assert shell.mcp_max_rounds == 6
+    assert "негодное mcp_max_rounds" in _plain(capsys.readouterr().err)
+
+
+def test_route_table_is_printed_after_a_tool_turn_from_recorded_calls(
+    monkeypatch, tmp_path, capsys
+):
+    shell, calls = _registry_shell(monkeypatch, tmp_path)
+    cli._dispatch("/mcp on", shell)
+    router = shell.mcp_router
+    for round_no, name in ((1, "repo__git_log"), (2, "fs__write_file"), (3, "fs__nope")):
+        shell.agent.tool_round = round_no  # what Agent._run_tool_loop keeps up to date
+        router.call(name, {})
+    capsys.readouterr()
+    cli._print_route(shell, 1234)
+    err = _plain(capsys.readouterr().err)
+    assert err.count("Маршрут хода") == 1
+    rows = [
+        [cell.strip() for cell in line.strip("│ ").split("│")]
+        for line in err.splitlines()
+        if line.startswith("│")
+    ][1:]  # first row is the column header
+    assert [(row[0], row[1], row[2], row[3]) for row in rows] == [
+        ("1", "repo", "git_log", "ok"),
+        ("2", "fs", "write_file", "ok"),
+        ("3", "?", "fs__nope", "ошибка"),
+    ]
+    assert "prompt_tokens раунда 1: 1234" in _flat(err)
+    assert router.take_records() == []  # the table drained them
+    assert calls == [("repo", "git_log"), ("fs", "write_file")]

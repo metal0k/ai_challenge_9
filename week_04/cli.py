@@ -13,13 +13,14 @@ import typer
 from rich.markup import escape as rich_escape
 from rich.table import Table
 
-from advent_core import console
+from advent_core import console, mcp_router
 from advent_core.errors import AdventError
 from week_04 import client as mcp_client
 from week_04 import scheduler
 from week_04.server import TOOL_NAMES
 
 DEFAULT_TIMEOUT = 15.0
+NL = chr(10)
 # A tools/list frame is kilobytes long; one screen line is what a viewer can read.
 RAW_HEAD = 800
 RAW_TAIL = 800
@@ -144,6 +145,49 @@ def tools_command(
         console.out.print(f"[green]{verdict}[/green]" if ok else f"[bold red]{verdict}[/bold red]")
         if not ok:
             raise typer.Exit(1)
+
+
+@app.command("servers")
+def servers_command(
+    registry: str | None = typer.Option(
+        None, "--registry", help="Путь к servers.json (по умолчанию week_04/servers.json)."
+    ),
+) -> None:
+    """Напечатать реестр MCP-серверов и то, что отдал каждый (после allow-списка)."""
+    from pathlib import Path
+
+    specs = mcp_router.load_registry(Path(registry) if registry else None)
+    console.note(f"подключаюсь к серверам: {len(specs)} (первый запуск npx — до минуты)")
+    report = mcp_router.Router(specs).connect()
+    for warning in report.warnings:
+        console.warn(warning)
+
+    table = Table(title="Реестр MCP-серверов", title_justify="left")
+    table.add_column("Сервер", no_wrap=True, style="bold")
+    table.add_column("Команда")
+    table.add_column("allow")
+    table.add_column("Инструменты для модели")
+    table.add_column("Отфильтровано", justify="right")
+    for spec in specs:
+        shown = subprocess.list2cmdline([Path(spec.command[0]).name, *spec.command[1:]])
+        tools = report.server_tools.get(spec.name)
+        offered = report.server_offered.get(spec.name, [])
+        table.add_row(
+            rich_escape(spec.name),
+            rich_escape(shown),
+            rich_escape(", ".join(spec.allow) if spec.allow is not None else "все"),
+            rich_escape(NL.join(f"{spec.name}__{n}" for n in tools))
+            if tools is not None
+            else "[red]недоступен[/red]",
+            str(len(offered) - len(tools)) if tools is not None else "—",
+        )
+    console.out.print(table)
+    console.out.print(
+        f"Инструментов для модели: {len(report.tools)}, серверов на связи: "
+        f"{len(report.server_tools)} из {len(specs)}"
+    )
+    if report.failed:
+        raise typer.Exit(1)
 
 
 def _tick_line(run: scheduler.Run) -> str:

@@ -458,6 +458,7 @@ class Agent:
         tools: Sequence[dict] | None = None,
         call_tool: Callable[[str, dict[str, Any]], ToolCallOutcome] | None = None,
         mcp_enabled: bool = False,
+        max_tool_rounds: int = MAX_TOOL_ROUNDS,
     ) -> None:
         self.config = config
         self._complete = complete
@@ -512,6 +513,12 @@ class Agent:
         # caller catches MCPError and returns ToolCallOutcome(is_error=True).
         self._call_tool = call_tool
         self.mcp_enabled = mcp_enabled
+        # Per-agent so registry mode (day 20) can allow a longer flow while
+        # days 17-19 keep the module default.
+        self.max_tool_rounds = max_tool_rounds
+        # 1-based round whose tool calls are running now; 0 outside the tool
+        # loop. The router reads it to label its trace lines.
+        self.tool_round = 0
         # Paid tool-loop rounds parked the moment they arrive — round 2 may
         # never happen, and a round that cost money must survive the turn
         # (day 09's rule, same shape as pending_compaction above).
@@ -907,7 +914,8 @@ class Agent:
         local_messages: list[dict[str, Any]] = list(messages)
         logs: list[ToolCallLog] = []
         result: CallResult | None = None
-        for _round in range(MAX_TOOL_ROUNDS):
+        for _round in range(self.max_tool_rounds):
+            self.tool_round = _round + 1
             result = self._complete(
                 self.config,
                 local_messages,
@@ -917,6 +925,7 @@ class Agent:
             )
             if not result.tool_calls:
                 # Final answer: the turn's one ordinary paid call, nothing parked.
+                self.tool_round = 0
                 return result, logs
             # Park BEFORE running any tool: the next round may never happen.
             self.pending_tool_rounds.append(result)
@@ -960,7 +969,11 @@ class Agent:
                         "name": call.name,
                     }
                 )
-        self._warn(f"инструмент вызывался {MAX_TOOL_ROUNDS} раза, финального ответа модель не дала")
+        self.tool_round = 0
+        self._warn(
+            f"лимит раундов инструментов ({self.max_tool_rounds}) исчерпан, "
+            "финального ответа модель не дала"
+        )
         # The last round is already parked AND becomes the reply's result —
         # the overlap is deliberate (SPEC-w04d17.md §4.4), not an oversight.
         assert result is not None  # MAX_TOOL_ROUNDS >= 1, so the loop ran

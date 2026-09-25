@@ -1,0 +1,31 @@
+{
+  "servers": [
+    {
+      "name": "repo",
+      "command": "{python}",
+      "args": ["-m", "week_04.servers_repo"],
+      "cwd": "{repo}",
+      "timeout": 30
+    },
+    {
+      "name": "pipeline",
+      "command": "{python}",
+      "args": ["-m", "week_04.servers_pipeline"],
+      "cwd": "{repo}",
+      "allow": ["summarize_text"],
+      "timeout": 60
+    },
+    {
+      "name": "fs",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem@2026.8.31",
+        "{repo}/logs/pipeline"
+      ],
+      "ensure_dirs": ["{repo}/logs/pipeline"],
+      "allow": ["list_allowed_directories", "write_file", "read_text_file", "list_directory"],
+      "timeout": 90
+    }
+  ]
+}

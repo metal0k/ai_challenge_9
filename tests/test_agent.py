@@ -2059,7 +2059,7 @@ def test_three_rounds_without_a_final_answer_warn_and_do_not_crash():
     reply = agent.ask("зациклись", [])
 
     assert len(recorder.calls) == MAX_TOOL_ROUNDS, "потолок раундов не сработал"
-    assert any("3 раза" in warning for warning in agent.warnings)
+    assert any("(3)" in warning for warning in agent.warnings)
     assert len(reply.tool_calls) == MAX_TOOL_ROUNDS
     # Последний раунд И запаркован, И стал результатом хода — перекрытие
     # зафиксировано спекой (§4.4), и вызывающий код обязан о нём знать, а не
@@ -2270,3 +2270,12 @@ def test_a_paid_tool_round_survives_a_failing_turn():
 
     assert agent.take_pending_tool_rounds() == [first]
     assert agent.take_pending_tool_rounds() == [], "раунды отдаются ровно один раз"
+
+
+def test_round_limit_other_than_three_stops_the_loop_and_names_the_limit():
+    double = _ToolDouble()
+    recorder = _ToolRecorder(*[_tool_round("{}", call_id=f"c{i}") for i in range(6)])
+    agent = _mcp_agent(recorder, double, max_tool_rounds=2)
+    agent.ask("зациклись", [])
+    assert len(double.calls) == 2
+    assert any("(2)" in warning and "исчерпан" in warning for warning in agent.warnings)

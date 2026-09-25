@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import tempfile
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import anyio
 from mcp import Client
@@ -118,6 +120,66 @@ def summarize_args(input_schema: dict[str, Any] | None) -> tuple[ToolArg, ...]:
     return tuple(args)
 
 
+STDERR_TAIL_CHARS = 300
+
+
+def _stdio(params: StdioServerParameters, quiet: bool) -> Any:
+    """`stdio_client`, with the child's stderr captured to a temp file when `quiet`.
+
+    Off by default: days 16-19 keep the SDK's own behaviour (child stderr on screen).
+    Captured rather than discarded so a failing server's last words can join the error.
+    """
+    if not quiet:
+        return stdio_client(params)
+    errlog: TextIO = tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace")  # noqa: SIM115
+    try:
+        return _ClosingStdio(stdio_client(params, errlog=errlog), errlog)
+    except BaseException:
+        errlog.close()
+        raise
+
+
+class _ClosingStdio:
+    """Async-CM wrapper that keeps the stderr tail and closes the capture file on exit."""
+
+    def __init__(self, inner: Any, errlog: TextIO) -> None:
+        self._inner = inner
+        self._errlog = errlog
+        self.tail = ""
+
+    async def __aenter__(self) -> Any:
+        return await self._inner.__aenter__()
+
+    async def __aexit__(self, *exc: Any) -> Any:
+        try:
+            return await self._inner.__aexit__(*exc)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Idempotent; also the cleanup for a transport that never got entered."""
+        if self._errlog.closed:
+            return
+        try:
+            self._errlog.flush()
+            self._errlog.seek(0)
+            text = self._errlog.read()
+            self.tail = " ".join(text.split())[-STDERR_TAIL_CHARS:]
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._errlog.close()
+
+
+def _with_stderr(error: MCPError, stdio: Any) -> MCPError:
+    """Append the child's stderr tail (quiet mode only) to the error text."""
+    if isinstance(stdio, _ClosingStdio):
+        stdio.close()
+        if stdio.tail:
+            return MCPError(f"{error.message} (stderr сервера: …{stdio.tail})", hint=error.hint)
+    return error
+
+
 def _flatten(exc: BaseException) -> Iterator[BaseException]:
     if isinstance(exc, BaseExceptionGroup):
         for sub in exc.exceptions:
@@ -190,6 +252,7 @@ async def aconnect_and_list(
     raw: bool,
     sink: Callable[[str], None],
     cwd: Path | None = None,
+    quiet: bool = False,
 ) -> ListResult:
     if not server_cmd:
         raise MCPError("команда сервера пустая", hint='Передайте --server "<команда>".')
@@ -199,9 +262,8 @@ async def aconnect_and_list(
     # The tap is always on so non-JSON output is detected; frames are mirrored
     # to the sink only with --raw.
     non_frames: list[Exception] = []
-    transport: Any = TapTransport(
-        stdio_client(params), sink if raw else (lambda line: None), non_frames.append
-    )
+    stdio = _stdio(params, quiet)
+    transport: Any = TapTransport(stdio, sink if raw else (lambda line: None), non_frames.append)
     stage = STAGE_INITIALIZE
     try:
         # One scope for the whole session: its deadline is re-armed per stage,
@@ -244,14 +306,45 @@ async def aconnect_and_list(
                     f"tools/list не закончился за {MAX_PAGES} страниц",
                     hint="Ошибка в сервере: список не должен быть бесконечным.",
                 )
-    except MCPError:
-        raise
+    except MCPError as error:
+        raise _with_stderr(error, stdio) from None
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as exc:
         if not isinstance(exc, Exception) and not isinstance(exc, BaseExceptionGroup):
             raise  # cancellation and other BaseExceptions are not ours to translate
-        raise _translate(exc, stage, timeout, server_cmd, non_frames=non_frames) from None
+        raise _with_stderr(
+            _translate(exc, stage, timeout, server_cmd, non_frames=non_frames), stdio
+        ) from None
+
+
+_LOG_LOCK = threading.Lock()
+_LOG_HOLDERS = 0
+_LOG_SAVED = logging.NOTSET
+
+
+class _quiet_sdk_logger:  # noqa: N801 - context manager used like a function
+    """Silence `mcp.client.stdio` for the duration; refcounted so threads cannot leak CRITICAL.
+
+    A per-call save/restore races when calls overlap (Router.connect runs a pool):
+    the second saver would read CRITICAL as the "previous" level.
+    """
+
+    def __enter__(self) -> None:
+        global _LOG_HOLDERS, _LOG_SAVED
+        logger = logging.getLogger("mcp.client.stdio")
+        with _LOG_LOCK:
+            if _LOG_HOLDERS == 0:
+                _LOG_SAVED = logger.level
+                logger.setLevel(logging.CRITICAL)
+            _LOG_HOLDERS += 1
+
+    def __exit__(self, *exc: Any) -> None:
+        global _LOG_HOLDERS
+        with _LOG_LOCK:
+            _LOG_HOLDERS -= 1
+            if _LOG_HOLDERS == 0:
+                logging.getLogger("mcp.client.stdio").setLevel(_LOG_SAVED)
 
 
 def connect_and_list(
@@ -261,18 +354,16 @@ def connect_and_list(
     raw: bool,
     sink: Callable[[str], None],
     cwd: Path | None = None,
+    quiet: bool = False,
 ) -> ListResult:
     # The SDK logs a rich traceback for every unparsable stdout line; we report
     # the cause ourselves (as advent_cli/obs.py does for obsws_python).
-    sdk_logger = logging.getLogger("mcp.client.stdio")
-    previous = sdk_logger.level
-    sdk_logger.setLevel(logging.CRITICAL)
-    try:
+    with _quiet_sdk_logger():
         return anyio.run(
-            lambda: aconnect_and_list(server_cmd, timeout=timeout, raw=raw, sink=sink, cwd=cwd)
+            lambda: aconnect_and_list(
+                server_cmd, timeout=timeout, raw=raw, sink=sink, cwd=cwd, quiet=quiet
+            )
         )
-    finally:
-        sdk_logger.setLevel(previous)
 
 
 def _outcome_of(result: Any) -> ToolCallOutcome:
@@ -288,6 +379,7 @@ async def acall_tool(
     *,
     timeout: float,
     cwd: Path | None = None,
+    quiet: bool = False,
 ) -> ToolCallOutcome:
     """One short-lived subprocess: spawn, handshake, call, close. No long-lived connection."""
     if not server_cmd:
@@ -296,7 +388,8 @@ async def acall_tool(
         command=server_cmd[0], args=server_cmd[1:], cwd=cwd, encoding="utf-8"
     )
     non_frames: list[Exception] = []
-    transport: Any = TapTransport(stdio_client(params), lambda line: None, non_frames.append)
+    stdio = _stdio(params, quiet)
+    transport: Any = TapTransport(stdio, lambda line: None, non_frames.append)
     stage = STAGE_INITIALIZE
     try:
         with anyio.fail_after(timeout) as scope:
@@ -305,14 +398,16 @@ async def acall_tool(
                 stage = STAGE_CALL
                 result = await client.call_tool(name, arguments)
                 return _outcome_of(result)
-    except MCPError:
-        raise
+    except MCPError as error:
+        raise _with_stderr(error, stdio) from None
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as exc:
         if not isinstance(exc, Exception) and not isinstance(exc, BaseExceptionGroup):
             raise  # cancellation and other BaseExceptions are not ours to translate
-        raise _translate(exc, stage, timeout, server_cmd, non_frames=non_frames) from None
+        raise _with_stderr(
+            _translate(exc, stage, timeout, server_cmd, non_frames=non_frames), stdio
+        ) from None
 
 
 def call_tool_once(
@@ -322,11 +417,9 @@ def call_tool_once(
     *,
     timeout: float,
     cwd: Path | None = None,
+    quiet: bool = False,
 ) -> ToolCallOutcome:
-    sdk_logger = logging.getLogger("mcp.client.stdio")
-    previous = sdk_logger.level
-    sdk_logger.setLevel(logging.CRITICAL)
-    try:
-        return anyio.run(lambda: acall_tool(server_cmd, name, arguments, timeout=timeout, cwd=cwd))
-    finally:
-        sdk_logger.setLevel(previous)
+    with _quiet_sdk_logger():
+        return anyio.run(
+            lambda: acall_tool(server_cmd, name, arguments, timeout=timeout, cwd=cwd, quiet=quiet)
+        )

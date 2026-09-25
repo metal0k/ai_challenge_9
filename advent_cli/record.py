@@ -164,6 +164,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 4 and day == 20:
+        return _demo_steps_w04d20()
     if week == 4 and day == 19:
         return _demo_steps_w04d19()
     if week == 4 and day == 18:
@@ -1765,6 +1767,79 @@ def _demo_steps_w04d19() -> list[Step]:
     ]
 
 
+_DEMO_D20_LINE_PAUSE = 10.0
+_DEMO_D20_SESSION_ARGS = ["--session", "w04d20-demo", "--max-tokens", "500"]
+# The file the demo question makes the fs server write; removed before every run
+# so the take is idempotent and the model never sees a stale copy.
+_D20_FILE = "w04d20-demo.md"
+_D20_QUESTION = (
+    "Найди в git log последние коммиты про MCP и сделай их краткую сводку с помощью "
+    "инструмента суммаризации. Затем узнай у файлового сервера, в какую директорию "
+    f"можно писать, запиши сводку в файл {_D20_FILE} в этой директории, прочитай файл "
+    "обратно и процитируй в ответе то, что в нём лежит."
+)
+
+
+def _demo_steps_w04d20() -> list[Step]:
+    """Day 20 — three MCP servers, one question, a long cross-server flow.
+
+    Step 1 shows the registry and what each server offers after its allow list.
+    Step 3 is the flow itself: the trace lines and the route table show which
+    server took each call, in which order. The question forces an explicit fs
+    write/read stage and asks to cite the file, otherwise the model may collapse
+    everything into commit_digest.
+    """
+    return [
+        Step(
+            title="1. Реестр: три MCP-сервера и их инструменты (allow-список у fs)",
+            module="week_04.cli",
+            args=["servers"],
+            timeout=240,
+            line_pause=6.0,
+        ),
+        Step(
+            title="2. Агент: /mcp on — инструменты со всех серверов, имена server__tool",
+            module="week_02.cli",
+            args=_DEMO_D20_SESSION_ARGS,
+            stdin_lines=["/new", "/mcp on", "/exit"],
+            timeout=240,
+            line_pause=4.0,
+        ),
+        Step(
+            title="3. Один вопрос — длинный флоу через repo, pipeline и fs",
+            module="week_02.cli",
+            args=_DEMO_D20_SESSION_ARGS,
+            stdin_lines=[_D20_QUESTION, "/mcp off", "/exit"],
+            timeout=360,
+            line_pause=_DEMO_D20_LINE_PAUSE,
+        ),
+    ]
+
+
+def _prepare_w04d20(week: int, day: int) -> None:
+    """Day 20 preflight: drop the previous fs-written file, warm the npx cache.
+
+    A cold `npx -y` fetch took ~22 s on the dev machine against 1.8 s warm; on
+    camera that reads as a hang, so the fetch is paid here. A failure only
+    warns: the demo then shows the partial-connect path honestly.
+    """
+    if (week, day) != (4, 20):
+        return
+    with suppress(OSError):
+        (PROJECT_ROOT / "logs" / "pipeline" / _D20_FILE).unlink(missing_ok=True)
+    from advent_core import mcp_router
+
+    console.note("прогреваю кэш npx (файловый сервер)…")
+    try:
+        specs = [s for s in mcp_router.load_registry() if s.name == "fs"]
+        report = mcp_router.Router(specs).connect()
+    except AdventError as error:
+        console.warn(f"прогрев npx не удался: {error.message}")
+        return
+    for warning in report.warnings:
+        console.warn(warning)
+
+
 def _warn_if_scheduler_idle(week: int, day: int, *, now: float | None = None) -> None:
     """Day 18 preflight: warn (never abort) when the daemon does not look alive."""
     if (week, day) != (4, 18):
@@ -2048,6 +2123,7 @@ def record(
     # every offline day.  A live Day 11 take is always a separate deliverable.
     target = _target_path(week, day, live=True) if live else _target_path(week, day)
     _warn_if_scheduler_idle(week, day)
+    _prepare_w04d20(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")
