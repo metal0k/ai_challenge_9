@@ -970,3 +970,39 @@ composed tool that calls the underlying functions in-process is not just the
 answer to a course-chat question, it is measurably cheaper. Any future day
 that chains several MCP tools should default to composing them server-side
 for this reason, independent of what the task text literally asks for.
+
+**Give the model tools that COMPETE for the same job and it will take the
+shortcut, and the orchestration you wanted to show disappears.** Day 20's first
+live run had `pipeline__commit_digest` in the tool list next to `repo__git_log`,
+`pipeline__summarize_text` and the filesystem tools: the model called the composed
+tool once and never touched `repo` or `fs`. The registry's per-server `allow` list
+is what made a multi-server flow happen (`pipeline` exposes only `summarize_text`,
+and the facade does not export `save_to_file` next to `fs__write_file`). Curating
+the tool set is part of the experiment design, not an optimisation.
+
+**The order of a multi-server flow is chosen by the model and it drifts between
+runs.** The dry-run went git_log ∥ list_allowed_directories → summarize → write →
+read; the recorded take went git_log → summarize → list_allowed_directories →
+write → read. Same question, same tools. So the demo shows the route table
+(`mcp_route` rows, per-call trace line) rather than promising an order, and tests
+assert the order from recorded calls, never from prose.
+
+**A refcount-free "save level, set CRITICAL, restore" is a race the moment two
+threads do it.** `connect_and_list` silences the `mcp.client.stdio` logger this
+way; the router runs it in a thread pool, so thread B can save CRITICAL as the
+"previous" level and restore it last, leaving the logger muted for the rest of
+the process. `_quiet_sdk_logger` in `mcp_client.py` now counts nesting under a
+lock. Same family as the day-18 lost update: shared mutable state plus
+save/restore needs a lock or a counter.
+
+**A partial connect that is cached becomes permanent.** If one registry server
+fails at the first `/mcp on` (cold npx over its timeout), the router keeps only
+the reachable tools, and the "tools already fetched" shortcut then reuses that
+partial list on every later `/mcp on` and on session restore. The router records
+`failed` and `_mcp_enable` skips the shortcut while it is non-empty.
+
+**Discarding a child's stderr to keep the camera clean also discards the only
+diagnostic.** The filesystem server prints a banner to stderr on every spawn, so
+registry servers run with `quiet=True`; the child's stderr goes to a temp file
+and its tail is appended to the `MCPError` when a call fails. Suppression without
+capture turns every failure into a bare timeout.
