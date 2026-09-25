@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -245,7 +246,9 @@ def test_once_tick_line_goes_to_stderr_and_stdout_stays_empty(tmp_path, monkeypa
     captured = capsys.readouterr()
     assert result.exit_code == 0
     assert result.stdout == "" and captured.out == ""
-    assert "тик T1: новых коммитов 1, всего 3" in result.stderr + captured.err
+    # Rich may colour the line when the env forces colour; compare the plain text
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stderr + captured.err)
+    assert "тик T1: новых коммитов 1, всего 3" in plain
 
 
 def test_interval_bounds_error_is_on_stderr_and_writes_nothing(tmp_path, monkeypatch, capsys):
