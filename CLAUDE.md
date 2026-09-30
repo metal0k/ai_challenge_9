@@ -60,6 +60,8 @@ uv run advent w01 bench --runs 10 --problem children
 uv run advent record --day 1              # record the demo through OBS
 uv run advent record --day 1 --dry-run    # run the demo without recording
 uv run advent submit --day 1              # verify tag + video, print the sheet comment
+uv run adventrag index                    # week 5: chunk + embed the repo into data/rag/index.sqlite3
+uv run adventrag compare                  # chunk stats, cost, hit@k for both strategies
 
 uv run ruff check . && uv run ruff format .
 uv run pytest
@@ -835,6 +837,22 @@ sanitised specification lives in `specs/SPEC.md`.
   adversarially verified before fixing — of 25 raw findings, 2 were refuted
   by reading the code. The cycle costs under an hour and the alternative is
   submitting the defect on video.
+- **Every review — of any plan, spec or code — is delegated to Codex, not run
+  by Claude.** Set 2026-09-28. That covers the spec-review before
+  implementation, the review of any implementation or workflow plan, and the
+  post-implementation code-review pass described above. The point of a review
+  step is a second, differently-trained set of eyes on the work — a Claude
+  subagent reviewing a Claude plan or implementation is closer to grading its
+  own homework. Claude still drives the interview and the adversarial-verify/
+  fix step on top of what Codex finds. Codex CLI lives in this environment
+  already (`codex-cli`, see `AGENTS.md`); if a review call fails on auth, run
+  `codex login` first.
+- **All coding is delegated to a `sonnet` subagent (`worker-sonnet`), whatever
+  its size.** Set 2026-09-28. This overrides the global "inline under ~20
+  lines" tier for this project: the main session plans, briefs, verifies and
+  talks to the user, and does not write product or test code itself. Larger
+  changes still go through `Workflow`, with every coding agent on `sonnet`.
+  Docs and specs (`CLAUDE.md`, `specs/`, reports) stay with the main session.
 - `specs/SPEC.md` is the agreed specification; `specs/TODO.md` is the live queue.
   Keep both current — the queue must survive a session restart.
 - **Every finished day gets a short report in `specs/reports/wNNdDD.md`**, written
@@ -1006,3 +1024,70 @@ diagnostic.** The filesystem server prints a banner to stderr on every spawn, so
 registry servers run with `quiet=True`; the child's stderr goes to a temp file
 and its tail is appended to the `MCPError` when a call fails. Suppression without
 capture turns every failure into a bare timeout.
+
+**Week 5 (RAG) has its own entry point, `adventrag`, and its index is built to
+be read by a later MCP tool.** Day 21 ships only the CLI (`index`, `compare`,
+`search`, `show`), but search, stats and eval live as plain functions in
+`week_05/index.py` rather than inside typer commands: when a task asks to wire
+RAG into `adventagent`, a `week_05/server.py` reads the same SQLite file and is
+registered in `week_04/servers.json` like `repo` and `pipeline`.
+
+**An index built from the working tree indexes what is not published.** The
+corpus is the tracked `*.md` plus `advent_core/*.py`, and both the file list and
+the contents come from a commit — `git ls-tree -r <sha>` and
+`git show <sha>:<path>`. Two ways this went wrong before it was right: reading
+files from disk would have put an uncommitted `CLAUDE.md` edit into the index
+and onto the video, and the first implementation took the *list* from
+`git ls-files` (the current index) while taking the *content* from `--rev`, so
+an older revision was indexed with today's file set. The commit SHA is stored
+per strategy, and `compare` refuses to compare strategies built from different
+snapshots or models — equal vector dimensions do not prove the same model.
+
+**`mistral-embed` limits, measured 2026-09-28.** 1024 dimensions; 8192 tokens
+per input (400 `Input id N has X tokens, exceeding max 8192 tokens`); per batch
+47,744 tokens pass and 71,616 fail with 400 `Too many tokens overall, split into
+more batches.`; 60 requests per minute; $0.1 per 1M tokens (model page in the
+docs). Embedding models report empty `capabilities` in `/v1/models`. The exact
+batch ceiling is unknown, so `advent_core/embeddings.py` batches by a
+conservative character budget and halves a batch on that 400 instead of trusting
+a constant. The per-input 400 is *not* healed there: re-cutting a chunk inside
+the embedding layer would break the one-to-one chunk-to-vector mapping, so every
+chunk of every strategy is capped at 4000 characters before it is sent.
+
+**An embedding response has to be validated before it becomes an index.** The
+first implementation copied `data[i]` into a dict by `index` and built the
+matrix from whatever arrived, so a missing item became a silent zero vector in
+the saved index. The checks that are there now: exactly `0..n-1` once each (all
+`index=None` means positional, a mix is an error), one dimension across all
+batches, and finiteness checked **after** the cast to float32 — `1e40` is finite
+as a Python float and `Inf` as float32, and normalising it writes `NaN`.
+
+**Structure-aware chunking cuts cleaner; it did not retrieve better.** On the
+tagged snapshot (52 files, 527k characters): fixed 1000/150 gives 640 chunks
+with 90% of them cut mid-sentence or mid-block, structure gives 469 chunks with
+18%, for 14% fewer tokens. Retrieval on six fixed questions: hit@5 67% for
+both, MRR@5 0.333 against 0.347 — one hit of difference. The defensible claim
+is "structure keeps chunks whole", not "structure finds more". Its costs are
+visible in the same table: 14% of chunks under 200 characters (a heading with no
+body) and a p90 of 3749, because one H2 without subheadings ("Things that will
+bite you") falls apart into ten 4000-character parts.
+
+**A retrieval metric must score both strategies by the same rule, and "same
+section" is not that rule.** Scoring a hit by section name would favour the
+strategy whose chunks *are* sections; scoring by line range counted a fixed
+chunk that overlapped the line but lacked the answer. The shipped rule is
+strategy-neutral: same source and the anchor substring fully inside the chunk
+text, with every anchor shorter than the fixed overlap (150) so some fixed chunk
+can always contain it whole. Questions and anchors were frozen before the first
+run; an anchor missing from the snapshot drops the whole question as a dataset
+error instead of counting as a miss.
+
+**Terminal width is measured in cells, not characters, and only a dry-run at 80
+columns shows it.** Three defects of this kind passed the tests, which rendered
+at width 200 and searched for substrings: a nine-column table truncated to
+ellipses, a search table whose text column wrapped to ten lines per hit (about a
+hundred lines for two searches), and a snippet cut by `len()` that wrapped
+because an emoji occupies two cells — `rich.cells.cell_len` is the measure. The
+tests now render at width 80 and assert concrete cells and the absence of `…`.
+Related: a path printed on success was made repo-relative while the same path in
+the *error* message stayed absolute until a second review caught it.
