@@ -1513,3 +1513,55 @@ def test_week_05_positive_step_passes_check_only_on_zero():
     record_mod._check(ok, 0)
     with pytest.raises(record_mod.AdventError):
         record_mod._check(ok, 1)
+
+
+# --------------------------------------------------------------------------
+# Week 05, Day 22: first RAG request — ask both ways, /rag in the agent, eval.
+# --------------------------------------------------------------------------
+def test_day_22_steps_pin_modules_and_args():
+    steps = record_mod.demo_steps(5, 22)
+    assert len(steps) == 3
+    assert [s.module for s in steps] == ["week_05.cli", "week_02.cli", "week_05.cli"]
+    assert steps[0].args == [
+        "ask",
+        "Какое максимальное значение temperature принимает Mistral API?",
+    ]
+    assert steps[1].args == ["--session", "w05d22-demo", "--max-tokens", "400"]
+    assert steps[2].args == ["eval"]
+
+
+def test_day_22_agent_step_asks_the_same_question_before_and_after_rag_on():
+    lines = record_mod.demo_steps(5, 22)[1].stdin_lines
+    assert lines == [
+        "/new",
+        "Какое максимальное значение temperature принимает Mistral API?",
+        "/rag on",
+        "/new",
+        "Какое максимальное значение temperature принимает Mistral API?",
+        "/rag",
+        "/exit",
+    ]
+    assert lines.index("/rag on") == 2
+    assert lines[-1] == "/exit"
+
+
+def test_day_22_last_step_is_eval_for_the_closing_headline():
+    assert record_mod.demo_steps(5, 22)[-1].args == ["eval"]
+
+
+def test_day_22_titles_are_short_and_numbered():
+    steps = record_mod.demo_steps(5, 22)
+    assert [s.title[:2] for s in steps] == ["1.", "2.", "3."]
+    assert all(len(s.title) < 100 for s in steps)
+
+
+def test_day_22_is_not_day_21():
+    assert record_mod.demo_steps(5, 22)[0].args[0] == "ask"
+    assert record_mod.demo_steps(5, 21)[0].args[0] == "index"
+
+
+def test_day_22_rehearsal_is_the_week_default():
+    steps = record_mod.rehearsal_steps(5, 22)
+    assert len(steps) == 1
+    assert steps[0].module == "week_05.cli"
+    assert steps[0].expect_failure is True

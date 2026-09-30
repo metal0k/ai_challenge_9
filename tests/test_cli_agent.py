@@ -15,6 +15,7 @@ import inspect
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,7 @@ from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError
 from advent_core.memory import MemoryStore, StructuredMemory
 from advent_core.params import AGENT_COMMAND, defaults_for
+from advent_core.rag import RagContext, RagHit
 from advent_core.session import Session
 from advent_core.task_state import TaskState, task_messages
 from advent_core.telemetry import CallResult, Usage
@@ -1121,6 +1123,10 @@ def test_defaults_come_from_the_registry_not_from_the_typer_signature():
         "working_max_tokens": 400,
         "long_term_max_tokens": 300,
         "memory_max_tokens": 1200,
+        # Day 22: RAG is opt-in for the agent.
+        "rag": False,
+        "rag_strategy": "structure",
+        "rag_k": 5,
     }
 
     signature = inspect.signature(cli.agent)
@@ -4523,3 +4529,250 @@ def test_route_table_is_printed_after_a_tool_turn_from_recorded_calls(
     assert "prompt_tokens раунда 1: 1234" in _flat(err)
     assert router.take_records() == []  # the table drained them
     assert calls == [("repo", "git_log"), ("fs", "write_file")]
+
+
+# --- Day 22: RAG in the REPL ------------------------------------------------
+
+_INFO = SimpleNamespace(corpus_rev="0123456789abcdef", n_chunks=469, model="mistral-embed")
+
+
+def _hit(source, text="chunk text", n=1):
+    return RagHit(chunk_id=f"{source}#{n}", source=source, section="s", score=0.9, text=text)
+
+
+def _ctx(hits, *, embed_tokens=12, dropped=0, strategy="structure"):
+    return RagContext(
+        hits=tuple(hits),
+        strategy=strategy,
+        k=5,
+        embed_model="mistral-embed",
+        embed_tokens=embed_tokens,
+        corpus_rev="0123456789abcdef",
+        dropped=dropped,
+    )
+
+
+@pytest.fixture(autouse=True)
+def rag_index(monkeypatch):
+    """Never touch the real index: check_index is recorded, the retriever is empty."""
+    calls: list[str] = []
+
+    def check(strategy):
+        calls.append(strategy)
+        return _INFO
+
+    monkeypatch.setattr(cli, "_rag_check_index", check)
+    monkeypatch.setattr(cli, "_rag_retriever", lambda: lambda q, strategy, k: _ctx([]))
+    return calls
+
+
+def _index_missing(monkeypatch):
+    def check(strategy):
+        raise AdventError("индекса нет", hint="advent rag index")
+
+    monkeypatch.setattr(cli, "_rag_check_index", check)
+
+
+def _saved(tmp_path, name="default"):
+    return Session.load(name, directory=tmp_path).state
+
+
+def test_rag_command_reports_off_then_the_index(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/rag", shell)
+    assert _flat(capsys.readouterr().err).strip() == "rag: off"
+
+    cli._dispatch("/rag on", shell)
+    capsys.readouterr()
+    cli._dispatch("/rag", shell)
+    assert (
+        _flat(capsys.readouterr().err).strip()
+        == "rag: on · structure · k=5 · индекс 0123456789ab (469 чанков)"
+    )
+
+
+@pytest.mark.parametrize("line", ["/rag on", "/set rag on"])
+def test_both_spellings_check_the_index_and_enable(monkeypatch, tmp_path, rag_index, line):
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch(line, shell)
+
+    assert rag_index == ["structure"]
+    assert shell.agent.rag_enabled is True
+
+
+@pytest.mark.parametrize("line", ["/rag on", "/set rag on"])
+def test_missing_index_keeps_rag_off_and_says_why(monkeypatch, tmp_path, capsys, line):
+    shell = _shell(monkeypatch, tmp_path)
+    _index_missing(monkeypatch)
+    capsys.readouterr()
+
+    cli._dispatch(line, shell)
+
+    stderr = _flat(capsys.readouterr().err)
+    assert stderr.count("rag не включён: индекса нет advent rag index") == 1
+    assert "rag = " not in stderr
+    assert shell.agent.rag_enabled is False
+
+
+def test_rag_command_says_when_the_index_vanished(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag on", shell)
+    _index_missing(monkeypatch)
+    capsys.readouterr()
+
+    cli._dispatch("/rag", shell)
+
+    assert _flat(capsys.readouterr().err).strip() == "rag: on · индекс недоступен (индекса нет)"
+
+
+def test_changing_rag_strategy_while_on_rechecks_and_keeps_the_old_one_on_failure(
+    monkeypatch, tmp_path, capsys, rag_index
+):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag on", shell)
+    _index_missing(monkeypatch)
+    capsys.readouterr()
+
+    cli._dispatch("/set rag_strategy fixed", shell)
+
+    assert shell.agent.rag_strategy == "structure"
+    assert _flat(capsys.readouterr().err).count("rag_strategy не изменён") == 1
+    monkeypatch.setattr(cli, "_rag_check_index", lambda s: rag_index.append(s) or _INFO)
+    cli._dispatch("/set rag_strategy fixed", shell)
+    assert shell.agent.rag_strategy == "fixed"
+    assert rag_index == ["structure", "fixed"]
+
+
+def test_rag_settings_round_trip_through_the_session_file(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag on", shell)
+    cli._dispatch("/set rag_k 3", shell)
+    cli._dispatch("/set rag_strategy fixed", shell)
+    state = _saved(tmp_path)
+    assert (state["rag"], state["rag_strategy"], state["rag_k"]) == (True, "fixed", 3)
+
+    second = _shell(monkeypatch, tmp_path)
+
+    assert second.agent.rag_enabled is True
+    assert second.agent.rag_strategy == "fixed"
+    assert second.agent.rag_k == 3
+
+
+def test_rag_off_is_written_as_an_explicit_false(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag on", shell)
+    cli._dispatch("/rag off", shell)
+
+    assert _saved(tmp_path)["rag"] is False
+
+
+def _session_with(tmp_path, name, state):
+    session = Session.new(name, directory=tmp_path)
+    session.state = state
+    session.save()
+
+
+def _rag_values(shell):
+    return (shell.agent.rag_enabled, shell.agent.rag_strategy, shell.agent.rag_k)
+
+
+def test_older_session_file_without_rag_keys_gives_defaults(monkeypatch, tmp_path):
+    _session_with(tmp_path, "default", {"mode": "chat"})
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert _rag_values(shell) == (False, "structure", 5)
+
+
+def test_absent_keys_keep_the_loaded_values_on_a_session_switch(monkeypatch, tmp_path):
+    _session_with(tmp_path, "work", {"mode": "chat"})
+    shell = _shell(monkeypatch, tmp_path, rag=True, rag_k=3, rag_strategy="fixed")
+
+    cli._dispatch("/set session work", shell)
+
+    assert _rag_values(shell) == (True, "fixed", 3)
+
+
+def test_null_keys_reset_to_defaults_on_a_session_switch(monkeypatch, tmp_path):
+    """Explicit null in the target file lifts what the previous session had set."""
+    _session_with(tmp_path, "work", {"rag": None, "rag_strategy": None, "rag_k": None})
+    shell = _shell(monkeypatch, tmp_path, rag=True, rag_k=3, rag_strategy="fixed")
+
+    cli._dispatch("/set session work", shell)
+
+    assert _rag_values(shell) == (False, "structure", 5)
+
+
+@pytest.mark.parametrize(("key", "bad"), [("rag", "yes"), ("rag_k", True), ("rag_strategy", 5)])
+def test_garbage_rag_keys_warn_and_leave_the_value(monkeypatch, tmp_path, capsys, key, bad):
+    _session_with(tmp_path, "default", {key: bad})
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert _flat(capsys.readouterr().err).count(f"негодное {key}={bad!r}") == 1
+    assert _rag_values(shell) == (False, "structure", 5)
+
+
+def test_restored_rag_on_without_an_index_turns_off_with_a_warning(monkeypatch, tmp_path, capsys):
+    _session_with(tmp_path, "default", {"rag": True})
+    _index_missing(monkeypatch)
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.rag_enabled is False
+    assert _flat(capsys.readouterr().err).count("rag не включён: индекса нет advent rag index") == 1
+
+
+def test_rag_settings_survive_new(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag on", shell)
+    cli._dispatch("/set rag_k 7", shell)
+
+    cli._dispatch("/new", shell)
+
+    assert (shell.agent.rag_enabled, shell.agent.rag_k) == (True, 7)
+    state = _saved(tmp_path)
+    assert (state["rag"], state["rag_k"]) == (True, 7)
+
+
+def test_rag_note_two_sources():
+    hits = [_hit("CLAUDE.md", n=i) for i in range(3)] + [
+        _hit("week_02/README.md", n=i) for i in range(2)
+    ]
+    assert cli._rag_note(_ctx(hits)) == (
+        "rag: 5 чанков (structure) · CLAUDE.md ×3, week_02/README.md ×2 · embed 12 ток."
+    )
+
+
+def test_rag_note_one_hit_unknown_embed():
+    assert cli._rag_note(_ctx([_hit("a.md")], embed_tokens=None)) == (
+        "rag: 1 чанк (structure) · a.md · embed — ток."
+    )
+
+
+def test_rag_note_zero_hits():
+    assert cli._rag_note(_ctx([], strategy="fixed")) == "rag: чанков не найдено (fixed)"
+
+
+def test_rag_note_names_dropped_hits():
+    line = cli._rag_note(_ctx([_hit("a.md"), _hit("b.md")], dropped=2))
+    assert line == "rag: 2 чанка (structure) · a.md, b.md · embed 12 ток. · не вошло: 2"
+
+
+def test_a_rag_turn_prints_one_note_and_sends_the_chunk(monkeypatch, tmp_path, capsys):
+    seen: list = []
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(seen=seen))
+    cli._dispatch("/rag on", shell)
+    shell.agent.retrieve = lambda q, strategy, k: _ctx(
+        [_hit("CLAUDE.md", text="УНИКАЛЬНЫЙ ЧАНК 4242")]
+    )
+    capsys.readouterr()
+
+    cli._turn(shell, "что там?")
+
+    stderr = _flat(capsys.readouterr().err)
+    assert stderr.count("rag: 1 чанк (structure) · CLAUDE.md · embed 12 ток.") == 1
+    assert "УНИКАЛЬНЫЙ ЧАНК 4242" in seen[0][-1]["content"]

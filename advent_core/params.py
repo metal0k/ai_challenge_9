@@ -29,6 +29,11 @@ STRATEGY_CHOICES = (*STRATEGIES, "all")
 # implies "facts + last N"), so this is a choice, not a set of flags.
 CONTEXT_STRATEGY_CHOICES = ("window", "facts", "branch", "summary", "memory")
 
+# Week 05 day 22: RAG chunking strategies of the index and the default top-k.
+RAG_STRATEGY_CHOICES = ("fixed", "structure")
+DEFAULT_RAG_STRATEGY = "structure"
+DEFAULT_RAG_K = 5
+
 # Команды CLI, у которых есть собственные значения по умолчанию (Spec.defaults).
 CHAT_COMMAND = "chat"
 SOLVE_COMMAND = "solve"
@@ -73,6 +78,10 @@ AGENT_PARAMS: tuple[str, ...] = (
     "working_max_tokens",
     "long_term_max_tokens",
     "memory_max_tokens",
+    # RAG (day 22): the agent retrieves chunks before the turn.
+    "rag",
+    "rag_strategy",
+    "rag_k",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -272,6 +281,31 @@ SPECS: tuple[Spec, ...] = (
         None,
         local=True,
         defaults={AGENT_COMMAND: 1200},
+    ),
+    # Day 22: RAG. Local — the retriever is the agent's, the server never sees these.
+    Spec(
+        "rag",
+        "bool",
+        "RAG: перед ходом искать чанки в индексе и прикладывать к вопросу.",
+        local=True,
+        defaults={AGENT_COMMAND: False},
+    ),
+    Spec(
+        "rag_strategy",
+        "choice",
+        "Стратегия чанкинга индекса для RAG: fixed / structure.",
+        choices=RAG_STRATEGY_CHOICES,
+        local=True,
+        defaults={AGENT_COMMAND: DEFAULT_RAG_STRATEGY},
+    ),
+    Spec(
+        "rag_k",
+        "int",
+        "Сколько чанков RAG прикладывать к вопросу.",
+        1,
+        20,
+        local=True,
+        defaults={AGENT_COMMAND: DEFAULT_RAG_K},
     ),
     Spec(
         "session",
@@ -486,6 +520,12 @@ class GenerationParams:
     done: str | None = None
     mode: str | None = None
     max_turns: int | None = 10
+
+    # Day 22 RAG params: local, the agent reads them before building the request.
+    # None means "command default" (apply_defaults fills it in).
+    rag: bool | None = None
+    rag_strategy: str | None = None
+    rag_k: int | None = None
 
     # Override лимита окна (день 08, SPEC-w02d08.md §4). None — «из карточки
     # модели»: у агента свой контракт на None, чем у max_turns выше — там

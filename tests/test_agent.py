@@ -2279,3 +2279,193 @@ def test_round_limit_other_than_three_stops_the_loop_and_names_the_limit():
     agent.ask("зациклись", [])
     assert len(double.calls) == 2
     assert any("(2)" in warning and "исчерпан" in warning for warning in agent.warnings)
+
+
+# --- Day 22: RAG wiring ------------------------------------------------------
+
+from advent_core.params import CONTEXT_STRATEGY_CHOICES  # noqa: E402
+from advent_core.rag import RagContext, RagHit  # noqa: E402
+
+CHUNK_TEXT = "Фрагмент индекса: порог compaction равен 4242."
+
+
+def _rag_ctx(strategy: str = "structure", k: int = 5) -> RagContext:
+    hit = RagHit("c1", "CLAUDE.md", "Раздел", 0.9, CHUNK_TEXT)
+    return RagContext((hit,), strategy, k, "mistral-embed", 7, "abc123")
+
+
+class _Retriever:
+    def __init__(self, log: list | None = None) -> None:
+        self.calls: list[tuple[str, str, int]] = []
+        self.log = log
+
+    def __call__(self, question: str, strategy: str, k: int) -> RagContext:
+        self.calls.append((question, strategy, k))
+        if self.log is not None:
+            self.log.append("retrieve")
+        return _rag_ctx(strategy, k)
+
+
+def _rag_agent(retriever=None, **params):
+    recorder = _Recorder(CallResult(text="ответ", model_requested="m"))
+    params.setdefault("rag", True)
+    agent = build_agent(recorder, make_config(**params), retrieve=retriever)
+    return agent, recorder
+
+
+def test_rag_augments_the_request_but_history_stays_raw():
+    retriever = _Retriever()
+    agent, recorder = _rag_agent(retriever)
+
+    reply = agent.ask("какой порог?", [])
+
+    last = recorder.calls[-1][-1]
+    assert last["role"] == "user"
+    assert CHUNK_TEXT in last["content"]
+    assert last["content"].endswith("Вопрос: какой порог?")
+    assert reply.history[0] == {"role": "user", "content": "какой порог?"}
+    assert not any(CHUNK_TEXT in m["content"] for m in reply.history)
+    assert reply.rag == _rag_ctx()
+    assert retriever.calls == [("какой порог?", "structure", 5)]
+
+
+def test_rag_strategy_and_k_reach_the_retriever():
+    retriever = _Retriever()
+    agent, _ = _rag_agent(retriever, rag_strategy="fixed", rag_k=3)
+    agent.ask("q", [])
+    assert retriever.calls == [("q", "fixed", 3)]
+
+
+def test_rag_off_never_calls_the_retriever():
+    def boom(*_args):
+        raise AssertionError("retriever must not run")
+
+    agent, recorder = _rag_agent(boom, rag=False)
+    reply = agent.ask("q", [])
+    assert reply.rag is None
+    assert recorder.calls[-1][-1]["content"] == "q"
+
+
+def test_rag_on_without_a_retriever_warns_once_and_runs_plain():
+    agent, recorder = _rag_agent(None)
+    first = agent.ask("q1", [])
+    agent.ask("q2", first.history)
+    warnings = [w for w in agent.warnings if "индекс не подключён" in w]
+    assert len(warnings) == 1
+    assert recorder.calls[-1][-1]["content"] == "q2"
+    assert first.rag is None
+
+
+def test_retriever_error_propagates_before_any_model_call():
+    def failing(*_args):
+        raise AdventError("embed упал")
+
+    agent, recorder = _rag_agent(failing)
+    with pytest.raises(AdventError, match="embed упал"):
+        agent.ask("q", [])
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize("strategy", CONTEXT_STRATEGY_CHOICES)
+def test_rag_reaches_the_request_for_every_context_strategy(strategy: str):
+    retriever = _Retriever()
+    recorder = _Recorder(CallResult(text="ответ", model_requested="m"))
+    agent = build_agent(
+        recorder,
+        make_config(context_strategy=strategy, rag=True),
+        retrieve=retriever,
+        counter=_CharCounter(),
+    )
+    reply = agent.ask("вопрос", list(HISTORY_6))
+    assert CHUNK_TEXT in recorder.calls[-1][-1]["content"]
+    assert recorder.calls[-1][-1]["content"].endswith("Вопрос: вопрос")
+    assert not any(CHUNK_TEXT in m["content"] for m in reply.history)
+    assert retriever.calls == [("вопрос", "structure", 5)]
+
+
+def test_retrieval_runs_before_the_invariant_assessment():
+    order: list[str] = []
+    retriever = _Retriever(order)
+
+    class _Logging(_Recorder):
+        def complete(self, config, messages, capabilities=None):
+            order.append("model")
+            return super().complete(config, messages, capabilities)
+
+    recorder = _Logging(
+        CallResult(
+            text=(
+                '{"decision":"compliant","rule_ids":[],"explanation":"ok","safe_alternative":null}'
+            ),
+            model_requested="m",
+            stream=False,
+        ),
+        CallResult(text="answer", model_requested="m", stream=False),
+    )
+    agent = build_agent(recorder, make_config(rag=True), retrieve=retriever, counter=_CharCounter())
+    active = InvariantSet((Invariant("no-public-network", "Keep the service private."),))
+
+    reply = agent.ask("plan", [], invariants=active)
+
+    assert order == ["retrieve", "model", "model"]
+    # Preflight sees the bare question; only the final request carries chunks.
+    assert CHUNK_TEXT not in recorder.calls[0][-1]["content"]
+    assert CHUNK_TEXT in recorder.calls[1][-1]["content"]
+    assert reply.rag is not None
+
+
+def test_blocked_turn_still_reports_the_retrieval():
+    retriever = _Retriever()
+    recorder = _Recorder(
+        CallResult(
+            text=(
+                '{"decision":"conflict","rule_ids":["no-public-network"],'
+                '"explanation":"no","safe_alternative":null}'
+            ),
+            model_requested="m",
+            stream=False,
+        )
+    )
+    agent = build_agent(recorder, make_config(rag=True), retrieve=retriever, counter=_CharCounter())
+    active = InvariantSet((Invariant("no-public-network", "Keep the service private."),))
+    reply = agent.ask("publish", [], invariants=active)
+    assert reply.text == ""
+    assert reply.rag == _rag_ctx()
+
+
+def test_retrieve_assigned_after_construction_is_what_ask_uses():
+    agent, recorder = _rag_agent(None)
+    retriever = _Retriever()
+    agent.retrieve = retriever
+    assert agent.retrieve is retriever
+    agent.ask("q", [])
+    assert retriever.calls == [("q", "structure", 5)]
+    assert CHUNK_TEXT in recorder.calls[-1][-1]["content"]
+
+
+def test_summary_budget_trigger_counts_the_augmented_request():
+    def build(rag: bool, limit: int):
+        recorder = _Recorder(CallResult(text="пересказ"), CallResult(text="ответ"))
+        agent = build_agent(
+            recorder,
+            compact_config(compact_every=100, max_tokens=10, rag=rag),
+            context_limit=limit,
+            retrieve=_Retriever(),
+            counter=_CharCounter(),
+            summary_prompt="сожми",
+        )
+        return recorder, agent
+
+    # Baseline: the plain request size, then a window that fits it with 5 to spare.
+    recorder, agent = build(False, 100_000)
+    agent.ask("вопрос", list(HISTORY_6))
+    limit = _CharCounter().count(recorder.calls[-1]) + 10 + 5
+
+    recorder, agent = build(False, limit)
+    agent.ask("вопрос", list(HISTORY_6))
+    assert len(recorder.calls) == 1  # fits: no compaction
+
+    recorder, agent = build(True, limit)
+    agent.ask("вопрос", list(HISTORY_6))
+    # Only the chunk text tipped it over: the summarizer ran first.
+    assert recorder.calls[0][0] == {"role": "system", "content": "сожми"}

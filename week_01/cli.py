@@ -107,6 +107,10 @@ NON_CHAT_PARAMS = {
     "working_max_tokens": "adventagent (неделя 03)",
     "long_term_max_tokens": "adventagent (неделя 03)",
     "memory_max_tokens": "adventagent (неделя 03)",
+    # RAG (day 22, SPEC-w05d22.md §3): retrieval happens inside Agent.ask().
+    "rag": "adventagent и adventrag (неделя 05)",
+    "rag_strategy": "adventagent и adventrag (неделя 05)",
+    "rag_k": "adventagent и adventrag (неделя 05)",
 }
 
 REPL_COMMANDS = [

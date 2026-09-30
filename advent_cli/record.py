@@ -166,6 +166,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 5 and day == 22:
+        return _demo_steps_w05d22()
     if week == 5 and day == 21:
         return _demo_steps_w05d21()
     if week == 4 and day == 20:
@@ -1897,6 +1899,51 @@ def _demo_steps_w05d21() -> list[Step]:
             module="week_05.cli",
             args=["compare"],
             timeout=180,
+            line_pause=8.0,
+        ),
+    ]
+
+
+_W05D22_QUESTION = "Какое максимальное значение temperature принимает Mistral API?"
+_W05D22_SESSION_ARGS = ["--session", "w05d22-demo", "--max-tokens", "400"]
+
+
+def _demo_steps_w05d22() -> list[Step]:
+    """Day 22 — first RAG request: one question both ways, the agent's /rag switch, 10 questions.
+
+    The same question runs in all three steps, so the contrast is the mode and
+    nothing else. `eval` is last: the comparison table is the day's headline and
+    belongs on the closing screen (day 10's lesson).
+    """
+    return [
+        Step(
+            title="1. adventrag ask — один вопрос: ответ без RAG и с RAG рядом",
+            module="week_05.cli",
+            args=["ask", _W05D22_QUESTION],
+            timeout=120,
+            line_pause=8.0,
+        ),
+        Step(
+            title="2. Агент: тот же вопрос без RAG, затем /rag on — и снова",
+            module="week_02.cli",
+            args=_W05D22_SESSION_ARGS,
+            stdin_lines=[
+                "/new",
+                _W05D22_QUESTION,
+                "/rag on",
+                "/new",
+                _W05D22_QUESTION,
+                "/rag",
+                "/exit",
+            ],
+            timeout=180,
+            line_pause=6.0,
+        ),
+        Step(
+            title="3. adventrag eval — 10 контрольных вопросов: факты и источники в обоих режимах",
+            module="week_05.cli",
+            args=["eval"],
+            timeout=420,
             line_pause=8.0,
         ),
     ]

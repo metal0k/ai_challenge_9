@@ -60,7 +60,9 @@ from advent_core.memory import (
 from advent_core.memory import (
     apply_delta as apply_memory_delta,
 )
+from advent_core.params import DEFAULT_RAG_K, DEFAULT_RAG_STRATEGY
 from advent_core.profiles import messages as profile_messages
+from advent_core.rag import RagContext, RetrieveFn, build_rag_prompt
 from advent_core.task_state import TaskState, task_messages
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCounter, reconcile
@@ -343,6 +345,8 @@ class AgentReply:
     # MAX_TOOL_ROUNDS exhaustion the last result is BOTH (SPEC-w04d17.md §4.4):
     # the caller must not double-count it in /tokens.
     tool_round_results: tuple[CallResult, ...] = ()
+    # Day 22: retrieval done for this turn (None when rag is off or unwired).
+    rag: RagContext | None = None
 
 
 def marker_instruction(kind: str, needle: str) -> str:
@@ -457,6 +461,7 @@ class Agent:
         on_warning: Callable[[str], None] | None = None,
         tools: Sequence[dict] | None = None,
         call_tool: Callable[[str, dict[str, Any]], ToolCallOutcome] | None = None,
+        retrieve: RetrieveFn | None = None,
         mcp_enabled: bool = False,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
     ) -> None:
@@ -512,6 +517,9 @@ class Agent:
         # Sync callback "run this tool". By contract it NEVER raises: the
         # caller catches MCPError and returns ToolCallOutcome(is_error=True).
         self._call_tool = call_tool
+        # Day 22: (question, strategy, k) -> RagContext. Read by ask() only when
+        # the `rag` param is on; None means no index wired in.
+        self._retrieve = retrieve
         self.mcp_enabled = mcp_enabled
         # Per-agent so registry mode (day 20) can allow a longer flow while
         # days 17-19 keep the module default.
@@ -544,6 +552,29 @@ class Agent:
     @call_tool.setter
     def call_tool(self, value: Callable[[str, dict[str, Any]], ToolCallOutcome] | None) -> None:
         self._call_tool = value
+
+    @property
+    def retrieve(self) -> RetrieveFn | None:
+        # Property for the same reason as call_tool: ask() reads `_retrieve`,
+        # a bare `agent.retrieve = ...` would create a second, unread attribute.
+        return self._retrieve
+
+    @retrieve.setter
+    def retrieve(self, value: RetrieveFn | None) -> None:
+        self._retrieve = value
+
+    @property
+    def rag_enabled(self) -> bool:
+        return bool(self.config.params.rag)
+
+    @property
+    def rag_strategy(self) -> str:
+        return self.config.params.rag_strategy or DEFAULT_RAG_STRATEGY
+
+    @property
+    def rag_k(self) -> int:
+        value = self.config.params.rag_k
+        return DEFAULT_RAG_K if value is None else value
 
     # --- предупреждения наверх -------------------------------------------
 
@@ -1600,6 +1631,19 @@ class Agent:
         # exactly the same pins as the later facts request.
         facts_pinned = tuple(facts_pinned)
 
+        # First paid step, before the invariant preflight: a failed embed must
+        # not take an already-paid preflight down with it. Only the outgoing
+        # request carries the chunks; history, extractors and the preflight
+        # keep the bare question, so chunks are never re-sent on later turns.
+        rag_ctx: RagContext | None = None
+        request_input = user_input
+        if self.rag_enabled:
+            if self._retrieve is None:
+                self._warn("rag включён, но индекс не подключён — ход идёт без RAG", once=True)
+            else:
+                rag_ctx = self._retrieve(user_input, self.rag_strategy, self.rag_k)
+                request_input = build_rag_prompt(user_input, rag_ctx.hits)
+
         # Assessment is deliberately the first possible model call while
         # rules are active.  Compaction/facts/memory must not spend tokens or
         # mutate pending state for a request which policy will deny.
@@ -1674,6 +1718,7 @@ class Agent:
                     ),
                     invariant_assessment=invariant_assessment,
                     invariant_result=invariant_result,
+                    rag=rag_ctx,
                 )
 
         system = self.system_prompt()
@@ -1694,7 +1739,7 @@ class Agent:
         if strategy == "summary":
             if self.compact_enabled():
                 older, tail = split_history(working, self.keep_last)
-                before = self._count_request(summary_now, working, system, user_input)
+                before = self._count_request(summary_now, working, system, request_input)
                 budget = self._token_budget()
                 # Either side can be unknown (no counter, no window) — then the
                 # budget trigger simply doesn't fire, and the scheduled
@@ -1702,7 +1747,9 @@ class Agent:
                 # would be worse than none at all.
                 over_budget = before is not None and budget is not None and before > budget
                 if should_compact(older, over_budget=over_budget, compact_every=self.compact_every):
-                    compaction = self._compact(summary_now, older, tail, before, system, user_input)
+                    compaction = self._compact(
+                        summary_now, older, tail, before, system, request_input
+                    )
                     if compaction is not None:
                         summary_now = compaction.summary
                         working = list(compaction.tail)
@@ -1772,7 +1819,7 @@ class Agent:
                 memory_now,
                 summary_now,
                 system,
-                user_input,
+                request_input,
             )
             memory_now, memory_upto_now, memory_update, memory_failed = self._run_memory(
                 memory_now,
@@ -1780,7 +1827,7 @@ class Agent:
                 user_input,
                 memory_upto_now,
             )
-            self._check_memory_head(memory_now, summary_now, system, user_input)
+            self._check_memory_head(memory_now, summary_now, system, request_input)
             # Summary and structured blocks are protected; _trim can only
             # remove raw short-term messages from ``working``.
             head = memory_messages(
@@ -1795,12 +1842,12 @@ class Agent:
         task_head = task_messages(task)
         strategy_head = head
         protected_head = [*invariant_head, *profile_head, *task_head, *strategy_head]
-        trimmed = self._trim(working, system, user_input, head=protected_head)
+        trimmed = self._trim(working, system, request_input, head=protected_head)
         if task_head and not invariant_head and self.counter is not None:
             budget = self._token_budget()
             if budget is not None and trimmed.tokens is not None and trimmed.tokens > budget:
                 baseline_final = chat_core.build_messages(
-                    user_input,
+                    request_input,
                     system=system,
                     history=[*profile_head, *strategy_head, *trimmed.history],
                 )
@@ -1815,7 +1862,7 @@ class Agent:
                         ),
                     )
         self._check_invariant_final_budget(
-            user_input=user_input,
+            user_input=request_input,
             system=system,
             invariant_head=invariant_head,
             baseline_head=[*profile_head, *task_head, *strategy_head],
@@ -1837,13 +1884,13 @@ class Agent:
                 summary=summary_now,
             )
             messages = chat_core.build_messages(
-                user_input,
+                request_input,
                 system=system,
                 history=[*profile_head, *task_head, *structured, *trimmed.history],
             )
         else:
             messages = chat_core.build_messages(
-                user_input, system=system, history=[*protected_head, *trimmed.history]
+                request_input, system=system, history=[*protected_head, *trimmed.history]
             )
 
         tool_logs: list[ToolCallLog] = []
@@ -1960,6 +2007,7 @@ class Agent:
             invariant_result=invariant_result,
             tool_calls=tuple(tool_logs),
             tool_round_results=tuple(tool_rounds),
+            rag=rag_ctx,
         )
 
     def _detect_done(self, text: str) -> bool:

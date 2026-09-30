@@ -535,3 +535,35 @@ def test_facts_max_tokens_is_local_and_never_reaches_payload():
 
 def test_facts_max_tokens_is_among_agent_params():
     assert "facts_max_tokens" in AGENT_PARAMS
+
+
+def test_rag_defaults_for_the_agent_command():
+    defaults = defaults_for(AGENT_COMMAND)
+    assert defaults["rag"] is False
+    assert defaults["rag_strategy"] == "structure"
+    assert defaults["rag_k"] == 5
+
+
+@pytest.mark.parametrize("bad", [0, 21])
+def test_rag_k_bounds_are_rejected(bad):
+    with pytest.raises(ParamError):
+        GenerationParams.build(rag_k=bad)
+
+
+@pytest.mark.parametrize("ok", [1, 20])
+def test_rag_k_bounds_are_accepted(ok):
+    assert GenerationParams.build(rag_k=ok).rag_k == ok
+
+
+def test_bad_rag_strategy_is_rejected():
+    with pytest.raises(ParamError):
+        GenerationParams.build(rag_strategy="semantic")
+
+
+def test_rag_params_are_local_and_agent_only():
+    params = GenerationParams.build(rag=True, rag_strategy="fixed", rag_k=3, temperature=0.5)
+    payload, _skipped = params.as_payload(REASONING)
+    assert payload == {"temperature": 0.5}
+    for name in ("rag", "rag_strategy", "rag_k"):
+        assert name in AGENT_PARAMS
+        assert name not in defaults_for(CHAT_COMMAND)

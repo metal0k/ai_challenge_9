@@ -24,6 +24,7 @@ from advent_core.embeddings import DEFAULT_EMBED_MODEL, embed_texts
 from advent_core.errors import AdventError
 from week_05 import corpus as corpus_module
 from week_05 import index as index_module
+from week_05 import rag_cli
 from week_05.chunking import MAX_CHUNK_CHARS, STRATEGIES, Chunk, chunk_corpus
 
 DAY = 21
@@ -517,6 +518,11 @@ def show_chunk(
             style="dim",
             markup=False,
         )
+
+
+# Day 22 commands (`ask`, `eval`) live in their own module.
+rag_cli.register(app)
+rag_cli.register_eval(app)
 
 
 def main() -> None:

@@ -1,0 +1,167 @@
+[
+  {
+    "id": 1,
+    "question": "Какое максимальное значение temperature принимает Mistral API?",
+    "expect": [
+      [
+        "1.5",
+        "1,5"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md",
+      "week_01/README.md",
+      "advent_core/params.py",
+      "advent_core/client.py"
+    ],
+    "note": "Потолок 1.5, а не 2.0 как у OpenAI."
+  },
+  {
+    "id": 2,
+    "question": "Какая задача из банка стала демо-задачей дня сравнения стратегий рассуждения и какой у неё правильный ответ?",
+    "expect": [
+      [
+        "alice"
+      ],
+      [
+        "answer 3",
+        "ответ 3",
+        "3 сестр",
+        "три сестр",
+        "**3**"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md",
+      "week_01/README.md"
+    ],
+    "note": "Задача alice (сколько сестёр у брата Алисы), ответ 3."
+  },
+  {
+    "id": 3,
+    "question": "Каков размер контекстного окна модели ministral-14b-latest в токенах по данным /v1/models?",
+    "expect": [
+      [
+        "262144"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md",
+      "week_02/README.md",
+      "advent_core/errors.py"
+    ],
+    "note": "262144 токена, не 128k."
+  },
+  {
+    "id": 4,
+    "question": "Каким git-тегом фиксируется состояние сданного дня в этом проекте? Приведи формат тега.",
+    "expect": [
+      [
+        "wNNdDD",
+        "w01d01"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md",
+      "README.md",
+      "week_01/README.md"
+    ],
+    "note": "Тег вида wNNdDD, например w01d01."
+  },
+  {
+    "id": 5,
+    "question": "Почему чтение кириллицы из stdin через pipe на Windows ломалось на слове «число»? Какая кодировка и какой обработчик ошибок были у stdin?",
+    "expect": [
+      [
+        "cp1252"
+      ],
+      [
+        "surrogateescape"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md",
+      "advent_core/console.py"
+    ],
+    "note": "stdin из pipe получает cp1252 + surrogateescape; байт 0x81 не определён."
+  },
+  {
+    "id": 6,
+    "question": "Как в проекте получить точный подсчёт токенов до отправки запроса: какой файл токенизатора и какой метод MistralTokenizer используются?",
+    "expect": [
+      [
+        "tekken"
+      ],
+      [
+        "from_file"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md",
+      "advent_core/tokens.py"
+    ],
+    "note": "tekken.json + MistralTokenizer.from_file(), а не from_model()."
+  },
+  {
+    "id": 7,
+    "question": "Какая размерность вектора у mistral-embed и сколько токенов максимум допускается на один вход?",
+    "expect": [
+      [
+        "1024"
+      ],
+      [
+        "8192"
+      ]
+    ],
+    "sources": [
+      "week_05/README.md"
+    ],
+    "note": "1024 измерения, 8192 токена на вход."
+  },
+  {
+    "id": 8,
+    "question": "Какими фильтрами ffmpeg скрипт cut_static.py должен вырезать застывшие участки записи и почему не select?",
+    "expect": [
+      [
+        "trim"
+      ],
+      [
+        "concat"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md"
+    ],
+    "note": "trim/atrim + concat; select оставляет аудио полной длины."
+  },
+  {
+    "id": 9,
+    "question": "Какая функция MCP-клиента проекта вызывает инструмент и держит ли она постоянное соединение с сервером?",
+    "expect": [
+      [
+        "call_tool_once"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md",
+      "advent_core/mcp_client.py",
+      "advent_core/mcp_router.py",
+      "week_04/README.md"
+    ],
+    "note": "call_tool_once: spawn, handshake, call, close — без долгоживущего соединения."
+  },
+  {
+    "id": 10,
+    "question": "Сколько примерно токенов стоит одна компакция истории по замерам проекта?",
+    "expect": [
+      [
+        "1450"
+      ]
+    ],
+    "sources": [
+      "CLAUDE.md",
+      "week_02/README.md"
+    ],
+    "note": "Около 1450 токенов (≈1076 prompt + ≈334 completion)."
+  }
+]

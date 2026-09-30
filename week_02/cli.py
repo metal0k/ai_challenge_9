@@ -92,6 +92,7 @@ from advent_core.params import (
     ParamError,
     defaults_for,
 )
+from advent_core.rag import RagContext
 from advent_core.session import (
     BRANCH_SEP,
     DEFAULT_SESSION,
@@ -420,6 +421,8 @@ class AgentShell:
             # Агент не печатает — он отдаёт текст сюда (SPEC §5).
             on_warning=console.warn,
         )
+        # No I/O here: the index is touched only when `rag` is on.
+        self.agent.retrieve = _rag_retriever()
         # The session's own `mcp_enabled` was parsed before the agent existed.
         self._restore_mcp()
         if self.config.params.context_limit is not None:
@@ -779,6 +782,7 @@ class AgentShell:
                     f"в файле сессии {session.name} негодное "
                     f"context_strategy={raw_strategy!r} — игнор"
                 )
+        self._apply_session_rag(session, check_explicit=check_explicit)
         self._apply_session_mcp(session)
         self._apply_session_summary(session)
         self._apply_session_facts(session)
@@ -788,6 +792,40 @@ class AgentShell:
         # it again once it is.
         self._restore_mcp()
         return resumed_dialog
+
+    def _apply_session_rag(self, session: Session, *, check_explicit: bool) -> None:
+        """`rag` / `rag_strategy` / `rag_k`: absent keeps, null resets, a typed value applies.
+
+        The type is checked BEFORE params.set() (a bool would pass as an int).
+        A restored `rag=True` needs the index: without it, off plus a warning.
+        """
+        checks = {
+            "rag_strategy": lambda v: isinstance(v, str),
+            "rag_k": lambda v: isinstance(v, int) and not isinstance(v, bool),
+            "rag": lambda v: isinstance(v, bool),
+        }
+        for name, is_valid in checks.items():
+            if (check_explicit and name in self.explicit) or name not in session.state:
+                continue
+            raw = session.state[name]
+            if raw is not None and not is_valid(raw):
+                console.warn(f"в файле сессии {session.name} негодное {name}={raw!r} — игнор")
+                continue
+            try:
+                self.config.params.set(name, raw)
+            except ParamError as error:
+                console.warn(
+                    f"в файле сессии {session.name} негодное {name}={raw!r} — игнор: {error}"
+                )
+                continue
+            if raw is None:
+                self.config.params.apply_defaults(AGENT_COMMAND)
+        if self.config.params.rag:
+            try:
+                _rag_check_index(self.config.params.rag_strategy)
+            except AdventError as error:
+                self.config.params.set("rag", False)
+                console.warn(f"rag не включён: {_with_hint(error)}")
 
     def _apply_session_mcp(self, session: Session) -> None:
         """Reads the `mcp_enabled` key — three cases, like `context_limit` above.
@@ -1299,6 +1337,8 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             "модель их больше не видит, файл сессии не тронут"
         )
 
+    if reply.rag is not None:
+        console.note(_rag_note(reply.rag))
     console.footer(reply.result, completion_estimate=_completion_estimate(shell, reply))
     # reconcile() — чистая функция: калибровку счётчика уже сделал агент, здесь
     # только показ. Сверять надо с тем, что РЕАЛЬНО ушло в API (sent_messages):
@@ -1669,6 +1709,11 @@ def _save_state(shell: AgentShell) -> None:
     # above); facts/facts_pinned/facts_upto are CONTENT, dropped by
     # session.clear() (CONTENT_STATE_KEYS) the same way summary is.
     shell.session.state["context_strategy"] = shell.config.params.context_strategy
+    # Day 22 settings (survive /new, not in CONTENT_STATE_KEYS); rag is always
+    # an explicit bool so "off" is a fact, not an absent key.
+    shell.session.state["rag"] = bool(shell.agent.rag_enabled)
+    shell.session.state["rag_strategy"] = shell.agent.rag_strategy
+    shell.session.state["rag_k"] = shell.agent.rag_k
     shell.session.state["facts"] = shell.facts
     shell.session.state["facts_pinned"] = list(shell.facts_pinned)
     shell.session.state["facts_upto"] = shell.facts_upto
@@ -2115,6 +2160,7 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
     # what the strategy was to tell "just switched to facts" from "already
     # was facts" (SPEC §5.6, review finding C3).
     previous_strategy = shell.agent.context_strategy if name == "context_strategy" else None
+    previous_rag_strategy = shell.agent.rag_strategy
     try:
         shell.config.params.set(name, raw)
     except ParamError as error:
@@ -2125,6 +2171,22 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
     # правило живёт в реестре параметров, а не здесь.
     shell.config.params.apply_defaults(AGENT_COMMAND)
     value = getattr(shell.config.params, name)
+    # The one enable path (also behind /rag): an index that is not there refuses
+    # BEFORE the confirmation, and the value goes back to what it was.
+    if (name == "rag" and value) or (name == "rag_strategy" and shell.agent.rag_enabled):
+        try:
+            _rag_check_index(shell.agent.rag_strategy)
+        except AdventError as error:
+            if name == "rag":
+                shell.config.params.set("rag", False)
+                console.warn(f"rag не включён: {_with_hint(error)}")
+            else:
+                shell.config.params.set("rag_strategy", previous_rag_strategy)
+                console.warn(
+                    f"rag_strategy не изменён (остаётся {previous_rag_strategy}): "
+                    f"{_with_hint(error)}"
+                )
+            return False
     console.note(f"{name} = {_shown(value)}")
 
     if value is not None:
@@ -2158,7 +2220,7 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
         # Негодный или съедаемый stop'ом маркер надо поймать сейчас, а не
         # тогда, когда диалог не закончится ни разу.
         _warn_text(shell.agent.check_done())
-    if name in ("mode", "done", "context_limit", "context_strategy", "compact"):
+    if name in ("mode", "done", "context_limit", "context_strategy", "compact", *RAG_PARAMS):
         # Значение применилось — сразу в файл: `/mode dialog` → `/exit` без
         # хода иначе терял бы режим (save после хода тут не случится). Точка
         # записи context_limit — та же (SPEC-w02d08.md §4).
@@ -2240,6 +2302,84 @@ def _cmd_strategy(shell: AgentShell, args: list[str]) -> bool:
         console.note(f"стратегия контекста: {shell.agent.context_strategy} (есть: {choices})")
         return False
     return _cmd_set(shell, ["context_strategy", *args])
+
+
+# --------------------------------------------------------------------------
+# RAG (day 22)
+# --------------------------------------------------------------------------
+
+RAG_PARAMS = ("rag", "rag_strategy", "rag_k")
+
+
+def _rag_retriever():
+    # The repo's second deliberate cross-week import (the first is week_04's
+    # server command in _mcp_enable): the agent's REPL retrieves from the index
+    # that week_05 builds, and the search is week_05's own business. Inlining
+    # it would be a second copy; moving it to advent_core would put "week_05"
+    # in the week-agnostic layer. A function-local import keeps week_02
+    # importable without week_05.
+    from week_05.rag import make_retriever
+
+    return make_retriever()
+
+
+def _rag_check_index(strategy: str):
+    """RunInfo of the index for `strategy`; raises AdventError when it is missing."""
+    from week_05.rag import check_index  # see _rag_retriever for why it is local
+
+    return check_index(None, strategy)
+
+
+def _with_hint(error: AdventError) -> str:
+    return f"{error.message} {error.hint}" if error.hint else error.message
+
+
+@command("/rag", "RAG по индексу репозитория: без значения — состояние", usage="/rag on | off")
+def _cmd_rag(shell: AgentShell, args: list[str]) -> bool:
+    """Shorthand for `/set rag`, like /strategy: one enable path, one check."""
+    if args:
+        return _cmd_set(shell, ["rag", *args])
+    if not shell.agent.rag_enabled:
+        console.note("rag: off")
+        return False
+    strategy = shell.agent.rag_strategy
+    try:
+        info = _rag_check_index(strategy)
+    except AdventError as error:
+        console.note(f"rag: on · индекс недоступен ({error.message})")
+        return False
+    console.note(
+        f"rag: on · {strategy} · k={shell.agent.rag_k} · индекс {info.corpus_rev[:12]} "
+        f"({info.n_chunks} чанков)"
+    )
+    return False
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def _rag_note(ctx: RagContext) -> str:
+    """One stderr line per turn: what retrieval added to the request."""
+    if not ctx.hits:
+        return f"rag: чанков не найдено ({ctx.strategy})"
+    counts: dict[str, int] = {}
+    for hit in ctx.hits:
+        counts[hit.source] = counts.get(hit.source, 0) + 1
+    sources = ", ".join(f"{s} ×{n}" if n > 1 else s for s, n in counts.items())
+    n = len(ctx.hits)
+    embed = "—" if ctx.embed_tokens is None else ctx.embed_tokens
+    line = (
+        f"rag: {n} {_plural(n, 'чанк', 'чанка', 'чанков')} ({ctx.strategy}) · {sources} "
+        f"· embed {embed} ток."
+    )
+    if ctx.dropped > 0:
+        line += f" · не вошло: {ctx.dropped}"
+    return line
 
 
 # --------------------------------------------------------------------------
@@ -2422,7 +2562,8 @@ def _mcp_enable(shell: AgentShell) -> bool:
     if Path(MCP_REGISTRY_PATH).is_file():
         return _mcp_enable_registry(shell)
 
-    # The repo's one deliberate cross-week import: the agent's REPL has to
+    # One of the repo's two deliberate cross-week imports (the other is
+    # week_05.rag, see _rag_retriever): the agent's REPL has to
     # know how to launch ITS OWN week_04 MCP server, and that command is
     # week_04's own business. Inlining the literal would make a second,
     # unsynchronized copy; moving it into advent_core would put "week_04" in
