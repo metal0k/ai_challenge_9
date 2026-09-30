@@ -14,12 +14,14 @@ start_recording. Раньше нельзя — verify_capture отбраковы
 
 from __future__ import annotations
 
+import subprocess
 from contextlib import contextmanager
 
 import pytest
 
 from advent_cli import record as record_mod
 from advent_core import console
+from advent_core.config import PROJECT_ROOT
 from advent_core.errors import AdventError
 from tools import strategy_bench
 
@@ -1399,3 +1401,115 @@ def test_scheduler_preflight_warns_on_corrupt_state_and_never_raises(tmp_path, m
     seen = _capture_warnings(monkeypatch)
     record_mod._warn_if_scheduler_idle(4, 18)
     assert len(seen) == 1
+
+
+# --------------------------------------------------------------------------
+# Week 05, Day 21: RAG index — chunk -> embed -> compare -> search -> show.
+# --------------------------------------------------------------------------
+
+
+def test_day_21_steps_pin_module_args_and_count():
+    steps = record_mod.demo_steps(5, 21)
+    assert len(steps) == 5
+    assert all(step.module == "week_05.cli" for step in steps)
+    assert [step.args[0] for step in steps] == ["index", "compare", "search", "show", "compare"]
+    assert steps[2].args == [
+        "search",
+        "как посчитать токены до отправки запроса",
+    ]
+
+
+def test_day_21_titles_are_short_and_numbered():
+    steps = record_mod.demo_steps(5, 21)
+    assert [title[:2] for title in (step.title for step in steps)] == [
+        "1.",
+        "2.",
+        "3.",
+        "4.",
+        "5.",
+    ]
+    assert all(len(step.title) < 100 for step in steps)
+
+
+def test_day_21_last_step_is_compare_for_the_closing_headline():
+    """Day 10's lesson: the headline number belongs on the LAST screen."""
+    steps = record_mod.demo_steps(5, 21)
+    assert steps[-1].args == ["compare"]
+    assert steps[1].args == steps[-1].args
+
+
+def test_week_05_module_is_shown_as_adventrag_in_the_caption():
+    assert record_mod.MODULE_COMMANDS["week_05.cli"] == "adventrag"
+
+
+def test_day_21_show_anchor_constants_are_pinned():
+    assert record_mod._W05D21_SHOW_SOURCE == "week_02/README.md"
+    assert record_mod._W05D21_SHOW_ANCHOR == "## Day 08 — работа с токенами"
+
+
+def test_day_21_show_target_line_matches_the_anchor_in_head_readme():
+    """Cross-checked against an INDEPENDENT read of HEAD:week_02/README.md."""
+    result = subprocess.run(
+        ["git", "show", "HEAD:week_02/README.md"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+    lines = result.stdout.split("\n")
+
+    show_step = record_mod.demo_steps(5, 21)[3]
+    assert show_step.args[0] == "show"
+    target = show_step.args[1]
+    assert target.startswith("week_02/README.md:")
+    lineno = int(target.removeprefix("week_02/README.md:"))
+    anchor = record_mod._W05D21_SHOW_ANCHOR
+    assert anchor in lines[lineno - 1]
+    assert not any(anchor in line for line in lines[: lineno - 1])
+
+
+def test_w05d21_anchor_line_resolves_first_match_with_literal_number(monkeypatch):
+    doc = "# Title\n\nintro\n## Day 08 — x\nbody\n## Day 08 — x again\n"
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["encoding"] = kwargs.get("encoding")
+        return subprocess.CompletedProcess(cmd, 0, stdout=doc, stderr="")
+
+    monkeypatch.setattr(record_mod.subprocess, "run", fake_run)
+    assert record_mod._w05d21_anchor_line("a/b.md", "## Day 08") == 4
+    assert seen["cmd"] == ["git", "show", "HEAD:a/b.md"]
+    assert seen["encoding"] == "utf-8"
+
+
+def test_w05d21_anchor_line_raises_when_anchor_missing(monkeypatch):
+    monkeypatch.setattr(
+        record_mod.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="a\nb\n", stderr=""),
+    )
+    with pytest.raises(record_mod.AdventError, match="не найден"):
+        record_mod._w05d21_anchor_line("a/b.md", "zzz")
+
+
+def test_week_05_rehearsal_has_positive_dry_run_and_negative_show():
+    steps = record_mod.rehearsal_steps(5, 21)
+    assert len(steps) == 2
+    ok, bad = steps
+    assert ok.module == "week_05.cli"
+    assert ok.args == ["index", "--dry-run", "--strategy", "fixed"]
+    assert ok.expect_failure is False
+    assert bad.module == "week_05.cli"
+    assert bad.args[0] == "show"
+    assert bad.expect_failure is True
+    # Cyrillic target: a pipe/argv encoding check on the failing side.
+    assert any(ch.isalpha() and ord(ch) > 127 for ch in bad.args[1])
+
+
+def test_week_05_positive_step_passes_check_only_on_zero():
+    ok = record_mod.rehearsal_steps(5, 21)[0]
+    record_mod._check(ok, 0)
+    with pytest.raises(record_mod.AdventError):
+        record_mod._check(ok, 1)

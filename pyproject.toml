@@ -21,6 +21,9 @@ dependencies = [
     # бы код ровно там, где он должен читаться легко. Тянет numpy и pycountry.
     "mistral-common>=1.8.6",
     "mcp>=2,<3",
+    # explicit now: advent_core/embeddings.py (week 05) uses it directly,
+    # not just transitively through mistral-common
+    "numpy>=1.26",
 ]
 
 [project.scripts]
@@ -31,6 +34,8 @@ advent = "advent_cli.app:main"
 adventagent = "week_02.cli:main"
 # Week 04 (MCP): a client is a separate process family, not an `advent` group.
 adventmcp = "week_04.cli:main"
+# Week 05 (RAG): a CLI over a local index, not an `advent` group either.
+adventrag = "week_05.cli:main"
 
 [dependency-groups]
 dev = [
@@ -43,7 +48,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["advent_core", "advent_cli", "week_01", "week_02", "week_04"]
+packages = ["advent_core", "advent_cli", "week_01", "week_02", "week_04", "week_05"]
 
 [tool.ruff]
 line-length = 100

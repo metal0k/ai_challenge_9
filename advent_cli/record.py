@@ -79,6 +79,8 @@ MODULE_COMMANDS = {
     "week_02.cli": "adventagent",
     # Week 04 (MCP) has its own entry point, like week 02's agent.
     "week_04.cli": "adventmcp",
+    # Week 05 (RAG) has its own entry point too, same reasoning as week 04.
+    "week_05.cli": "adventrag",
     # День 07 показывает файл сессии глазами — подпись в кадре должна
     # соответствовать тому, что зритель может повторить.
     "json.tool": "python -m json.tool",
@@ -164,6 +166,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 5 and day == 21:
+        return _demo_steps_w05d21()
     if week == 4 and day == 20:
         return _demo_steps_w04d20()
     if week == 4 and day == 19:
@@ -1816,6 +1820,88 @@ def _demo_steps_w04d20() -> list[Step]:
     ]
 
 
+# Source and anchor whose line number becomes `adventrag show <source>:<N>` (step 4).
+# A whole `## Day` section of a README is one structural chunk; a CLAUDE.md line
+# landed mid-sentence in a fixed-size part. Not a hardcoded line number: the
+# file can grow above the anchor (SPEC-w05d21.md SS8).
+_W05D21_SHOW_SOURCE = "week_02/README.md"
+_W05D21_SHOW_ANCHOR = "## Day 08 — работа с токенами"
+
+
+def _w05d21_anchor_line(source: str, anchor: str, root: Path = PROJECT_ROOT) -> int:
+    """1-based line number of the first line containing `anchor` in HEAD:<source>.
+
+    Reads the committed snapshot (`git show HEAD:...`), the same source
+    week_05/corpus.py indexes from — the index a live `adventrag show` looks
+    up was built from that same snapshot, not from the working tree.
+    """
+    result = subprocess.run(
+        ["git", "show", f"HEAD:{source}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AdventError(f"git show HEAD:{source} не удался: {result.stderr.strip()}")
+    for lineno, line in enumerate(result.stdout.split("\n"), start=1):
+        if anchor in line:
+            return lineno
+    raise AdventError(f"Якорь {anchor!r} не найден в HEAD:{source}.")
+
+
+def _demo_steps_w05d21() -> list[Step]:
+    """Day 21 — RAG index: chunk -> embed -> compare strategies -> search -> show.
+
+    Step 4's target line is computed here, not hardcoded (SPEC SS8): the README
+    can change above the anchor, and a literal line number would silently point at
+    the wrong sentence the next time this function runs. `compare` closes the
+    take twice — step 2 and step 5 — because the headline number belongs on
+    the LAST screen (day 10's lesson): step 2 can be cut first if the take
+    runs long, step 5 cannot.
+    """
+    line = _w05d21_anchor_line(_W05D21_SHOW_SOURCE, _W05D21_SHOW_ANCHOR)
+    show_target = f"{_W05D21_SHOW_SOURCE}:{line}"
+    return [
+        Step(
+            title="1. adventrag index — обе стратегии, прогресс батчей и итог по каждой",
+            module="week_05.cli",
+            args=["index"],
+            timeout=480,
+            line_pause=6.0,
+        ),
+        Step(
+            title="2. adventrag compare — статистика чанков и качество поиска",
+            module="week_05.cli",
+            args=["compare"],
+            timeout=180,
+            line_pause=8.0,
+        ),
+        Step(
+            title="3. adventrag search — обе стратегии рядом на вопросе не из eval-набора",
+            module="week_05.cli",
+            args=["search", "как посчитать токены до отправки запроса"],
+            timeout=90,
+            line_pause=6.0,
+        ),
+        Step(
+            title=f"4. adventrag show {show_target} — целый раздел дня как один structure-чанк",
+            module="week_05.cli",
+            args=["show", show_target],
+            timeout=60,
+            line_pause=6.0,
+        ),
+        Step(
+            title="5. adventrag compare — итог дня на закрывающем экране",
+            module="week_05.cli",
+            args=["compare"],
+            timeout=180,
+            line_pause=8.0,
+        ),
+    ]
+
+
 def _prepare_w04d20(week: int, day: int) -> None:
     """Day 20 preflight: drop the previous fs-written file, warm the npx cache.
 
@@ -2050,6 +2136,18 @@ def rehearsal_step(week: int) -> Step:
     §17.2). Сессия репетиции — своя: `/params` и заведомо неверная команда
     ходов не пишут, но подставлять сюда демо-сессию всё равно нельзя.
     """
+    if week == 5:
+        # Negative half only: an unparseable `show` target must exit non-zero
+        # (expect_failure accepts ANY non-zero code — an AdventError and a
+        # traceback both exit 1, so the code cannot tell them apart). It checks
+        # that the run fails, not why; the import/corpus/chunking/Cyrillic
+        # proof is the positive dry-run step in rehearsal_steps(5, 21).
+        return Step(
+            title="репетиция",
+            module="week_05.cli",
+            args=["show", "нет-такого-чанка", "--db", "logs/w05d21-rehearsal-missing.sqlite3"],
+            expect_failure=True,
+        )
     if week == 4:
         # Cheap machinery check: spawn, exit code and the Cyrillic error text.
         return Step(
@@ -2088,6 +2186,16 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w03d14(session="w03d14-rehearsal")
     if (week, day) == (3, 15):
         return _demo_steps_w03d15(session="w03d15-rehearsal")
+    if (week, day) == (5, 21):
+        return [
+            # Positive: import, git corpus read, chunking, Cyrillic table; no API.
+            Step(
+                title="репетиция: index --dry-run",
+                module="week_05.cli",
+                args=["index", "--dry-run", "--strategy", "fixed"],
+            ),
+            rehearsal_step(5),
+        ]
     return [rehearsal_step(week)]
 
 

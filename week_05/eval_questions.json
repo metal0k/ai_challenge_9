@@ -1,0 +1,49 @@
+[
+  {
+    "id": 1,
+    "question": "Почему при temperature=0 модель отвечает по-разному даже с random_seed?",
+    "expected": [
+      {"source": "CLAUDE.md", "anchor": "is not deterministic, and"}
+    ]
+  },
+  {
+    "id": 2,
+    "question": "Какое максимальное значение temperature принимает Mistral API?",
+    "expected": [
+      {"source": "CLAUDE.md", "anchor": "ceiling is 1.5"}
+    ]
+  },
+  {
+    "id": 3,
+    "question": "Почему OBS записывает чёрный кадр вместо окна терминала?",
+    "expected": [
+      {
+        "source": "CLAUDE.md",
+        "anchor": "Configure and probe the scene while it is the active program scene"
+      }
+    ]
+  },
+  {
+    "id": 4,
+    "question": "Почему модель по умолчанию сменили с mistral-small?",
+    "expected": [
+      {"source": "week_01/README.md", "anchor": "### DEFAULT_MODEL сменился"},
+      {"source": "advent_core/config.py", "anchor": "DEFAULT_MODEL = "}
+    ]
+  },
+  {
+    "id": 5,
+    "question": "Экономит ли сжатие истории токены на коротком диалоге?",
+    "expected": [
+      {"source": "week_02/README.md", "anchor": "Вывод дня обратный ожидаемому"},
+      {"source": "CLAUDE.md", "anchor": "History compaction does not save tokens"}
+    ]
+  },
+  {
+    "id": 6,
+    "question": "Держит ли MCP-клиент постоянное соединение с сервером при вызове инструмента?",
+    "expected": [
+      {"source": "advent_core/mcp_client.py", "anchor": "def call_tool_once"}
+    ]
+  }
+]

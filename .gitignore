@@ -17,6 +17,8 @@ venv/
 # --- runtime artifacts ---
 logs/
 *.mp4
+# RAG index (week_05): holds full chunk text, not just vectors
+data/
 
 # --- os / ide ---
 .DS_Store
