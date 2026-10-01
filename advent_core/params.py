@@ -33,6 +33,9 @@ CONTEXT_STRATEGY_CHOICES = ("window", "facts", "branch", "summary", "memory")
 RAG_STRATEGY_CHOICES = ("fixed", "structure")
 DEFAULT_RAG_STRATEGY = "structure"
 DEFAULT_RAG_K = 5
+# Day 23: second stage (candidates before filtering, reranker score cut-off).
+DEFAULT_RAG_K_BEFORE = 20
+DEFAULT_RAG_THRESHOLD = 5.0
 
 # Команды CLI, у которых есть собственные значения по умолчанию (Spec.defaults).
 CHAT_COMMAND = "chat"
@@ -82,6 +85,10 @@ AGENT_PARAMS: tuple[str, ...] = (
     "rag",
     "rag_strategy",
     "rag_k",
+    "rag_rewrite",
+    "rag_rerank",
+    "rag_k_before",
+    "rag_threshold",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -308,6 +315,38 @@ SPECS: tuple[Spec, ...] = (
         defaults={AGENT_COMMAND: DEFAULT_RAG_K},
     ),
     Spec(
+        "rag_rewrite",
+        "bool",
+        "RAG: переписать вопрос в поисковый запрос и слить выдачу с исходным (RRF).",
+        local=True,
+        defaults={AGENT_COMMAND: False},
+    ),
+    Spec(
+        "rag_rerank",
+        "bool",
+        "RAG: LLM-rerank кандидатов и отсечение по порогу.",
+        local=True,
+        defaults={AGENT_COMMAND: False},
+    ),
+    Spec(
+        "rag_k_before",
+        "int",
+        "RAG: сколько кандидатов брать на каждый запрос до фильтрации.",
+        1,
+        50,
+        local=True,
+        defaults={AGENT_COMMAND: DEFAULT_RAG_K_BEFORE},
+    ),
+    Spec(
+        "rag_threshold",
+        "float",
+        "RAG: минимальная оценка reranker'а 0-10; 0 — без отсечения.",
+        0.0,
+        10.0,
+        local=True,
+        defaults={AGENT_COMMAND: DEFAULT_RAG_THRESHOLD},
+    ),
+    Spec(
         "session",
         "string",
         "Имя сессии агента: logs/sessions/<имя>.json.",
@@ -526,6 +565,11 @@ class GenerationParams:
     rag: bool | None = None
     rag_strategy: str | None = None
     rag_k: int | None = None
+    # Day 23: rewrite/rerank stage; same None-means-command-default rule.
+    rag_rewrite: bool | None = None
+    rag_rerank: bool | None = None
+    rag_k_before: int | None = None
+    rag_threshold: float | None = None
 
     # Override лимита окна (день 08, SPEC-w02d08.md §4). None — «из карточки
     # модели»: у агента свой контракт на None, чем у max_turns выше — там

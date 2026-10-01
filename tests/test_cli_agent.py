@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.cells import cell_len
 
 import week_02.cli as cli
 from advent_core import console
@@ -1127,6 +1128,11 @@ def test_defaults_come_from_the_registry_not_from_the_typer_signature():
         "rag": False,
         "rag_strategy": "structure",
         "rag_k": 5,
+        # Day 23: second stage is opt-in as well.
+        "rag_rewrite": False,
+        "rag_rerank": False,
+        "rag_k_before": 20,
+        "rag_threshold": 5.0,
     }
 
     signature = inspect.signature(cli.agent)
@@ -4540,7 +4546,7 @@ def _hit(source, text="chunk text", n=1):
     return RagHit(chunk_id=f"{source}#{n}", source=source, section="s", score=0.9, text=text)
 
 
-def _ctx(hits, *, embed_tokens=12, dropped=0, strategy="structure"):
+def _ctx(hits, *, embed_tokens=12, dropped=0, strategy="structure", **extra):
     return RagContext(
         hits=tuple(hits),
         strategy=strategy,
@@ -4549,6 +4555,7 @@ def _ctx(hits, *, embed_tokens=12, dropped=0, strategy="structure"):
         embed_tokens=embed_tokens,
         corpus_rev="0123456789abcdef",
         dropped=dropped,
+        **extra,
     )
 
 
@@ -4562,7 +4569,7 @@ def rag_index(monkeypatch):
         return _INFO
 
     monkeypatch.setattr(cli, "_rag_check_index", check)
-    monkeypatch.setattr(cli, "_rag_retriever", lambda: lambda q, strategy, k: _ctx([]))
+    monkeypatch.setattr(cli, "_rag_retriever", lambda: lambda q, settings: _ctx([]))
     return calls
 
 
@@ -4766,7 +4773,7 @@ def test_a_rag_turn_prints_one_note_and_sends_the_chunk(monkeypatch, tmp_path, c
     seen: list = []
     shell = _shell(monkeypatch, tmp_path, complete=_complete(seen=seen))
     cli._dispatch("/rag on", shell)
-    shell.agent.retrieve = lambda q, strategy, k: _ctx(
+    shell.agent.retrieve = lambda q, settings: _ctx(
         [_hit("CLAUDE.md", text="УНИКАЛЬНЫЙ ЧАНК 4242")]
     )
     capsys.readouterr()
@@ -4776,3 +4783,239 @@ def test_a_rag_turn_prints_one_note_and_sends_the_chunk(monkeypatch, tmp_path, c
     stderr = _flat(capsys.readouterr().err)
     assert stderr.count("rag: 1 чанк (structure) · CLAUDE.md · embed 12 ток.") == 1
     assert "УНИКАЛЬНЫЙ ЧАНК 4242" in seen[0][-1]["content"]
+
+
+# --- Day 23: /rag plain|full, status line, note, state -------------------------
+
+
+def _stage_values(shell):
+    s = shell.agent.rag_settings
+    return (s.rewrite, s.rerank, s.k_before, s.threshold)
+
+
+def test_rag_full_enables_rag_and_both_stages_through_one_index_check(
+    monkeypatch, tmp_path, rag_index
+):
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/rag full", shell)
+
+    assert rag_index == ["structure"]
+    assert shell.agent.rag_enabled is True
+    assert _stage_values(shell)[:2] == (True, True)
+    state = _saved(tmp_path)
+    assert (state["rag_rewrite"], state["rag_rerank"]) == (True, True)
+
+
+def test_rag_plain_after_full_turns_both_stages_off_but_keeps_rag_on(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag full", shell)
+
+    cli._dispatch("/rag plain", shell)
+
+    assert shell.agent.rag_enabled is True
+    assert _stage_values(shell)[:2] == (False, False)
+
+
+def test_rag_full_with_missing_index_leaves_stages_off(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    _index_missing(monkeypatch)
+    capsys.readouterr()
+
+    cli._dispatch("/rag full", shell)
+
+    assert _flat(capsys.readouterr().err).count("rag не включён: индекса нет advent rag index") == 1
+    assert shell.agent.rag_enabled is False
+    assert _stage_values(shell)[:2] == (False, False)
+
+
+def test_rag_status_line_for_full(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag full", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/rag", shell)
+
+    assert _flat(capsys.readouterr().err).strip() == (
+        "rag: on · structure · k 20→5 · rewrite on · rerank on (порог 5) "
+        "· индекс 0123456789ab (469 чанков)"
+    )
+
+
+def test_rag_status_line_for_rewrite_only(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag on", shell)
+    cli._dispatch("/set rag_rewrite on", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/rag", shell)
+
+    assert "k 20→5 · rewrite on · rerank off · индекс" in _flat(capsys.readouterr().err)
+
+
+def test_params_lists_the_new_params(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/params", shell)
+
+    err = _flat(capsys.readouterr().err)
+    for name in ("rag_rewrite", "rag_rerank", "rag_k_before", "rag_threshold"):
+        assert name in err
+
+
+def test_rag_note_with_stages_and_aux_tokens():
+    hits = [_hit("a.md", n=i) for i in range(4)]
+    ctx = _ctx(
+        hits,
+        candidates=31,
+        passed=4,
+        threshold=5.0,
+        aux_prompt_tokens=9412,
+        aux_completion_tokens=180,
+        trace=object(),
+    )
+    assert cli._rag_note(ctx) == (
+        "rag: 4 чанка (structure) · a.md ×4 · embed 12 ток. "
+        "· кандидатов 31 → порог 4 → в контексте 4 · aux 9 412+180 ток."
+    )
+
+
+def test_rag_note_with_passed_zero_keeps_the_diagnostics():
+    ctx = _ctx(
+        [],
+        candidates=31,
+        passed=0,
+        threshold=5.0,
+        aux_prompt_tokens=9412,
+        aux_completion_tokens=180,
+    )
+    assert cli._rag_note(ctx) == (
+        "rag: в контексте 0 (structure) · кандидатов 31 → порог 0 · aux 9 412+180 ток."
+    )
+
+
+def test_rag_note_rewrite_only_has_no_threshold_step():
+    ctx = _ctx([_hit("a.md")], candidates=27, trace=object())
+    assert cli._rag_note(ctx).endswith("· кандидатов 27 → в контексте 1")
+
+
+def test_rag_rewrite_note_is_cut_by_cells_and_absent_without_rewrite():
+    assert cli._rag_rewrite_note(_ctx([])) is None
+    line = cli._rag_rewrite_note(_ctx([], rewritten="поиск " * 40), width=40)
+    assert line.startswith("rag rewrite: поиск")
+    assert line.endswith("…")
+    assert len(line) <= 40
+    wide = cli._rag_rewrite_note(_ctx([], rewritten="поиск 検索 " * 10 + "😀" * 30), width=40)
+    assert wide.endswith("…")
+    assert cell_len(wide) <= 40
+    assert cell_len(wide) > len(wide)  # double-cell chars: len() would overshoot the width
+    short = cli._rag_rewrite_note(_ctx([], rewritten="cut_static ffmpeg"), width=80)
+    assert short == "rag rewrite: cut_static ffmpeg"
+
+
+def test_a_full_turn_prints_the_rewrite_line_after_the_note(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete())
+    cli._dispatch("/rag full", shell)
+    shell.agent.retrieve = lambda q, settings: _ctx(
+        [_hit("a.md")], candidates=9, passed=1, rewritten="cut_static ffmpeg trim"
+    )
+    capsys.readouterr()
+
+    cli._turn(shell, "что там?")
+
+    err = _flat(capsys.readouterr().err)
+    assert err.count("rag rewrite: cut_static ffmpeg trim") == 1
+    assert err.index("rag: 1 чанк") < err.index("rag rewrite:")
+
+
+def test_stage_settings_round_trip_through_the_session_file(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag full", shell)
+    cli._dispatch("/set rag_k_before 12", shell)
+    cli._dispatch("/set rag_threshold 6.5", shell)
+    state = _saved(tmp_path)
+    assert (state["rag_k_before"], state["rag_threshold"]) == (12, 6.5)
+
+    second = _shell(monkeypatch, tmp_path)
+
+    assert _stage_values(second) == (True, True, 12, 6.5)
+
+
+def test_older_session_file_gives_stage_defaults(monkeypatch, tmp_path):
+    _session_with(tmp_path, "default", {"rag": False})
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert _stage_values(shell) == (False, False, 20, 5.0)
+
+
+_LOADED_STAGES = {
+    "rag_rewrite": True,
+    "rag_rerank": True,
+    "rag_k_before": 9,
+    "rag_threshold": 3.0,
+}
+
+
+def test_absent_stage_keys_keep_the_loaded_values_on_a_session_switch(monkeypatch, tmp_path):
+    _session_with(tmp_path, "work", {"mode": "chat"})
+    shell = _shell(monkeypatch, tmp_path, **_LOADED_STAGES)
+
+    cli._dispatch("/set session work", shell)
+
+    assert _stage_values(shell) == (True, True, 9, 3.0)
+
+
+def test_null_stage_keys_reset_to_defaults_on_a_session_switch(monkeypatch, tmp_path):
+    _session_with(tmp_path, "work", dict.fromkeys(_LOADED_STAGES))
+    shell = _shell(monkeypatch, tmp_path, **_LOADED_STAGES)
+
+    cli._dispatch("/set session work", shell)
+
+    assert _stage_values(shell) == (False, False, 20, 5.0)
+
+
+def test_typed_stage_keys_apply_on_a_session_switch(monkeypatch, tmp_path):
+    _session_with(
+        tmp_path,
+        "work",
+        {"rag_rewrite": True, "rag_rerank": True, "rag_k_before": 7, "rag_threshold": 4},
+    )
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/set session work", shell)
+
+    assert _stage_values(shell) == (True, True, 7, 4)
+
+
+def test_huge_int_threshold_warns_instead_of_overflowing(monkeypatch, tmp_path, capsys):
+    _session_with(tmp_path, "default", {"rag_threshold": 10**400})
+
+    shell = _shell(monkeypatch, tmp_path)  # OverflowError from math.isfinite without the guard
+
+    assert _flat(capsys.readouterr().err).count("негодное rag_threshold=") == 1
+    assert _stage_values(shell) == (False, False, 20, 5.0)
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("rag_rewrite", "yes"),
+        ("rag_rewrite", 1),
+        ("rag_rerank", "on"),
+        ("rag_k_before", True),
+        ("rag_k_before", 2.5),
+        ("rag_threshold", True),
+        ("rag_threshold", "5"),
+        ("rag_threshold", float("nan")),
+        ("rag_threshold", float("inf")),
+    ],
+)
+def test_garbage_stage_keys_warn_and_leave_the_value(monkeypatch, tmp_path, capsys, key, bad):
+    _session_with(tmp_path, "default", {key: bad})
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert _flat(capsys.readouterr().err).count(f"негодное {key}={bad!r}") == 1
+    assert _stage_values(shell) == (False, False, 20, 5.0)

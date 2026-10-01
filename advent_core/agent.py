@@ -60,9 +60,14 @@ from advent_core.memory import (
 from advent_core.memory import (
     apply_delta as apply_memory_delta,
 )
-from advent_core.params import DEFAULT_RAG_K, DEFAULT_RAG_STRATEGY
+from advent_core.params import (
+    DEFAULT_RAG_K,
+    DEFAULT_RAG_K_BEFORE,
+    DEFAULT_RAG_STRATEGY,
+    DEFAULT_RAG_THRESHOLD,
+)
 from advent_core.profiles import messages as profile_messages
-from advent_core.rag import RagContext, RetrieveFn, build_rag_prompt
+from advent_core.rag import RagContext, RagSettings, RetrieveFn, build_rag_prompt
 from advent_core.task_state import TaskState, task_messages
 from advent_core.telemetry import CallResult
 from advent_core.tokens import TokenCounter, reconcile
@@ -575,6 +580,18 @@ class Agent:
     def rag_k(self) -> int:
         value = self.config.params.rag_k
         return DEFAULT_RAG_K if value is None else value
+
+    @property
+    def rag_settings(self) -> RagSettings:
+        p = self.config.params
+        return RagSettings(
+            strategy=self.rag_strategy,
+            k=self.rag_k,
+            k_before=DEFAULT_RAG_K_BEFORE if p.rag_k_before is None else p.rag_k_before,
+            rewrite=bool(p.rag_rewrite),
+            rerank=bool(p.rag_rerank),
+            threshold=DEFAULT_RAG_THRESHOLD if p.rag_threshold is None else p.rag_threshold,
+        )
 
     # --- предупреждения наверх -------------------------------------------
 
@@ -1641,8 +1658,12 @@ class Agent:
             if self._retrieve is None:
                 self._warn("rag включён, но индекс не подключён — ход идёт без RAG", once=True)
             else:
-                rag_ctx = self._retrieve(user_input, self.rag_strategy, self.rag_k)
-                request_input = build_rag_prompt(user_input, rag_ctx.hits)
+                rag_ctx = self._retrieve(user_input, self.rag_settings)
+                for warning in rag_ctx.warnings:
+                    self._warn(warning)
+                request_input = build_rag_prompt(
+                    user_input, rag_ctx.hits, filtered_out=(rag_ctx.passed == 0)
+                )
 
         # Assessment is deliberately the first possible model call while
         # rules are active.  Compaction/facts/memory must not spend tokens or

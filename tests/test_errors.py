@@ -103,3 +103,16 @@ def test_mcp_error_has_exit_code_8_and_keeps_message_and_hint():
     assert error.message == "нет сервера"
     assert error.hint == "проверьте --server"
     assert isinstance(error, AdventError)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        httpx.ReadError("boom"),
+        httpx.ConnectError("boom"),
+        RuntimeError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"),
+    ],
+)
+def test_transient_connection_drops_map_to_network_exit_code_6(exc):
+    assert translate(exc).exit_code == 6

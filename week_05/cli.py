@@ -520,9 +520,10 @@ def show_chunk(
         )
 
 
-# Day 22 commands (`ask`, `eval`) live in their own module.
+# Day 22-23 commands (`ask`, `eval`, `stages`) live in their own module.
 rag_cli.register(app)
 rag_cli.register_eval(app)
+rag_cli.register_stages(app)
 
 
 def main() -> None:

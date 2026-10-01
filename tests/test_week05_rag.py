@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from advent_core import config as config_module
 from advent_core.errors import AdventError
-from advent_core.rag import RagContext, RagHit
+from advent_core.rag import RagContext, RagHit, RagSettings
+from advent_core.telemetry import CallResult, Usage
 from week_05 import rag
 from week_05.chunking import Chunk
 
@@ -60,12 +62,23 @@ class _Ctx:
         return False
 
 
+def _sr(text, n=1, score=0.5, source="CLAUDE.md"):
+    return SimpleNamespace(chunk=_chunk(text, source=source, n=n), score=score)
+
+
 @pytest.fixture
 def seams(monkeypatch):
-    calls = {"embed": [], "search": []}
+    calls = {"embed": [], "search": [], "chat": [], "journal": []}
+    calls["rewrite_text"] = "  **окно контекста context window**\nвторая строка"
+    calls["rerank_text"] = json.dumps({"scores": []})
+    calls["search_fn"] = lambda row, k: [
+        SimpleNamespace(chunk=_chunk("первый", n=1), score=0.9),
+        SimpleNamespace(chunk=_chunk("второй", source="week_02/README.md", n=2), score=0.4),
+    ]
 
+    monkeypatch.setattr(config_module, "load_env", lambda: None)
+    monkeypatch.setenv("MISTRAL_API_KEY", "k" * 32)
     monkeypatch.setattr(rag.index_module, "load_runs", lambda db_path: {"structure": _run()})
-    monkeypatch.setattr(rag.Config, "resolve", classmethod(lambda cls: object()))
     monkeypatch.setattr(rag, "mistral_client", lambda config: _Ctx())
 
     def fake_embed(client, model, texts, *, week, day, journal_extra):
@@ -78,21 +91,40 @@ def seams(monkeypatch):
                 "journal_extra": journal_extra,
             }
         )
-        return SimpleNamespace(
-            vectors=np.ones((1, 4), dtype=np.float32),
-            prompt_tokens=7,
-        )
+        vectors = np.stack([np.full(4, float(i + 1), dtype=np.float32) for i in range(len(texts))])
+        return SimpleNamespace(vectors=vectors, prompt_tokens=7)
 
     monkeypatch.setattr(rag, "embed_texts", fake_embed)
 
     def fake_search(db_path, strategy, vec, k):
         calls["search"].append({"strategy": strategy, "k": k})
-        return [
-            SimpleNamespace(chunk=_chunk("первый", n=1), score=0.9),
-            SimpleNamespace(chunk=_chunk("второй", source="week_02/README.md", n=2), score=0.4),
-        ]
+        return calls["search_fn"](int(vec[0]), k)
 
     monkeypatch.setattr(rag.index_module, "search", fake_search)
+
+    def fake_complete(config, messages, capabilities=None, **kwargs):
+        calls["chat"].append({"config": config, "messages": list(messages)})
+        sent = list(messages)
+        if config.params.format == "json":  # chat._payload adds this system message
+            sent = [{"role": "system", "content": "JSON-ИНСТРУКЦИЯ"}, *sent]
+        is_rewrite = messages[-1]["content"].startswith("Перепиши")
+        text = calls["rewrite_text"] if is_rewrite else calls["rerank_text"]
+        return CallResult(
+            text=text,
+            usage=Usage(prompt_tokens=1000 if not is_rewrite else 50, completion_tokens=20),
+            latency_ms=10,
+            stream=False,
+            sent_messages=sent,
+        )
+
+    monkeypatch.setattr(rag.chat_core, "complete", fake_complete)
+    monkeypatch.setattr(
+        rag,
+        "log_call",
+        lambda result, messages, *, week, day, extra=None: calls["journal"].append(
+            {"result": result, "week": week, "day": day, "extra": extra, "messages": messages}
+        ),
+    )
 
     return calls
 
@@ -108,6 +140,18 @@ def test_check_index_returns_run(seams):
     assert run.model == "mistral-embed"
 
 
+def _settings(
+    strategy: str = "structure",
+    k: int = 5,
+    *,
+    rewrite: bool = False,
+    rerank: bool = False,
+    k_before: int = 20,
+    threshold: float = 5.0,
+) -> RagSettings:
+    return RagSettings(strategy, k, k_before, rewrite, rerank, threshold)
+
+
 def test_make_retriever_does_no_io(monkeypatch):
     def boom(*_args, **_kwargs):
         raise AssertionError
@@ -117,7 +161,7 @@ def test_make_retriever_does_no_io(monkeypatch):
 
 
 def test_retriever_builds_context(seams):
-    ctx = rag.make_retriever()("Сколько?", "structure", 5)
+    ctx = rag.make_retriever()("Сколько?", _settings("structure", 5))
 
     assert isinstance(ctx, RagContext)
     assert ctx.strategy == "structure"
@@ -133,7 +177,7 @@ def test_retriever_builds_context(seams):
 
 
 def test_retriever_embeds_with_index_model_and_day_22(seams):
-    rag.make_retriever()("Сколько?", "structure", 5)
+    rag.make_retriever()("Сколько?", _settings("structure", 5))
 
     assert seams["embed"] == [
         {
@@ -157,7 +201,7 @@ def test_retriever_counts_dropped_hits(seams, monkeypatch):
         ],
     )
 
-    ctx = rag.make_retriever()("q", "structure", 5)
+    ctx = rag.make_retriever()("q", _settings("structure", 5))
 
     assert len(ctx.hits) == 1
     assert ctx.dropped == 1
@@ -165,7 +209,7 @@ def test_retriever_counts_dropped_hits(seams, monkeypatch):
 
 def test_retriever_refuses_unknown_strategy_before_embedding(seams):
     with pytest.raises(AdventError):
-        rag.make_retriever()("q", "fixed", 5)
+        rag.make_retriever()("q", _settings("fixed", 5))
 
     assert seams["embed"] == []
 
@@ -342,3 +386,291 @@ def test_shipped_question_set_is_supported_by_the_real_index():
 
     assert broken == []
     assert len(valid) == 10
+
+
+# --- Day 23: rewrite, RRF, rerank, threshold -------------------------------------------
+
+
+def _scores(*pairs):
+    return json.dumps({"scores": [{"id": i, "score": s} for i, s in pairs]})
+
+
+def _by_vector(first, second=None):
+    """search_fn: vector row 1 (the original question) gets `first`, row 2 gets `second`."""
+
+    def search(row, k):
+        return list(first if row == 1 else (second if second is not None else first))
+
+    return search
+
+
+def test_plain_settings_search_k_and_never_call_chat(seams):
+    ctx = rag.make_retriever()("Сколько?", _settings(k=3))
+
+    assert seams["search"] == [{"strategy": "structure", "k": 3}]
+    assert seams["chat"] == []
+    assert seams["journal"] == []
+    assert ctx.trace is None
+    assert ctx.rewritten is None
+    assert ctx.candidates == 0
+    assert ctx.passed is None
+    assert ctx.aux_prompt_tokens is None
+    assert ctx.warnings == ()
+
+
+def test_rewrite_only_embeds_both_in_one_call_and_searches_k_before(seams):
+    seams["search_fn"] = _by_vector(
+        [_sr("a", 1, 0.9), _sr("b", 2, 0.8)], [_sr("b", 2, 0.7), _sr("c", 3, 0.6)]
+    )
+    ctx = rag.make_retriever()("Сколько?", _settings(k=2, rewrite=True, k_before=7))
+
+    assert [e["texts"] for e in seams["embed"]] == [["Сколько?", "окно контекста context window"]]
+    assert seams["search"] == [{"strategy": "structure", "k": 7}] * 2
+    assert len(seams["chat"]) == 1
+    assert ctx.rewritten == "окно контекста context window"
+    assert ctx.candidates == 3
+    assert ctx.passed is None
+    assert ctx.threshold is None
+    # RRF: b is rank 2 + rank 1 -> first; a (1/61) beats c (1/62)
+    assert [h.chunk_id for h in ctx.hits] == [
+        "structure:CLAUDE.md#2",
+        "structure:CLAUDE.md#1",
+    ]
+    assert ctx.trace is not None
+    assert [h.chunk_id for h in ctx.trace.original] == [
+        "structure:CLAUDE.md#1",
+        "structure:CLAUDE.md#2",
+    ]
+    assert len(ctx.trace.fused) == 3
+    assert ctx.trace.reranked == ()
+
+
+def test_duplicate_chunk_keeps_the_original_cosine_and_sums_rrf(seams):
+    seams["search_fn"] = _by_vector([_sr("b", 2, 0.81)], [_sr("b", 2, 0.55)])
+    ctx = rag.make_retriever()("q", _settings(rewrite=True))
+
+    (hit,) = ctx.hits
+    assert hit.score == 0.81
+    assert hit.fused == pytest.approx(2 / 61)
+
+
+def test_rerank_only_searches_k_before_once_and_filters_by_threshold(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1, 0.9), _sr("b", 2, 0.8), _sr("c", 3, 0.7)])
+    seams["rerank_text"] = _scores((1, 3), (2, 9), (3, 5))
+    ctx = rag.make_retriever()("q", _settings(k=5, rerank=True, k_before=12, threshold=5))
+
+    assert [e["texts"] for e in seams["embed"]] == [["q"]]
+    assert seams["search"] == [{"strategy": "structure", "k": 12}]
+    assert len(seams["chat"]) == 1
+    assert [(h.chunk_id[-1], h.rerank, h.rank) for h in ctx.hits] == [("2", 9.0, 2), ("3", 5.0, 3)]
+    assert ctx.candidates == 3
+    assert ctx.passed == 2
+    assert ctx.threshold == 5.0
+    assert ctx.rewritten is None
+    assert [h.rerank for h in ctx.trace.reranked] == [9.0, 5.0, 3.0]
+    assert [h.chunk_id[-1] for h in ctx.trace.fused] == ["1", "2", "3"]
+
+
+def test_top_k_is_applied_after_the_threshold(seams):
+    seams["search_fn"] = _by_vector([_sr(c, i, 0.9) for i, c in enumerate("abcd", 1)])
+    seams["rerank_text"] = _scores((1, 9), (2, 8), (3, 7), (4, 6))
+    ctx = rag.make_retriever()("q", _settings(k=2, rerank=True, threshold=0))
+
+    assert [h.chunk_id[-1] for h in ctx.hits] == ["1", "2"]
+    assert ctx.passed == 4
+
+
+def test_rewrite_and_rerank_send_the_whole_union_to_the_reranker(seams):
+    seams["search_fn"] = _by_vector(
+        [_sr("alpha", 1), _sr("beta", 2)], [_sr("beta", 2), _sr("gamma", 3)]
+    )
+    seams["rerank_text"] = _scores((1, 9), (2, 8), (3, 7))
+    ctx = rag.make_retriever()("q", _settings(rewrite=True, rerank=True))
+
+    assert len(seams["chat"]) == 2
+    prompt = seams["chat"][1]["messages"][-1]["content"]
+    assert "[3] CLAUDE.md" in prompt and "[4]" not in prompt
+    for text in ("alpha", "beta", "gamma"):
+        assert text in prompt
+    assert prompt.rstrip().endswith("Вопрос: q")
+    assert ctx.candidates == 3
+    assert ctx.passed == 3
+    assert [e["texts"] for e in seams["embed"]] == [["q", "окно контекста context window"]]
+
+
+def test_rerank_prompt_carries_the_chunk_whole(seams):
+    long_text = "x" * 5000 + "ФАКТ-В-КОНЦЕ"
+    seams["search_fn"] = _by_vector([_sr(long_text, 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("q", _settings(rerank=True))
+
+    assert "ФАКТ-В-КОНЦЕ" in seams["chat"][0]["messages"][-1]["content"]
+
+
+def test_aux_calls_are_isolated_from_env_params(seams, monkeypatch):
+    from advent_core import chat as chat_core
+
+    monkeypatch.setenv("MISTRAL_MAX_TOKENS", "5")
+    monkeypatch.setenv("MISTRAL_STOP", "}")
+    monkeypatch.setenv("MISTRAL_TOP_P", "0.1")
+    monkeypatch.setenv("MISTRAL_TEMPERATURE", "1.4")
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("q", _settings(rewrite=True, rerank=True))
+
+    rewrite_cfg, rerank_cfg = (c["config"] for c in seams["chat"])
+    rewrite_payload = chat_core._payload(rewrite_cfg, [{"role": "user", "content": "x"}])[0]
+    rerank_payload = chat_core._payload(rerank_cfg, [{"role": "user", "content": "x"}])[0]
+    assert rewrite_payload["model"] == rag.RAG_AUX_MODEL == "ministral-14b-latest"
+    assert rewrite_payload["temperature"] == 0
+    assert rewrite_payload["max_tokens"] == 200
+    assert rerank_payload["temperature"] == 0
+    assert rerank_payload["max_tokens"] == 2000
+    assert rerank_payload["response_format"] == {"type": "json_object"}
+    assert "response_format" not in rewrite_payload
+    for payload in (rewrite_payload, rerank_payload):
+        assert not {"stop", "top_p", "random_seed", "reasoning_effort"} & payload.keys()
+    assert rewrite_cfg.stream is False and rerank_cfg.stream is False
+
+
+def test_rerank_prompt_asks_for_json_in_words_not_only_in_the_format_flag(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("q", _settings(rerank=True))
+
+    first = seams["chat"][0]["messages"][-1]["content"]
+    assert 'Верни JSON {"scores": [{"id": <номер>, "score": <0-10>}, ...]}' in first
+    assert "для всех 1 фрагментов без пропусков." in first
+
+
+def test_each_aux_call_is_journaled_as_day_23(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("q", _settings(rewrite=True, rerank=True))
+
+    rows = seams["journal"]
+    assert [(r["week"], r["day"], r["extra"]) for r in rows] == [
+        (5, 23, {"command": "rag_rewrite"}),
+        (5, 23, {"command": "rag_rerank"}),
+    ]
+
+
+def test_rerank_journal_records_the_json_system_instruction_actually_sent(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("q", _settings(rerank=True))
+
+    (row,) = seams["journal"]
+    assert row["messages"][0] == {"role": "system", "content": "JSON-ИНСТРУКЦИЯ"}
+
+
+def test_validate_questions_fact_is_not_supported_inside_a_longer_number():
+    chunks = [_chunk("лимит 11.5 токенов")]
+    valid, broken = rag.validate_questions([_question(expect=(("1.5",),))], chunks)
+    assert valid == []
+    assert broken[0][1] == "факт 1.5 не найден в источниках"
+    ok, _ = rag.validate_questions([_question(expect=(("11.5",),))], chunks)
+    assert len(ok) == 1
+
+
+def test_rerank_is_journaled_even_when_parsing_fails(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = "это не JSON"
+
+    with pytest.raises(AdventError):
+        rag.make_retriever()("q", _settings(rerank=True))
+
+    (row,) = seams["journal"]
+    assert row["extra"] == {"command": "rag_rerank"}
+    assert row["result"].text == "это не JSON"
+    assert row["day"] == 23
+
+
+def test_unrated_chunks_never_pass_even_at_threshold_zero_and_warn(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1), _sr("b", 2), _sr("c", 3)])
+    seams["rerank_text"] = _scores((2, 0), (99, 9))
+    ctx = rag.make_retriever()("q", _settings(rerank=True, threshold=0))
+
+    assert [h.chunk_id[-1] for h in ctx.hits] == ["2"]
+    assert ctx.passed == 1
+    assert ctx.rerank_unrated == 2
+    assert ctx.warnings == ("reranker не оценил 2 из 3 чанков",)
+    assert [h.rerank for h in ctx.trace.reranked] == [0.0, None, None]
+
+
+def test_everything_below_the_threshold_gives_passed_zero(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1), _sr("b", 2)])
+    seams["rerank_text"] = _scores((1, 2), (2, 1))
+    ctx = rag.make_retriever()("q", _settings(rerank=True))
+
+    assert ctx.hits == ()
+    assert ctx.passed == 0
+    assert ctx.candidates == 2
+
+
+def test_empty_rewrite_warns_and_falls_back_to_the_original_question(seams):
+    seams["rewrite_text"] = "  \n ** ** \n"
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    ctx = rag.make_retriever()("q", _settings(rewrite=True))
+
+    assert ctx.rewritten is None
+    assert [e["texts"] for e in seams["embed"]] == [["q"]]
+    assert seams["search"] == [{"strategy": "structure", "k": 20}]
+    assert len(ctx.warnings) == 1 and "rewrite" in ctx.warnings[0]
+    assert [h.chunk_id[-1] for h in ctx.hits] == ["1"]
+
+
+def test_aux_tokens_are_summed_over_both_calls(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    ctx = rag.make_retriever()("q", _settings(rewrite=True, rerank=True))
+
+    assert ctx.aux_prompt_tokens == 1050
+    assert ctx.aux_completion_tokens == 40
+    assert ctx.embed_tokens == 7
+
+
+def test_aux_tokens_are_unknown_when_usage_is_missing(seams, monkeypatch):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+
+    def no_usage(config, messages, capabilities=None, **kwargs):
+        return CallResult(text="запрос", usage=Usage(), latency_ms=1, stream=False)
+
+    monkeypatch.setattr(rag.chat_core, "complete", no_usage)
+    ctx = rag.make_retriever()("q", _settings(rewrite=True))
+
+    assert ctx.aux_prompt_tokens is None
+    assert ctx.aux_completion_tokens is None
+
+
+def test_context_cap_applies_after_rerank(seams):
+    seams["search_fn"] = _by_vector([_sr("a" * 20000, 1), _sr("b" * 20000, 2)])
+    seams["rerank_text"] = _scores((1, 9), (2, 8))
+    ctx = rag.make_retriever()("q", _settings(rerank=True))
+
+    assert len(ctx.hits) == 1
+    assert ctx.dropped == 1
+    assert ctx.passed == 2
+
+
+def test_relevant_chunk_ids_needs_source_and_every_fact():
+    q = _question(expect=(("262144",), ("w01d01",)), sources=("CLAUDE.md",))
+    both = _chunk("окно 262 144, тег w01d01", n=1)
+    one = _chunk("только 262144", n=2)
+    other_source = _chunk("окно 262144 и w01d01", source="README.md", n=3)
+
+    assert rag.relevant_chunk_ids(q, [both, one, other_source]) == {both.chunk_id}
+
+
+def test_relevant_chunk_ids_respects_number_boundaries():
+    q = _question(expect=(("1.5",),))
+    inside = _chunk("потолок 11.5 секунд", n=1)
+    exact = _chunk("потолок 1.5 секунды", n=2)
+
+    assert rag.relevant_chunk_ids(q, [inside, exact]) == {exact.chunk_id}
+
+
+def test_relevant_chunk_ids_is_empty_when_facts_are_spread_over_chunks():
+    q = _question(expect=(("альфа",), ("бета",)))
+
+    assert rag.relevant_chunk_ids(q, [_chunk("альфа", n=1), _chunk("бета", n=2)]) == frozenset()

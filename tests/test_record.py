@@ -1568,3 +1568,47 @@ def test_day_22_rehearsal_is_the_week_default():
     assert len(steps) == 1
     assert steps[0].module == "week_05.cli"
     assert steps[0].expect_failure is True
+
+
+# --------------------------------------------------------------------------
+# Week 05, Day 23: rerank + threshold + query rewrite.
+# --------------------------------------------------------------------------
+def test_day_23_steps_pin_modules_args_and_timeouts():
+    steps = record_mod.demo_steps(5, 23)
+    assert [s.module for s in steps] == [
+        "week_05.cli",
+        "week_05.cli",
+        "week_05.cli",
+        "week_02.cli",
+        "week_05.cli",
+    ]
+    assert steps[0].args == ["stages"]
+    assert steps[1].args == [
+        "ask",
+        "Каким git-тегом фиксируется состояние сданного дня в этом проекте? Приведи формат тега.",
+        "--pair",
+        "plain,full",
+    ]
+    assert steps[2].args == ["ask", "Как приготовить борщ?", "--pair", "plain,full"]
+    assert steps[3].args == ["--session", "w05d23-demo", "--max-tokens", "400"]
+    assert steps[4].args == ["eval", "--pair", "plain,full", "--detail", "3"]
+    assert [s.timeout for s in steps] == [300, 180, 180, 180, 600]
+
+
+def test_day_23_agent_step_switches_full_on_and_off_again():
+    lines = record_mod.demo_steps(5, 23)[3].stdin_lines
+    assert lines[:3] == ["/new", "/rag full", "/rag"]
+    assert lines[-2:] == ["/rag off", "/exit"]
+    assert len(lines) == 6
+    assert "temperature" in lines[3]
+
+
+def test_day_23_titles_are_short_and_numbered():
+    steps = record_mod.demo_steps(5, 23)
+    assert [s.title[:2] for s in steps] == ["1.", "2.", "3.", "4.", "5."]
+    assert all(len(s.title) < 100 for s in steps)
+
+
+def test_day_23_is_not_day_22():
+    assert record_mod.demo_steps(5, 23)[0].args == ["stages"]
+    assert record_mod.demo_steps(5, 22)[0].args[0] == "ask"

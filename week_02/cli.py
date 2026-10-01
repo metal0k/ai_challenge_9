@@ -19,12 +19,14 @@ advent_core/session.py, счёт токенов — в advent_core/tokens.py. П
 from __future__ import annotations
 
 import copy
+import math
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import typer
+from rich.cells import cell_len
 from rich.markup import escape as rich_escape
 from rich.table import Table
 
@@ -803,6 +805,14 @@ class AgentShell:
             "rag_strategy": lambda v: isinstance(v, str),
             "rag_k": lambda v: isinstance(v, int) and not isinstance(v, bool),
             "rag": lambda v: isinstance(v, bool),
+            "rag_rewrite": lambda v: isinstance(v, bool),
+            "rag_rerank": lambda v: isinstance(v, bool),
+            "rag_k_before": lambda v: isinstance(v, int) and not isinstance(v, bool),
+            "rag_threshold": lambda v: (
+                isinstance(v, int | float)
+                and not isinstance(v, bool)
+                and (abs(v) < 10**6 if isinstance(v, int) else math.isfinite(v))
+            ),
         }
         for name, is_valid in checks.items():
             if (check_explicit and name in self.explicit) or name not in session.state:
@@ -1339,6 +1349,9 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
 
     if reply.rag is not None:
         console.note(_rag_note(reply.rag))
+        rewrite_line = _rag_rewrite_note(reply.rag)
+        if rewrite_line:
+            console.note(rewrite_line)
     console.footer(reply.result, completion_estimate=_completion_estimate(shell, reply))
     # reconcile() — чистая функция: калибровку счётчика уже сделал агент, здесь
     # только показ. Сверять надо с тем, что РЕАЛЬНО ушло в API (sent_messages):
@@ -1714,6 +1727,12 @@ def _save_state(shell: AgentShell) -> None:
     shell.session.state["rag"] = bool(shell.agent.rag_enabled)
     shell.session.state["rag_strategy"] = shell.agent.rag_strategy
     shell.session.state["rag_k"] = shell.agent.rag_k
+    # Day 23, additive (no SESSION_VERSION bump): older files lack these keys.
+    rag_settings = shell.agent.rag_settings
+    shell.session.state["rag_rewrite"] = rag_settings.rewrite
+    shell.session.state["rag_rerank"] = rag_settings.rerank
+    shell.session.state["rag_k_before"] = rag_settings.k_before
+    shell.session.state["rag_threshold"] = rag_settings.threshold
     shell.session.state["facts"] = shell.facts
     shell.session.state["facts_pinned"] = list(shell.facts_pinned)
     shell.session.state["facts_upto"] = shell.facts_upto
@@ -2308,7 +2327,15 @@ def _cmd_strategy(shell: AgentShell, args: list[str]) -> bool:
 # RAG (day 22)
 # --------------------------------------------------------------------------
 
-RAG_PARAMS = ("rag", "rag_strategy", "rag_k")
+RAG_PARAMS = (
+    "rag",
+    "rag_strategy",
+    "rag_k",
+    "rag_rewrite",
+    "rag_rerank",
+    "rag_k_before",
+    "rag_threshold",
+)
 
 
 def _rag_retriever():
@@ -2334,9 +2361,24 @@ def _with_hint(error: AdventError) -> str:
     return f"{error.message} {error.hint}" if error.hint else error.message
 
 
-@command("/rag", "RAG по индексу репозитория: без значения — состояние", usage="/rag on | off")
+@command(
+    "/rag",
+    "RAG по индексу репозитория: без значения — состояние; plain — косинус top-k, "
+    "full — rewrite + rerank + порог",
+    usage="/rag on | off | plain | full",
+)
 def _cmd_rag(shell: AgentShell, args: list[str]) -> bool:
     """Shorthand for `/set rag`, like /strategy: one enable path, one check."""
+    if args and args[0].lower() in ("plain", "full") and len(args) == 1:
+        full = args[0].lower() == "full"
+        # Enable first (the one index check): a refused enable must not leave
+        # stage flags switched behind a rag that is off.
+        _cmd_set(shell, ["rag", "on"])
+        if not shell.agent.rag_enabled:
+            return False
+        for name in ("rag_rewrite", "rag_rerank"):
+            _cmd_set(shell, [name, "on" if full else "off"])
+        return False
     if args:
         return _cmd_set(shell, ["rag", *args])
     if not shell.agent.rag_enabled:
@@ -2348,11 +2390,27 @@ def _cmd_rag(shell: AgentShell, args: list[str]) -> bool:
     except AdventError as error:
         console.note(f"rag: on · индекс недоступен ({error.message})")
         return False
+    settings = shell.agent.rag_settings
+    if settings.rewrite or settings.rerank:
+        stages = [
+            f"k {settings.k_before}→{settings.k}",
+            "rewrite on" if settings.rewrite else "rewrite off",
+        ]
+        if settings.rerank:
+            stages.append(f"rerank on (порог {_fmt_threshold(settings.threshold)})")
+        else:
+            stages.append("rerank off")
+        shown = " · ".join(stages)
+    else:
+        shown = f"k={settings.k}"
     console.note(
-        f"rag: on · {strategy} · k={shell.agent.rag_k} · индекс {info.corpus_rev[:12]} "
-        f"({info.n_chunks} чанков)"
+        f"rag: on · {strategy} · {shown} · индекс {info.corpus_rev[:12]} ({info.n_chunks} чанков)"
     )
     return False
+
+
+def _fmt_threshold(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
 
 
 def _plural(n: int, one: str, few: str, many: str) -> str:
@@ -2365,8 +2423,25 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
 
 def _rag_note(ctx: RagContext) -> str:
     """One stderr line per turn: what retrieval added to the request."""
+    # Diagnostics first: an empty result is exactly where "31 -> 0" matters.
+    staged = ctx.trace is not None or ctx.passed is not None
+    diag = ""
+    if staged:
+        steps = [f"кандидатов {ctx.candidates}"]
+        if ctx.passed is not None:
+            steps.append(f"порог {ctx.passed}")
+        if ctx.hits:
+            steps.append(f"в контексте {len(ctx.hits)}")
+        diag = " → ".join(steps)
+        if ctx.aux_prompt_tokens is not None and ctx.aux_completion_tokens is not None:
+            diag += (
+                f" · aux {_thousands(ctx.aux_prompt_tokens)}+"
+                f"{_thousands(ctx.aux_completion_tokens)} ток."
+            )
     if not ctx.hits:
-        return f"rag: чанков не найдено ({ctx.strategy})"
+        if not staged:
+            return f"rag: чанков не найдено ({ctx.strategy})"
+        return f"rag: в контексте 0 ({ctx.strategy}) · {diag}"
     counts: dict[str, int] = {}
     for hit in ctx.hits:
         counts[hit.source] = counts.get(hit.source, 0) + 1
@@ -2379,7 +2454,32 @@ def _rag_note(ctx: RagContext) -> str:
     )
     if ctx.dropped > 0:
         line += f" · не вошло: {ctx.dropped}"
+    if diag:
+        line += f" · {diag}"
     return line
+
+
+def _thousands(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def _rag_rewrite_note(ctx: RagContext, width: int | None = None) -> str | None:
+    """`rag rewrite: <query>` cut to the console width in cells, None without a rewrite."""
+    if not ctx.rewritten:
+        return None
+    if width is None:
+        width = console.err.width
+    head = "rag rewrite: "
+    room = max(10, width - cell_len(head) - 1)
+    text = ctx.rewritten
+    if cell_len(text) > room:
+        out = ""
+        for ch in text:
+            if cell_len(out + ch) > room - 1:
+                break
+            out += ch
+        text = out + "…"
+    return head + rich_escape(text)
 
 
 # --------------------------------------------------------------------------

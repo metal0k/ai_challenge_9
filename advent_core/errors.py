@@ -173,7 +173,20 @@ def translate(exc: Exception) -> AdventError:
         )
 
     name = type(exc).__name__.lower()
-    if any(marker in name for marker in ("timeout", "connect", "network", "ssl")):
+    # RemoteProtocolError ("Server disconnected"), ReadError/WriteError and SSL EOF are drops.
+    low = detail.lower()
+    if any(
+        marker in name
+        for marker in (
+            "timeout",
+            "connect",
+            "network",
+            "ssl",
+            "remoteprotocol",
+            "readerror",
+            "writeerror",
+        )
+    ) or any(m in low for m in ("server disconnected", "unexpected_eof", "connection reset")):
         return NetworkError(
             "Нет связи с api.mistral.ai.",
             hint="Проверь интернет, VPN и прокси.",

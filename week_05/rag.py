@@ -2,29 +2,48 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from advent_core import chat as chat_core
+from advent_core.chat import Message
 from advent_core.client import mistral_client
 from advent_core.config import Config
 from advent_core.embeddings import embed_texts
 from advent_core.errors import AdventError
+from advent_core.journal import log_call
+from advent_core.params import GenerationParams
 from advent_core.rag import (
+    RAG_REWRITE_PROMPT,
     RagContext,
     RagHit,
+    RagSettings,
+    RetrievalTrace,
     RetrieveFn,
+    apply_rerank,
+    build_rerank_prompt,
     check_facts,
     cited_sources,
+    clean_rewrite,
     fit_hits,
     normalize,
+    order_by_rerank,
+    parse_rerank,
+    rrf_merge,
 )
+from advent_core.telemetry import CallResult
 from week_05 import index as index_module
 from week_05.chunking import Chunk
 
 RAG_WEEK = 5
 RAG_DAY = 22
+RAG_AUX_DAY = 23
+RAG_AUX_MODEL = "ministral-14b-latest"
+REWRITE_MAX_TOKENS = 200
+RERANK_MAX_TOKENS = 2000
 
 
 def check_index(db_path: Path | None, strategy: str) -> index_module.RunInfo:
@@ -38,6 +57,53 @@ def check_index(db_path: Path | None, strategy: str) -> index_module.RunInfo:
     return runs[strategy]
 
 
+def _aux_call(prompt: str, *, command: str, max_tokens: int, json_mode: bool) -> CallResult:
+    """One isolated helper call: nothing from .env params, no system persona.
+
+    Journaled here, before the caller parses the reply, so a paid call is on record
+    even when parsing then fails.
+    """
+    config = dataclasses.replace(
+        Config.resolve(model=RAG_AUX_MODEL, stream=False),
+        params=GenerationParams(
+            temperature=0, max_tokens=max_tokens, format="json" if json_mode else None
+        ),
+    )
+    messages: list[Message] = [{"role": "user", "content": prompt}]
+    result = chat_core.complete(config, messages)
+    log_call(
+        result,
+        list(result.sent_messages or messages),
+        week=RAG_WEEK,
+        day=RAG_AUX_DAY,
+        extra={"command": command},
+    )
+    return result
+
+
+def _to_hits(found: Sequence[object]) -> tuple[RagHit, ...]:
+    return tuple(
+        RagHit(
+            chunk_id=h.chunk.chunk_id,
+            source=h.chunk.source,
+            section=h.chunk.section,
+            score=h.score,
+            text=h.chunk.text,
+            rank=position,
+        )
+        for position, h in enumerate(found, start=1)
+    )
+
+
+def _add_tokens(total: int | None, value: int | None, first: bool) -> int | None:
+    """Sum token counts; one unknown value makes the whole sum unknown."""
+    if first:
+        return value
+    if total is None or value is None:
+        return None
+    return total + value
+
+
 def make_retriever(
     db_path: Path | None = None,
     *,
@@ -46,39 +112,89 @@ def make_retriever(
 ) -> RetrieveFn:
     """Create a retriever bound to a database path and journal coordinates."""
 
-    def retrieve(question: str, strategy: str, k: int) -> RagContext:
-        """Retrieve the top-k chunks for a question using the configured strategy."""
+    def retrieve(question: str, settings: RagSettings) -> RagContext:
+        """Rewrite -> embed -> search -> RRF -> rerank -> threshold -> top-k."""
+        strategy, k = settings.strategy, settings.k
+        staged = settings.rewrite or settings.rerank
+        n = settings.k_before if staged else k
         run = check_index(db_path, strategy)
+        warnings: list[str] = []
+        aux_calls: list[CallResult] = []
+
+        rewritten: str | None = None
+        if settings.rewrite:
+            result = _aux_call(
+                RAG_REWRITE_PROMPT.replace("{question}", question),
+                command="rag_rewrite",
+                max_tokens=REWRITE_MAX_TOKENS,
+                json_mode=False,
+            )
+            aux_calls.append(result)
+            rewritten = clean_rewrite(result.text)
+            if rewritten is None:
+                warnings.append("rewrite вернул пустую строку — поиск только по исходному вопросу")
+
+        texts = [question] if rewritten is None else [question, rewritten]
         config = Config.resolve()
         with mistral_client(config) as client:
-            result = embed_texts(
+            embedded = embed_texts(
                 client,
                 run.model,
-                [question],
+                texts,
                 week=week,
                 day=day,
                 journal_extra={"strategy": strategy, "command": "rag"},
             )
-        found = index_module.search(db_path, strategy, result.vectors[0], k=k)
-        raw = tuple(
-            RagHit(
-                chunk_id=h.chunk.chunk_id,
-                source=h.chunk.source,
-                section=h.chunk.section,
-                score=h.score,
-                text=h.chunk.text,
+        lists = [
+            _to_hits(index_module.search(db_path, strategy, embedded.vectors[i], k=n))
+            for i in range(len(texts))
+        ]
+        original = lists[0]
+        fused = rrf_merge(lists) if rewritten is not None else original
+
+        reranked: tuple[RagHit, ...] = ()
+        passed: int | None = None
+        unrated = 0
+        if settings.rerank:
+            result = _aux_call(
+                build_rerank_prompt(question, fused),
+                command="rag_rerank",
+                max_tokens=RERANK_MAX_TOKENS,
+                json_mode=True,
             )
-            for h in found
-        )
+            aux_calls.append(result)
+            scores = parse_rerank(result.text, len(fused))
+            unrated = len(fused) - len(scores)
+            if unrated:
+                warnings.append(f"reranker не оценил {unrated} из {len(fused)} чанков")
+            reranked = order_by_rerank(fused, scores)
+            raw, passed = apply_rerank(fused, scores, settings.threshold, k)
+        else:
+            raw = fused[:k]
+
         hits = fit_hits(raw)
+        aux_prompt: int | None = None
+        aux_completion: int | None = None
+        for i, call in enumerate(aux_calls):
+            aux_prompt = _add_tokens(aux_prompt, call.usage.prompt_tokens, i == 0)
+            aux_completion = _add_tokens(aux_completion, call.usage.completion_tokens, i == 0)
         return RagContext(
             hits=hits,
             strategy=strategy,
             k=k,
             embed_model=run.model,
-            embed_tokens=result.prompt_tokens,
+            embed_tokens=embedded.prompt_tokens,
             corpus_rev=run.corpus_rev,
             dropped=len(raw) - len(hits),
+            rewritten=rewritten,
+            candidates=len(fused) if staged else 0,
+            passed=passed,
+            threshold=settings.threshold if settings.rerank else None,
+            rerank_unrated=unrated,
+            aux_prompt_tokens=aux_prompt,
+            aux_completion_tokens=aux_completion,
+            warnings=tuple(warnings),
+            trace=RetrievalTrace(original, fused, reranked) if staged else None,
         )
 
     return retrieve
@@ -196,9 +312,7 @@ def validate_questions(
         if reason is None:
             for fact in question.expect:
                 supported = any(
-                    normalize(alt) in text_by_source[source]
-                    for source in question.sources
-                    for alt in fact
+                    check_facts(text_by_source[source], [fact])[0] for source in question.sources
                 )
                 if not supported:
                     reason = f"факт {' | '.join(fact)} не найден в источниках"
@@ -247,4 +361,11 @@ def score_answer(question: ControlQuestion, answer: str, ctx: RagContext | None)
         facts=facts,
         sources_retrieved=retrieved,
         sources_cited=cited,
+    )
+
+
+def relevant_chunk_ids(q: ControlQuestion, chunks: Sequence[Chunk]) -> frozenset[str]:
+    """Chunks from the question's sources that hold every expected fact."""
+    return frozenset(
+        c.chunk_id for c in chunks if c.source in q.sources and all(check_facts(c.text, q.expect))
     )

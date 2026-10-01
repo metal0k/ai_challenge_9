@@ -2284,7 +2284,7 @@ def test_round_limit_other_than_three_stops_the_loop_and_names_the_limit():
 # --- Day 22: RAG wiring ------------------------------------------------------
 
 from advent_core.params import CONTEXT_STRATEGY_CHOICES  # noqa: E402
-from advent_core.rag import RagContext, RagHit  # noqa: E402
+from advent_core.rag import RAG_EMPTY_INSTRUCTION, RagContext, RagHit, RagSettings  # noqa: E402
 
 CHUNK_TEXT = "Фрагмент индекса: порог compaction равен 4242."
 
@@ -2297,13 +2297,15 @@ def _rag_ctx(strategy: str = "structure", k: int = 5) -> RagContext:
 class _Retriever:
     def __init__(self, log: list | None = None) -> None:
         self.calls: list[tuple[str, str, int]] = []
+        self.settings: list[RagSettings] = []
         self.log = log
 
-    def __call__(self, question: str, strategy: str, k: int) -> RagContext:
-        self.calls.append((question, strategy, k))
+    def __call__(self, question: str, settings: RagSettings) -> RagContext:
+        self.calls.append((question, settings.strategy, settings.k))
+        self.settings.append(settings)
         if self.log is not None:
             self.log.append("retrieve")
-        return _rag_ctx(strategy, k)
+        return _rag_ctx(settings.strategy, settings.k)
 
 
 def _rag_agent(retriever=None, **params):
@@ -2334,6 +2336,51 @@ def test_rag_strategy_and_k_reach_the_retriever():
     agent, _ = _rag_agent(retriever, rag_strategy="fixed", rag_k=3)
     agent.ask("q", [])
     assert retriever.calls == [("q", "fixed", 3)]
+
+
+def test_retriever_gets_rag_settings_from_params():
+    retriever = _Retriever()
+    agent, _ = _rag_agent(
+        retriever,
+        rag_strategy="fixed",
+        rag_k=3,
+        rag_rewrite=True,
+        rag_rerank=True,
+        rag_k_before=12,
+        rag_threshold=7.5,
+    )
+    agent.ask("q", [])
+    assert retriever.settings == [RagSettings("fixed", 3, 12, True, True, 7.5)]
+
+
+def test_rag_settings_fall_back_to_registry_defaults():
+    retriever = _Retriever()
+    agent, _ = _rag_agent(retriever)
+    agent.ask("q", [])
+    assert retriever.settings == [RagSettings("structure", 5, 20, False, False, 5.0)]
+
+
+def _ctx_with(**fields) -> RagContext:
+    return RagContext((), "structure", 5, "mistral-embed", 7, "abc123", **fields)
+
+
+def test_nothing_passed_the_threshold_sends_the_empty_instruction():
+    agent, recorder = _rag_agent(lambda q, s: _ctx_with(passed=0, candidates=9, threshold=5.0))
+    agent.ask("как борщ?", [])
+    assert recorder.calls[-1][-1]["content"] == (f"{RAG_EMPTY_INSTRUCTION}\n\nВопрос: как борщ?")
+
+
+def test_no_hits_without_rerank_keeps_the_bare_question():
+    agent, recorder = _rag_agent(lambda q, s: _ctx_with())
+    agent.ask("q", [])
+    assert recorder.calls[-1][-1]["content"] == "q"
+
+
+def test_context_warnings_reach_the_agent_warnings():
+    ctx = _ctx_with(warnings=("reranker не оценил 2 из 9 чанков",))
+    agent, _ = _rag_agent(lambda q, s: ctx)
+    agent.ask("q", [])
+    assert "reranker не оценил 2 из 9 чанков" in agent.warnings
 
 
 def test_rag_off_never_calls_the_retriever():

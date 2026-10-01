@@ -567,3 +567,40 @@ def test_rag_params_are_local_and_agent_only():
     for name in ("rag", "rag_strategy", "rag_k"):
         assert name in AGENT_PARAMS
         assert name not in defaults_for(CHAT_COMMAND)
+
+
+def test_rag_stage_defaults_for_the_agent_command():
+    defaults = defaults_for(AGENT_COMMAND)
+    assert defaults["rag_rewrite"] is False
+    assert defaults["rag_rerank"] is False
+    assert defaults["rag_k_before"] == 20
+    assert defaults["rag_threshold"] == 5
+
+
+@pytest.mark.parametrize("bad", [0, 51])
+def test_rag_k_before_bounds_are_rejected(bad):
+    with pytest.raises(ParamError):
+        GenerationParams.build(rag_k_before=bad)
+
+
+@pytest.mark.parametrize("bad", [-0.1, 10.5, "nan", "inf"])
+def test_rag_threshold_bounds_are_rejected(bad):
+    with pytest.raises(ParamError):
+        GenerationParams.build(rag_threshold=bad)
+
+
+@pytest.mark.parametrize("ok", [0, 4.5, 10])
+def test_rag_threshold_bounds_are_accepted(ok):
+    assert GenerationParams.build(rag_threshold=ok).rag_threshold == ok
+
+
+def test_rag_stage_params_are_local_and_agent_only():
+    params = GenerationParams.build(
+        rag_rewrite="вкл", rag_rerank=True, rag_k_before=12, rag_threshold=3, temperature=0.5
+    )
+    assert params.rag_rewrite is True
+    payload, _skipped = params.as_payload(REASONING)
+    assert payload == {"temperature": 0.5}
+    for name in ("rag_rewrite", "rag_rerank", "rag_k_before", "rag_threshold"):
+        assert name in AGENT_PARAMS
+        assert name not in defaults_for(CHAT_COMMAND)

@@ -166,6 +166,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 5 and day == 23:
+        return _demo_steps_w05d23()
     if week == 5 and day == 22:
         return _demo_steps_w05d22()
     if week == 5 and day == 21:
@@ -1944,6 +1946,68 @@ def _demo_steps_w05d22() -> list[Step]:
             module="week_05.cli",
             args=["eval", "--detail", "3"],
             timeout=420,
+            line_pause=8.0,
+        ),
+    ]
+
+
+_W05D23_HIT_QUESTION = (
+    "Каким git-тегом фиксируется состояние сданного дня в этом проекте? Приведи формат тега."
+)
+_W05D23_OFFTOPIC_QUESTION = "Как приготовить борщ?"
+_W05D23_SESSION_ARGS = ["--session", "w05d23-demo", "--max-tokens", "400"]
+_W05D23_AGENT_QUESTION = "Какой максимум у temperature в Mistral API?"
+
+
+def _demo_steps_w05d23() -> list[Step]:
+    """Day 23 — rerank, threshold, query rewrite: stages table, two ask pairs, agent, eval.
+
+    `eval` is last: the plain-vs-full table is the day's headline and belongs on
+    the closing screen. The agent step ends with `/rag off` so the saved session
+    state does not carry `full` into later sessions.
+    """
+    return [
+        Step(
+            title="1. adventrag stages — ранг релевантного чанка по этапам",
+            module="week_05.cli",
+            args=["stages"],
+            timeout=300,
+            line_pause=8.0,
+        ),
+        Step(
+            title="2. adventrag ask — вопрос про git-тег сданного дня: plain против full",
+            module="week_05.cli",
+            args=["ask", _W05D23_HIT_QUESTION, "--pair", "plain,full"],
+            timeout=180,
+            line_pause=8.0,
+        ),
+        Step(
+            title="3. adventrag ask — вопрос не по теме: порог отсекает всё",
+            module="week_05.cli",
+            args=["ask", _W05D23_OFFTOPIC_QUESTION, "--pair", "plain,full"],
+            timeout=180,
+            line_pause=8.0,
+        ),
+        Step(
+            title="4. Агент: /rag full — вопрос с кандидатами, порогом и rewrite",
+            module="week_02.cli",
+            args=_W05D23_SESSION_ARGS,
+            stdin_lines=[
+                "/new",
+                "/rag full",
+                "/rag",
+                _W05D23_AGENT_QUESTION,
+                "/rag off",
+                "/exit",
+            ],
+            timeout=180,
+            line_pause=6.0,
+        ),
+        Step(
+            title="5. adventrag eval — plain против full: 3 подробно, итог по всем 10",
+            module="week_05.cli",
+            args=["eval", "--pair", "plain,full", "--detail", "3"],
+            timeout=600,
             line_pause=8.0,
         ),
     ]
