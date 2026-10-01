@@ -1612,3 +1612,57 @@ def test_day_23_titles_are_short_and_numbered():
 def test_day_23_is_not_day_22():
     assert record_mod.demo_steps(5, 23)[0].args == ["stages"]
     assert record_mod.demo_steps(5, 22)[0].args[0] == "ask"
+
+
+# --------------------------------------------------------------------------
+# Week 05, Day 24: cited answers and «не знаю».
+# --------------------------------------------------------------------------
+def test_day_24_steps_pin_modules_args_and_timeouts():
+    steps = record_mod.demo_steps(5, 24)
+    assert [s.module for s in steps] == ["week_05.cli", "week_05.cli", "week_02.cli", "week_05.cli"]
+    assert steps[0].args == [
+        "ask",
+        "--cite",
+        "Каким git-тегом фиксируется состояние сданного дня в этом проекте? Приведи формат тега.",
+    ]
+    assert steps[1].args == [
+        "ask",
+        "Какой тариф Mistral оплачен на аккаунте проекта и сколько он стоит в месяц?",
+        "--pair",
+        "full,cite",
+    ]
+    assert steps[2].args == ["--session", "w05d24-demo", "--max-tokens", "400"]
+    assert steps[3].args == ["eval", "--pair", "full,cite", "--detail", "2"]
+    assert [s.timeout for s in steps] == [180, 240, 240, 900]
+
+
+def test_day_24_step_2_title_does_not_claim_full_invents():
+    title = record_mod.demo_steps(5, 24)[1].title
+    assert title == (
+        "2. adventrag ask --pair full,cite — вопрос без ответа: "
+        "cite говорит «не знаю» и просит уточнить"
+    )
+
+
+def test_day_24_agent_step_asks_refuses_clarifies_and_switches_cite_off_again():
+    lines = record_mod.demo_steps(5, 24)[2].stdin_lines
+    assert lines == [
+        "/new",
+        "/rag cite",
+        "Какая база данных PostgreSQL используется для хранения сессий агента?",
+        "про хранение сессий в файлах",
+        "/rag off",
+        "/exit",
+    ]
+
+
+def test_day_24_titles_are_short_numbered_and_eval_is_last():
+    steps = record_mod.demo_steps(5, 24)
+    assert [s.title[:2] for s in steps] == ["1.", "2.", "3.", "4."]
+    assert all(len(s.title) < 100 for s in steps)
+    assert steps[-1].args[0] == "eval"
+
+
+def test_day_24_is_not_day_23():
+    assert record_mod.demo_steps(5, 24)[0].args[:2] == ["ask", "--cite"]
+    assert record_mod.demo_steps(5, 23)[0].args == ["stages"]

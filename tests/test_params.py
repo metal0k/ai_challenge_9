@@ -604,3 +604,14 @@ def test_rag_stage_params_are_local_and_agent_only():
     for name in ("rag_rewrite", "rag_rerank", "rag_k_before", "rag_threshold"):
         assert name in AGENT_PARAMS
         assert name not in defaults_for(CHAT_COMMAND)
+
+
+def test_rag_cite_is_a_local_agent_only_bool_defaulting_off():
+    params = GenerationParams.build(rag_cite="вкл", temperature=0.5)
+    assert params.rag_cite is True
+    assert GenerationParams.build().rag_cite is None
+    payload, _skipped = params.as_payload(REASONING)
+    assert payload == {"temperature": 0.5}
+    assert "rag_cite" in AGENT_PARAMS
+    assert defaults_for(AGENT_COMMAND)["rag_cite"] is False
+    assert "rag_cite" not in defaults_for(CHAT_COMMAND)

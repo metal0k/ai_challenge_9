@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +23,7 @@ import pytest
 from rich.cells import cell_len
 
 import week_02.cli as cli
+from advent_core import config as config_module
 from advent_core import console
 from advent_core.agent import INTERRUPT_NOTE
 from advent_core.config import Config, ConfigError
@@ -1133,6 +1136,7 @@ def test_defaults_come_from_the_registry_not_from_the_typer_signature():
         "rag_rerank": False,
         "rag_k_before": 20,
         "rag_threshold": 5.0,
+        "rag_cite": False,
     }
 
     signature = inspect.signature(cli.agent)
@@ -4559,6 +4563,9 @@ def _ctx(hits, *, embed_tokens=12, dropped=0, strategy="structure", **extra):
     )
 
 
+_REAL_RAG_RETRIEVER = cli._rag_retriever  # captured before rag_index replaces it
+
+
 @pytest.fixture(autouse=True)
 def rag_index(monkeypatch):
     """Never touch the real index: check_index is recorded, the retriever is empty."""
@@ -5019,3 +5026,523 @@ def test_garbage_stage_keys_warn_and_leave_the_value(monkeypatch, tmp_path, caps
 
     assert _flat(capsys.readouterr().err).count(f"негодное {key}={bad!r}") == 1
     assert _stage_values(shell) == (False, False, 20, 5.0)
+
+
+# --- Day 24: /rag cite, cite turns, state ---------------------------------------
+
+CITE_TEXT = "Порог compaction равен 4242 токена."
+
+
+def _cite_raw(**over) -> str:
+    data = {
+        "status": "answer",
+        "answer": "Порог равен 4242.",
+        "sources": [1],
+        "quotes": [{"id": 1, "text": "Порог compaction равен 4242"}],
+    }
+    data.update(over)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _cite_shell(monkeypatch, tmp_path, replies=None, ctx=None, seen=None):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(replies, seen))
+    cli._dispatch("/rag cite", shell)
+    context = ctx if ctx is not None else _ctx([_hit("CLAUDE.md", text=CITE_TEXT)])
+    shell.agent.retrieve = lambda q, settings: context
+    return shell
+
+
+def test_rag_cite_enables_rag_both_stages_and_cite_through_one_index_check(
+    monkeypatch, tmp_path, rag_index
+):
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/rag cite", shell)
+
+    assert rag_index == ["structure"]
+    assert shell.agent.rag_enabled is True
+    s = shell.agent.rag_settings
+    assert (s.rewrite, s.rerank, s.cite) == (True, True, True)
+    state = _saved(tmp_path)
+    assert (state["rag"], state["rag_rewrite"], state["rag_rerank"], state["rag_cite"]) == (
+        True,
+        True,
+        True,
+        True,
+    )
+
+
+def test_rag_status_line_shows_cite(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/rag", shell)
+
+    assert _flat(capsys.readouterr().err).strip() == (
+        "rag: on · structure · k 20→5 · rewrite on · rerank on (порог 5) · cite on "
+        "· индекс 0123456789ab (469 чанков)"
+    )
+
+
+@pytest.mark.parametrize("line", ["/rag off", "/rag plain", "/rag full", "/set rag off"])
+def test_rag_off_plain_and_full_clear_cite_and_write_it_to_the_file(monkeypatch, tmp_path, line):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+
+    cli._dispatch(line, shell)
+
+    assert shell.agent.rag_settings.cite is False
+    assert _saved(tmp_path)["rag_cite"] is False
+
+
+def test_rag_full_after_cite_keeps_the_stages_but_drops_cite(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+
+    cli._dispatch("/rag full", shell)
+
+    s = shell.agent.rag_settings
+    assert (shell.agent.rag_enabled, s.rewrite, s.rerank, s.cite) == (True, True, True, False)
+
+
+def test_set_rag_cite_on_goes_through_the_rag_enable_path(monkeypatch, tmp_path, rag_index):
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/set rag_cite on", shell)
+
+    assert shell.agent.rag_enabled is True
+    assert shell.agent.rag_settings.cite is True
+    assert rag_index == ["structure"]
+    assert _saved(tmp_path)["rag_cite"] is True
+
+
+@pytest.mark.parametrize("line", ["/rag cite", "/set rag_cite on"])
+def test_cite_with_a_missing_index_stays_off(monkeypatch, tmp_path, capsys, line):
+    shell = _shell(monkeypatch, tmp_path)
+    _index_missing(monkeypatch)
+    capsys.readouterr()
+
+    cli._dispatch(line, shell)
+
+    assert shell.agent.rag_enabled is False
+    assert shell.agent.rag_settings.cite is False
+    assert _flat(capsys.readouterr().err).count("rag не включён: индекса нет advent rag index") == 1
+
+
+def test_cite_refuses_to_start_while_mcp_tools_are_on(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    shell.agent.mcp_enabled = True
+    capsys.readouterr()
+
+    cli._dispatch("/rag cite", shell)
+
+    assert shell.agent.rag_settings.cite is False
+    assert shell.agent.rag_enabled is False
+    assert _flat(capsys.readouterr().err).count("rag_cite не включён: несовместим с MCP") == 1
+
+
+def test_set_rag_cite_refuses_in_dialog_mode_and_reverts(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, mode="dialog", done="text:ГОТОВО")
+    capsys.readouterr()
+
+    cli._dispatch("/set rag_cite on", shell)
+
+    assert shell.agent.rag_settings.cite is False
+    assert (
+        _flat(capsys.readouterr().err).count("rag_cite не включён: несовместим с mode=dialog") == 1
+    )
+
+
+def test_dialog_mode_is_refused_while_cite_is_on(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/set mode dialog", shell)
+
+    assert shell.agent.mode != "dialog"
+    assert _flat(capsys.readouterr().err).count("mode=dialog несовместим с rag_cite") == 1
+
+
+def test_mcp_on_is_refused_while_cite_is_on(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+    capsys.readouterr()
+
+    assert cli._mcp_enable(shell) is False
+
+    assert shell.agent.mcp_enabled is False
+    assert _flat(capsys.readouterr().err).count("rag_cite несовместим с ними") == 1
+
+
+def test_rag_cite_round_trips_through_the_session_file(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+
+    second = _shell(monkeypatch, tmp_path)
+
+    assert second.agent.rag_enabled is True
+    assert second.agent.rag_settings.cite is True
+
+
+def test_older_session_file_without_rag_cite_gives_off(monkeypatch, tmp_path):
+    _session_with(tmp_path, "default", {"rag": True})
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.rag_enabled is True
+    assert shell.agent.rag_settings.cite is False
+
+
+def test_absent_rag_cite_keeps_the_loaded_value_on_a_session_switch(monkeypatch, tmp_path):
+    _session_with(tmp_path, "work", {"mode": "chat"})
+    shell = _shell(monkeypatch, tmp_path, rag=True, rag_cite=True)
+
+    cli._dispatch("/set session work", shell)
+
+    assert shell.agent.rag_settings.cite is True
+
+
+def test_null_rag_cite_lifts_the_override_on_a_session_switch(monkeypatch, tmp_path):
+    _session_with(tmp_path, "work", {"rag": True, "rag_cite": None})
+    shell = _shell(monkeypatch, tmp_path, rag=True, rag_cite=True)
+
+    cli._dispatch("/set session work", shell)
+
+    assert shell.agent.rag_settings.cite is False
+    assert shell.agent.rag_enabled is True
+
+
+def test_typed_rag_cite_applies_on_a_session_switch(monkeypatch, tmp_path):
+    _session_with(tmp_path, "work", {"rag": True, "rag_cite": True})
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/set session work", shell)
+
+    assert shell.agent.rag_settings.cite is True
+
+
+@pytest.mark.parametrize("bad", ["yes", 1, "true"])
+def test_garbage_rag_cite_warns_and_leaves_the_value(monkeypatch, tmp_path, capsys, bad):
+    _session_with(tmp_path, "default", {"rag_cite": bad})
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert _flat(capsys.readouterr().err).count(f"негодное rag_cite={bad!r}") == 1
+    assert shell.agent.rag_settings.cite is False
+
+
+def test_restored_rag_cite_with_rag_off_turns_cite_off_with_a_warning(
+    monkeypatch, tmp_path, capsys
+):
+    _session_with(tmp_path, "default", {"rag": False, "rag_cite": True})
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert shell.agent.rag_enabled is False
+    assert shell.agent.rag_settings.cite is False
+    assert _flat(capsys.readouterr().err).count("rag_cite не включён: rag выключен") == 1
+
+
+def test_restored_rag_cite_without_an_index_goes_off_with_rag(monkeypatch, tmp_path, capsys):
+    _session_with(tmp_path, "default", {"rag": True, "rag_cite": True})
+    _index_missing(monkeypatch)
+
+    shell = _shell(monkeypatch, tmp_path)
+
+    assert (shell.agent.rag_enabled, shell.agent.rag_settings.cite) == (False, False)
+    err = _flat(capsys.readouterr().err)
+    assert err.count("rag не включён: индекса нет advent rag index") == 1
+    assert err.count("rag_cite не включён: rag выключен") == 1
+
+
+def test_a_cite_turn_prints_the_rendered_answer_to_stdout_not_the_json(
+    monkeypatch, tmp_path, capsys
+):
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kw: rows.append(kw))
+    shell = _cite_shell(monkeypatch, tmp_path, [_cite_raw()])
+    capsys.readouterr()
+
+    cli._turn(shell, "какой порог?")
+
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Порог равен 4242.\n\n"
+        "Источники:\n"
+        "[1] CLAUDE.md — s · CLAUDE.md#1 · цитата ✓\n"
+        "Цитаты:\n"
+        "[1] ✓ «Порог compaction равен 4242»\n"
+    )
+    err = _flat(captured.err)
+    assert err.count("цитаты: 1/1 дословны") == 1
+    assert "подтвержд" not in err
+    assert len(rows) == 1
+    assert (rows[0]["week"], rows[0]["day"]) == (5, 24)
+    # The session file and the history hold the rendered form, not the raw JSON.
+    assert shell.session.turns[-1].content == shell.history[-1]["content"]
+    assert '"status"' not in shell.session.turns[-1].content
+
+
+def test_a_cite_turn_still_prints_footer_and_reconciles(monkeypatch, tmp_path):
+    footers: list = []
+    monkeypatch.setattr(cli.console, "footer", lambda result, **kw: footers.append(result))
+    shell = _cite_shell(monkeypatch, tmp_path, [_cite_raw()])
+
+    cli._turn(shell, "какой порог?")
+
+    assert len(footers) == 1
+    assert shell.last_check is not None
+
+
+def test_an_unverified_cite_turn_shows_the_draft_but_stores_only_the_refusal(
+    monkeypatch, tmp_path, capsys
+):
+    raw = _cite_raw(answer="Черновик 999.", quotes=[{"id": 1, "text": "цитата которой нет нигде"}])
+    shell = _cite_shell(monkeypatch, tmp_path, [raw])
+    capsys.readouterr()
+
+    cli._turn(shell, "какой порог?")
+
+    captured = capsys.readouterr()
+    assert "неподтверждённый ответ модели: «Черновик 999.»" in captured.out
+    assert "Черновик" not in shell.session.turns[-1].content
+    assert "Черновик" not in shell.history[-1]["content"]
+    assert _flat(captured.err).count("не знаю · unverified · цитаты: 0/1 дословны") == 1
+
+
+def test_a_code_refusal_has_no_footer_no_reconcile_no_journal_row(monkeypatch, tmp_path, capsys):
+    rows: list[dict] = []
+    footers: list = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kw: rows.append(kw))
+    monkeypatch.setattr(cli.console, "footer", lambda result, **kw: footers.append(result))
+    calls: list = []
+    monkeypatch.setattr(cli.tokens, "reconcile", lambda *a, **k: calls.append(a))
+    seen: list = []
+    empty = _ctx([], candidates=9, passed=0, aux_prompt_tokens=9412, aux_completion_tokens=180)
+    shell = _cite_shell(monkeypatch, tmp_path, ctx=empty, seen=seen)
+    capsys.readouterr()
+
+    cli._turn(shell, "как борщ?")
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith("Не знаю: в документации проекта не нашлось")
+    assert seen == []  # the model was never called
+    assert rows == [] and footers == [] and calls == []
+    err = _flat(captured.err)
+    assert err.count("не знаю · модель не вызывалась · aux 9 412+180 ток.") == 1
+    assert shell.session.turns[-1].content.startswith("Не знаю:")
+    assert shell.history[-1]["content"].startswith("Не знаю:")
+
+
+def test_a_refusal_without_aux_numbers_says_no_aux(monkeypatch, tmp_path, capsys):
+    shell = _cite_shell(monkeypatch, tmp_path, ctx=_ctx([]))
+    capsys.readouterr()
+
+    cli._turn(shell, "как борщ?")
+
+    err = _flat(capsys.readouterr().err)
+    assert err.count("не знаю · модель не вызывалась") == 1
+    assert "aux" not in err.split("не знаю · модель не вызывалась")[1].split("токены ·")[0]
+
+
+def test_a_follow_up_after_a_refusal_says_the_rewrite_saw_the_previous_question(
+    monkeypatch, tmp_path, capsys
+):
+    queries: list[tuple[str, str | None]] = []
+    contexts = [_ctx([]), _ctx([_hit("CLAUDE.md", text=CITE_TEXT)])]
+
+    def retriever(question, settings):
+        queries.append((question, settings.previous))
+        return contexts[len(queries) - 1]
+
+    shell = _cite_shell(monkeypatch, tmp_path, [_cite_raw()])
+    shell.agent.retrieve = retriever
+    cli._turn(shell, "как оно устроено?")
+    capsys.readouterr()
+
+    cli._turn(shell, "про порог compaction")
+
+    assert queries == [
+        ("как оно устроено?", None),
+        ("про порог compaction", "как оно устроено?"),
+    ]
+    assert _flat(capsys.readouterr().err).count("rag: rewrite учёл предыдущий вопрос") == 1
+
+
+def test_a_cite_error_turn_does_not_crash_the_repl(monkeypatch, tmp_path, capsys):
+    shell = _cite_shell(monkeypatch, tmp_path, [_cite_raw()])
+    shell.agent.mcp_enabled = True  # bypasses the guard in /rag cite on purpose
+    capsys.readouterr()
+
+    cli._turn(shell, "q")
+
+    assert _flat(capsys.readouterr().err).count("rag_cite несовместим с MCP-инструментами") == 1
+    assert shell.session.turns == []
+
+
+@pytest.mark.parametrize(
+    ("line", "week", "day"),
+    [("/rag plain", 5, 22), ("/rag full", 5, 23), ("/rag cite", 5, 24)],
+)
+def test_the_chat_row_day_follows_the_rag_mode(monkeypatch, tmp_path, line, week, day):
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kw: rows.append(kw))
+    replies = [_cite_raw()] if line == "/rag cite" else None
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(replies))
+    cli._dispatch(line, shell)
+    shell.agent.retrieve = lambda q, settings: _ctx([_hit("CLAUDE.md", text=CITE_TEXT)])
+
+    cli._turn(shell, "вопрос")
+
+    assert [(r["week"], r["day"]) for r in rows] == [(week, day)]
+
+
+def test_the_chat_row_without_rag_keeps_week_2_day_10(monkeypatch, tmp_path):
+    rows: list[dict] = []
+    monkeypatch.setattr(cli, "log_call", lambda result, messages, **kw: rows.append(kw))
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._turn(shell, "вопрос")
+
+    assert [(r["week"], r["day"]) for r in rows] == [(2, 10)]
+
+
+def test_cite_note_literals():
+    cited_ok = SimpleNamespace(
+        quoted=True, quotes=(1, 2, 3), verified_quotes=2, reason="", status="answer"
+    )
+    reply = SimpleNamespace(cited=cited_ok, model_called=True, rag=None)
+    assert cli._cite_note(reply) == "цитаты: 2/3 дословны"
+    refused = SimpleNamespace(quoted=False, quotes=(), verified_quotes=0, reason="bad_json")
+    assert cli._cite_note(SimpleNamespace(cited=refused, model_called=True, rag=None)) == (
+        "не знаю · bad_json"
+    )
+
+
+def test_a_session_switch_to_an_old_dialog_file_turns_a_carried_over_cite_off(
+    monkeypatch, tmp_path, capsys
+):
+    # No `rag_cite` key in the file: "absent keeps the loaded value" would keep cite
+    # on next to mode=dialog, which the agent refuses to run.
+    work = Session.new("work", directory=tmp_path)
+    work.state = {"mode": "dialog", "done": "text:ГОТОВО"}
+    work.save()
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+    assert shell.agent.rag_settings.cite is True
+    capsys.readouterr()
+
+    cli._dispatch("/set session work", shell)
+
+    assert shell.agent.mode == "dialog"
+    assert shell.agent.rag_settings.cite is False
+    assert _flat(capsys.readouterr().err).count("rag_cite выключен: сессия в mode=dialog") == 1
+
+
+def test_a_session_switch_to_an_mcp_session_turns_a_carried_over_cite_off(
+    monkeypatch, tmp_path, capsys
+):
+    work = Session.new("work", directory=tmp_path)
+    work.state = {"mcp_enabled": True}
+    work.save()
+    enabled_with_cite: list[bool] = []
+
+    def enable(shell):
+        enabled_with_cite.append(shell.agent.rag_settings.cite)
+        shell.agent.mcp_enabled = True
+        return True
+
+    monkeypatch.setattr(cli, "_mcp_enable", enable)
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+    capsys.readouterr()
+
+    cli._dispatch("/set session work", shell)
+
+    assert shell.agent.mcp_enabled is True
+    assert shell.agent.rag_settings.cite is False
+    assert enabled_with_cite == [False], "cite must be off BEFORE the tools are attached"
+    assert _flat(capsys.readouterr().err).count("rag_cite выключен: сессия с MCP") == 1
+
+
+def test_a_session_with_an_explicit_cite_key_and_no_conflict_keeps_cite(monkeypatch, tmp_path):
+    work = Session.new("work", directory=tmp_path)
+    work.state = {"rag": True, "rag_cite": True}
+    work.save()
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/set session work", shell)
+
+    assert shell.agent.rag_settings.cite is True
+
+
+def test_the_repl_retriever_journals_embed_and_aux_rows_by_the_rag_mode(
+    monkeypatch, tmp_path, capsys
+):
+    import numpy as np
+
+    from week_05 import rag as week_rag
+
+    events: list[tuple[str, int]] = []
+    monkeypatch.setattr(config_module, "load_env", lambda: None)
+    monkeypatch.setenv("MISTRAL_API_KEY", "k" * 32)
+    monkeypatch.setattr(cli, "_rag_retriever", _REAL_RAG_RETRIEVER)
+    monkeypatch.setattr(
+        week_rag.index_module,
+        "load_runs",
+        lambda db_path: {"structure": SimpleNamespace(model="mistral-embed", corpus_rev="abc")},
+    )
+
+    @contextmanager
+    def fake_client(config):
+        yield object()
+
+    monkeypatch.setattr(week_rag, "mistral_client", fake_client)
+
+    def fake_embed(client, model, texts, *, week, day, journal_extra):
+        events.append(("embed", day))
+        return SimpleNamespace(vectors=np.ones((len(texts), 4), dtype=np.float32), prompt_tokens=7)
+
+    monkeypatch.setattr(week_rag, "embed_texts", fake_embed)
+    found = SimpleNamespace(
+        chunk=SimpleNamespace(
+            chunk_id="structure:CLAUDE.md#1", source="CLAUDE.md", section="s", text=CITE_TEXT
+        ),
+        score=0.9,
+    )
+    monkeypatch.setattr(week_rag.index_module, "search", lambda db, strategy, vec, k: [found])
+    monkeypatch.setattr(
+        week_rag,
+        "log_call",
+        lambda result, messages, *, week, day, extra=None: events.append((extra["command"], day)),
+    )
+    monkeypatch.setattr(
+        cli, "log_call", lambda result, messages, **kw: events.append(("main", kw["day"]))
+    )
+    rerank = json.dumps({"scores": [{"id": 1, "score": 9}]})
+    replies = ["ответ", "запрос", rerank, "ответ", "запрос", rerank, _cite_raw()]
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(replies))
+    capsys.readouterr()
+
+    for line in ("/rag plain", "/rag full", "/rag cite"):
+        cli._dispatch(line, shell)
+        events.append((line, 0))
+        cli._turn(shell, "вопрос про порог")
+
+    assert events == [
+        ("/rag plain", 0),
+        ("embed", 22),
+        ("main", 22),
+        ("/rag full", 0),
+        ("rag_rewrite", 23),
+        ("embed", 23),
+        ("rag_rerank", 23),
+        ("main", 23),
+        ("/rag cite", 0),
+        ("rag_rewrite", 24),
+        ("embed", 24),
+        ("rag_rerank", 24),
+        ("main", 24),
+    ]

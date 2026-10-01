@@ -211,7 +211,9 @@ def verify(format_name: str, text: str, schema: dict[str, Any] | None = None) ->
 
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError, TypeError):
+        # Total on purpose: "[" * 10000 raises RecursionError, and verify() runs
+        # inside complete() after the answer is paid for but before it is journaled.
         return FormatVerdict(ok=False, detail="JSON ✗")
 
     if format_name == "json":
@@ -223,7 +225,7 @@ def verify(format_name: str, text: str, schema: dict[str, Any] | None = None) ->
         return FormatVerdict(ok=False, detail="JSON ✓ · схема не задана")
     try:
         jsonschema.validate(parsed, schema)
-    except jsonschema.ValidationError:
+    except (jsonschema.ValidationError, jsonschema.SchemaError, RecursionError):
         return FormatVerdict(ok=False, detail="JSON ✓ · схема ✗")
 
     detail = "JSON ✓ · схема ✓"

@@ -1,4 +1,4 @@
-"""Days 22-23: `adventrag ask` / `eval` / `stages` — the same Agent with RAG off, plain, full."""
+"""Days 22-24: `adventrag ask` / `eval` / `stages` — one Agent: RAG off, plain, full, cite."""
 
 from __future__ import annotations
 
@@ -17,15 +17,31 @@ from advent_core.agent import Agent
 from advent_core.config import PROJECT_ROOT, Config
 from advent_core.errors import AdventError, NetworkError, RateLimitError, ServerError
 from advent_core.journal import log_call
-from advent_core.rag import RagContext, RagHit, RagSettings, check_facts, fact_span
+from advent_core.rag import (
+    RAG_UNKNOWN_PREFIX,
+    RAG_UNKNOWN_TEXTS,
+    CitedAnswer,
+    RagContext,
+    RagHit,
+    RagSettings,
+    check_facts,
+    fact_span,
+)
 from week_05 import index as index_module
 from week_05 import rag as rag_module
 
 QUESTIONS_PATH = PROJECT_ROOT / "week_05" / "rag_questions.json"
+UNANSWERABLE_PATH = PROJECT_ROOT / "week_05" / "rag_unanswerable.json"
 RAG_STRATEGIES = ("fixed", "structure")
-MODE_LABELS = {"off": "без RAG", "plain": "RAG", "full": "RAG+rerank"}
-ASK_MODES = ("both", "rag", "no-rag", "full")
-ALLOWED_PAIRS = (("off", "plain"), ("off", "full"), ("plain", "full"))
+MODE_LABELS = {"off": "без RAG", "plain": "RAG", "full": "RAG+rerank", "cite": "RAG+цитаты"}
+ASK_MODES = ("both", "rag", "no-rag", "full", "cite")
+ALLOWED_PAIRS = (
+    ("off", "plain"),
+    ("off", "full"),
+    ("plain", "full"),
+    ("off", "cite"),
+    ("full", "cite"),
+)
 DEFAULT_PAIR = "off,plain"
 RETRY_PAUSE_S = 5.0
 TRANSIENT_EXIT_CODES = (
@@ -35,6 +51,8 @@ TRANSIENT_EXIT_CODES = (
 )
 JOURNAL_DAY_PLAIN = 22
 JOURNAL_DAY_FULL = 23
+JOURNAL_DAY_CITE = 24
+MODE_DAYS = {"off": 22, "plain": 22, "full": 23, "cite": 24}
 
 
 def _pause(seconds: float) -> None:
@@ -48,13 +66,24 @@ def parse_pair(pair: str) -> tuple[str, str]:
     if parts not in ALLOWED_PAIRS:
         raise AdventError(
             f"Недопустимая пара режимов: {pair!r}.",
-            hint="Доступно: off,plain · off,full · plain,full.",
+            hint="Доступно: off,plain · off,full · plain,full · off,cite · full,cite.",
         )
     return parts
 
 
 def journal_day(modes: tuple[str, ...]) -> int:
+    if "cite" in modes:
+        return JOURNAL_DAY_CITE
     return JOURNAL_DAY_FULL if "full" in modes else JOURNAL_DAY_PLAIN
+
+
+def mode_days(modes: tuple[str, ...]) -> dict[str, int]:
+    """Journal day per mode. A pair with `cite` splits days by mode (full 23, cite 24);
+    older pairs keep one day for both, as on days 22-23."""
+    if "cite" in modes:
+        return {m: MODE_DAYS[m] for m in modes}
+    day = journal_day(modes)
+    return {m: day for m in modes}
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +94,9 @@ class ModeRun:
     completion_tokens: int | None
     latency_ms: int
     mode: str = "off"
+    cited: CitedAnswer | None = None
+    display_text: str | None = None
+    model_called: bool = True
 
 
 def check_args(strategy: str, k: int, k_before: int, threshold: float) -> None:
@@ -94,6 +126,7 @@ def make_config(
     config.params.rag = False
     config.params.rag_rewrite = False
     config.params.rag_rerank = False
+    config.params.rag_cite = False
     return config
 
 
@@ -102,16 +135,37 @@ def _yes_no(flags: tuple[bool, ...]) -> str:
     return "да" if any(flags) else "нет"
 
 
+# Every question runs on an empty history with no context_limit wired in, so this
+# one fires on every ask and says nothing the user can act on.
+_NOISE_WARNING = "max_context_length модели неизвестен"
+
+
+def _agent_warning(text: str) -> None:
+    """Agent warnings to stderr; the unknown-window one is noise here."""
+    if text.startswith(_NOISE_WARNING):
+        return
+    console.warn(text)
+
+
 def build_agent(config: Config, db_path: Path | None, day: int = JOURNAL_DAY_PLAIN) -> Agent:
-    # No on_warning: the only warning this path can raise is the unknown context
-    # window, which is noise here — every question runs on an empty history.
-    # ctx.warnings are printed by this module instead.
     return Agent(
         config,
+        on_warning=_agent_warning,
         complete=chat_core.complete,
         stream=chat_core.stream,
-        retrieve=rag_module.make_retriever(db_path, day=day),
+        retrieve=rag_module.make_retriever(db_path, day=day, aux_day=day),
     )
+
+
+def build_agents(config: Config, db_path: Path | None, modes: tuple[str, ...]) -> dict[str, Agent]:
+    """One Agent per distinct journal day, shared by the modes that use that day."""
+    by_day: dict[int, Agent] = {}
+    agents: dict[str, Agent] = {}
+    for mode, day in mode_days(modes).items():
+        if day not in by_day:
+            by_day[day] = build_agent(config, db_path, day)
+        agents[mode] = by_day[day]
+    return agents
 
 
 def run_mode(
@@ -125,25 +179,26 @@ def run_mode(
 ) -> ModeRun:
     params = agent.config.params
     params.rag = mode != "off"
-    params.rag_rewrite = params.rag_rerank = mode == "full"
+    params.rag_rewrite = params.rag_rerank = mode in ("full", "cite")
+    params.rag_cite = mode == "cite"
     reply = agent.ask(question, [])
     extra: dict[str, object] = {
         "command": command,
         "rag": mode != "off",
         "question_id": question_id,
     }
-    if mode == "full":
+    if mode in ("full", "cite"):
         extra["mode"] = mode
-    log_call(
-        reply.result,
-        reply.result.sent_messages or [],
-        week=rag_module.RAG_WEEK,
-        day=day,
-        extra=extra,
-    )
-    if reply.rag is not None:
-        for warning in reply.rag.warnings:
-            console.warn(warning)
+    # A refusal made by code has a synthetic CallResult: nothing was sent, nothing to journal.
+    if reply.model_called:
+        log_call(
+            reply.result,
+            reply.result.sent_messages or [],
+            week=rag_module.RAG_WEEK,
+            day=day,
+            extra=extra,
+        )
+    # ctx.warnings already reached stderr through the agent's on_warning.
     return ModeRun(
         text=reply.text,
         ctx=reply.rag,
@@ -151,6 +206,9 @@ def run_mode(
         completion_tokens=reply.result.usage.completion_tokens,
         latency_ms=reply.result.latency_ms,
         mode=mode,
+        cited=reply.cited,
+        display_text=reply.display_text,
+        model_called=reply.model_called,
     )
 
 
@@ -195,9 +253,64 @@ def print_sources(ctx: RagContext, mode: str = "plain") -> None:
         )
 
 
+def _quotes_note(cited: CitedAnswer) -> str:
+    return f"цитаты: {cited.verified_quotes}/{len(cited.quotes)} дословны"
+
+
+def _aux_tokens_text(ctx: RagContext | None) -> str:
+    if ctx is None:
+        return ""
+    return f"aux {_tokens(ctx.aux_prompt_tokens)}+{_tokens(ctx.aux_completion_tokens)} ток."
+
+
+def print_cite_answer(run: ModeRun) -> None:
+    """Cite screen: the rendered answer already lists sources with chunk_id and quotes ✓/✗."""
+    console.out.print(
+        (run.display_text or run.text).strip(), markup=False, highlight=False, emoji=False
+    )
+    ctx = run.ctx
+    if ctx is None:
+        return
+    if ctx.rewritten is not None:
+        _print_line(_cut(f"rewrite: {' '.join(ctx.rewritten.split())}", console.out.width))
+    if ctx.passed is not None:
+        console.out.print(
+            f"кандидатов {ctx.candidates} → прошли порог {ctx.passed} → "
+            f"в контексте {len(ctx.hits)}",
+            markup=False,
+            highlight=False,
+        )
+
+
+def _cite_note(run: ModeRun) -> str:
+    label = MODE_LABELS["cite"]
+    if not run.model_called:
+        return (
+            f"{label}: не знаю · модель не вызывалась · {_aux_tokens_text(run.ctx)} · "
+            f"embed {_tokens(run.ctx.embed_tokens) if run.ctx else '?'}"
+        )
+    parts = [
+        f"{label}: prompt {_tokens(run.prompt_tokens)} · "
+        f"completion {_tokens(run.completion_tokens)}"
+    ]
+    if run.ctx is not None:
+        parts.append(f"embed {_tokens(run.ctx.embed_tokens)}")
+        parts.append(_aux_tokens_text(run.ctx))
+    parts.append(f"{run.latency_ms / 1000:.1f} с")
+    return " · ".join(parts)
+
+
 def print_mode_answer(mode: str, run: ModeRun) -> None:
     label = MODE_LABELS[mode]
     console.out.print(f"── {label} ──", style="bold", markup=False, highlight=False)
+    if mode == "cite":
+        print_cite_answer(run)
+        console.out.print()
+        console.note(_cite_note(run))
+        # Own line: appended to the token line it wraps the latency off at 80 columns.
+        if run.model_called and run.cited is not None and run.cited.quotes:
+            console.note(_quotes_note(run.cited))
+        return
     console.out.print(run.text.strip(), markup=False, highlight=False)
     if run.ctx is not None:
         print_sources(run.ctx, mode)
@@ -231,6 +344,7 @@ def resolve_ask_modes(mode: str, pair: str | None) -> tuple[str, ...]:
         "rag": ("plain",),
         "no-rag": ("off",),
         "full": ("full",),
+        "cite": ("cite",),
     }[mode]
 
 
@@ -252,10 +366,10 @@ def ask_question(
     config = make_config(model, strategy, k, k_before, threshold)
     if any(m != "off" for m in modes):
         rag_module.check_index(db_path, strategy)
-    day = journal_day(modes)
-    agent = build_agent(config, db_path, day)
+    days = mode_days(modes)
+    agents = build_agents(config, db_path, modes)
     for m in modes:
-        run = run_mode(agent, question, mode=m, command="ask", day=day)
+        run = run_mode(agents[m], question, mode=m, command="ask", day=days[m])
         print_mode_answer(m, run)
 
 
@@ -267,8 +381,13 @@ def register(app: typer.Typer) -> None:
             None, "--rag/--no-rag", help="Только с RAG или только без; по умолчанию оба режима."
         ),
         full: bool = typer.Option(False, "--full", help="Только RAG+rerank (rewrite + rerank)."),
+        cite: bool = typer.Option(
+            False, "--cite", help="Только RAG+цитаты (rewrite + rerank + JSON с цитатами)."
+        ),
         pair: str | None = typer.Option(
-            None, "--pair", help="Пара режимов: off,plain (по умолчанию) | off,full | plain,full."
+            None,
+            "--pair",
+            help="Пара: off,plain (по умолчанию) | off,full | plain,full | off,cite | full,cite.",
         ),
         strategy: str = typer.Option("structure", "--strategy", help="fixed | structure."),
         k: int = typer.Option(5, "-k", "--top-k", min=1, help="Сколько чанков прикладывать."),
@@ -284,7 +403,17 @@ def register(app: typer.Typer) -> None:
         """Один вопрос — ответы в двух режимах рядом (без RAG / RAG / RAG+rerank)."""
         if full and rag is not None:
             raise AdventError("--full нельзя сочетать с --rag/--no-rag.")
-        mode = "full" if full else "both" if rag is None else ("rag" if rag else "no-rag")
+        if cite and (full or rag is not None):
+            raise AdventError("--cite нельзя сочетать с --rag/--no-rag/--full.")
+        mode = (
+            "cite"
+            if cite
+            else "full"
+            if full
+            else "both"
+            if rag is None
+            else ("rag" if rag else "no-rag")
+        )
         ask_question(question, mode, strategy, k, db, model, pair, k_before, threshold)
 
 
@@ -299,6 +428,8 @@ class EvalRow:
     first_score: rag_module.AnswerScore | None
     second_score: rag_module.AnswerScore | None
     error: str | None = None
+    grounding: rag_module.Grounding | None = None
+    judge_error: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -335,6 +466,8 @@ def _labels(pair: tuple[str, str]) -> tuple[str, str]:
 
 def eval_table(rows: list[EvalRow], pair: tuple[str, str] = ("off", "plain")) -> Table:
     """Build a comparison table for evaluated questions."""
+    if pair[1] == "cite":
+        return cite_eval_table(rows, pair)
     first, second = _labels(pair)
     table = Table(title=f"Контрольные вопросы: {first} и {second}", title_justify="left")
     table.add_column("#", justify="right")
@@ -385,11 +518,14 @@ def print_summary(rows: list[EvalRow], pair: tuple[str, str] = ("off", "plain"))
     )
     _out(f"Полных ответов: {first} {first_full}/{n} · {second} {second_full}/{n}")
     _out(f"Ожидаемый источник в top-k: {retrieved}/{n} · назван в ответе: {cited}/{n}")
-    first_p = _sum([row.first.prompt_tokens for row in done])
-    first_c = _sum([row.first.completion_tokens for row in done])
-    second_p = _sum([row.second.prompt_tokens for row in done])
-    second_c = _sum([row.second.completion_tokens for row in done])
-    runs = [run for row in done for run in (row.first, row.second)]
+    # Spend counts every completed call, including the first run of a failed pair.
+    runs = [run for row in rows for run in (row.first, row.second) if run is not None]
+    first_runs = [run for row in rows if (run := row.first) is not None]
+    second_runs = [run for row in rows if (run := row.second) is not None]
+    first_p = _sum([run.prompt_tokens for run in first_runs])
+    first_c = _sum([run.completion_tokens for run in first_runs])
+    second_p = _sum([run.prompt_tokens for run in second_runs])
+    second_c = _sum([run.completion_tokens for run in second_runs])
     embed = _sum([run.ctx.embed_tokens for run in runs if run.ctx is not None] or [0])
     tokens = (
         f"Токены prompt/completion: {first} {_tokens(first_p)}/{_tokens(first_c)} · "
@@ -462,6 +598,9 @@ def _snippet(answer: str, facts: tuple[tuple[str, ...], ...] | list, width: int)
 
 def _print_pair(n: int, row: EvalRow, detail: int, pair: tuple[str, str]) -> None:
     """Print one question's result right after its pair of answers."""
+    if pair[1] == "cite":
+        _print_cite_pair(n, row, detail, pair)
+        return
     first, second = _labels(pair)
     width = console.out.width
     head = f"#{row.question.id} "
@@ -546,6 +685,308 @@ def _load_valid_questions(
     return valid, chunks
 
 
+# --- Day 24: cite pair — table, per-question lines, unanswerable set, summary -----------
+
+CITE_QUESTION_CELL = 14
+UN_QUESTION_CELL = 30
+NOT_JUDGED = "—"
+
+
+@dataclass(frozen=True, slots=True)
+class UnRow:
+    question: rag_module.UnanswerableQuestion
+    first: ModeRun | None
+    second: ModeRun | None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def _judge(
+    question: rag_module.ControlQuestion, run: ModeRun
+) -> tuple[rag_module.Grounding | None, str | None]:
+    """Judge a quoted cite answer under its own try: its failure never costs the pair."""
+    cited = run.cited
+    if cited is None or not cited.quoted or run.ctx is None:
+        return None, None
+    hits = run.ctx.hits
+    try:
+        grounding = _retry_transient(
+            lambda: rag_module.judge_grounding(
+                cited, hits, question.question, day=JOURNAL_DAY_CITE
+            ),
+            f"judge #{question.id}",
+        )
+    except Exception as error:  # noqa: BLE001 - isolated: the answer and its tokens are kept
+        message = getattr(error, "message", None) or str(error)
+        console.warn(f"judge #{question.id}: {message}")
+        return None, message
+    return grounding, None
+
+
+def _verdict(row: EvalRow) -> str:
+    """Judge cell: `н/о` for a quoted answer without a usable verdict, `—` when not judged."""
+    cited = row.second.cited if row.second is not None else None
+    if cited is None or not cited.quoted:
+        return NOT_JUDGED
+    if row.grounding is None or row.grounding.verdict is None:
+        return NOT_RATED
+    return row.grounding.verdict
+
+
+def _quotes_cell(cited: CitedAnswer | None) -> str:
+    if cited is None or not cited.quotes:
+        return "—"
+    return f"{cited.verified_quotes}/{len(cited.quotes)}"
+
+
+def cite_eval_table(rows: list[EvalRow], pair: tuple[str, str]) -> Table:
+    """Facts of both modes, then the cite columns: sources, quotes, meaning, refusal."""
+    first, second = _labels(pair)
+    table = Table(title=f"Контрольные вопросы: {first} и {second}", title_justify="left")
+    table.add_column("#", justify="right", no_wrap=True)
+    table.add_column("вопрос", no_wrap=True)
+    table.add_column(pair[0], justify="right", no_wrap=True)
+    table.add_column("cite", justify="right", no_wrap=True)
+    for name in ("источн.", "цитаты", "смысл", "не знаю"):
+        table.add_column(name, justify="right", no_wrap=True)
+    for row in rows:
+        question = _cut(" ".join(row.question.question.split()), CITE_QUESTION_CELL)
+        if not row.ok:
+            table.add_row(str(row.question.id), question, *["ошибка"] * 2, *["—"] * 4)
+            continue
+        cited = row.second.cited
+        answered = cited is not None and cited.quoted
+        table.add_row(
+            str(row.question.id),
+            question,
+            _ratio(row.first_score.facts),
+            _ratio(row.second_score.facts),
+            _yes_no(row.second_score.sources_cited) if answered else "—",
+            _quotes_cell(cited),
+            _verdict(row),
+            _refusal_cell(cited),
+        )
+    return table
+
+
+REFUSAL_SHORT = {
+    "empty_context": "порог",
+    "model_unknown": "модель",
+    "unverified": "цитаты",
+    "bad_json": "формат",
+    "truncated": "формат",
+    "no_index": "индекс",
+}
+
+
+def _refusal_tag(cited: CitedAnswer | None) -> str:
+    """Short refusal reason, "" when the cite run answered (or has no cite result)."""
+    if cited is None or cited.status != "unknown":
+        return ""
+    return REFUSAL_SHORT.get(cited.reason, cited.reason)
+
+
+def _refusal_cell(cited: CitedAnswer | None) -> str:
+    tag = _refusal_tag(cited)
+    return f"да·{tag}" if tag else "нет"
+
+
+def _answer_text(run: ModeRun) -> str:
+    """The text a reader compares: the accepted cite answer, else the whole reply."""
+    if run.cited is not None and run.cited.quoted:
+        return run.cited.answer
+    return run.text
+
+
+def _refusal_line(cited: CitedAnswer | None) -> str:
+    """First line of the refusal as the reader sees it."""
+    if cited is None:
+        return "не знаю"
+    reason = RAG_UNKNOWN_TEXTS.get(cited.reason, cited.reason)
+    return f"{RAG_UNKNOWN_PREFIX} {reason}."
+
+
+def _print_cite_pair(n: int, row: EvalRow, detail: int, pair: tuple[str, str]) -> None:
+    width = console.out.width
+    head = f"#{row.question.id} "
+    question = " ".join(row.question.question.split())
+    if not row.ok or row.first_score is None or row.second_score is None:
+        tail = " · ошибка"
+        _print_line(head + _cut(question, width - len(head) - len(tail)) + tail)
+        return
+    cited = row.second.cited
+    r1, r2 = _ratio(row.first_score.facts), _ratio(row.second_score.facts)
+    if cited is not None and cited.quoted:
+        extra = f" · цитаты {_quotes_cell(cited)} · смысл {_verdict(row)}"
+    else:
+        tag = _refusal_tag(cited)
+        extra = f" · не знаю·{tag}" if tag else " · не знаю"
+    if n > detail:
+        tail = f" · {pair[0]} {r1} · cite {r2}{extra}"
+        _print_line(head + _cut(question, width - len(head) - cell_len(tail)) + tail)
+        return
+    _print_line(head + _cut(question, width - len(head)))
+    expected = " · ".join(" ".join(fact[0].split()) for fact in row.question.expect)
+    label = "   ожидается: "
+    _print_line(label + _cut(expected, width - cell_len(label)))
+    marks_w = max(2, len(row.question.expect))
+    name_w = max(len(pair[0]), 4)
+    for name, run, score in (
+        (pair[0], row.first, row.first_score),
+        ("cite", row.second, row.second_score),
+    ):
+        marks = "".join("✓" if found else "✗" for found in score.facts)
+        lead = f"   {name:<{name_w}} {marks:<{marks_w}} «"
+        room = width - cell_len(lead) - 1
+        _print_line(f"{lead}{_snippet(_answer_text(run), row.question.expect, room)}»")
+    if cited is not None and cited.quoted:
+        sources = _yes_no(row.second_score.sources_cited)
+        line = (
+            f"   цитаты {_quotes_cell(cited)} дословны · источник {sources} · смысл {_verdict(row)}"
+        )
+        reason = row.grounding.reason if row.grounding is not None else ""
+        if reason:
+            line += f" — {reason}"
+        _print_line(_cut(line, width))
+        for quote in cited.quotes:
+            mark = "✓" if quote.verified else "✗"
+            _print_line(_cut(f"   [{quote.n}] {mark} «{' '.join(quote.text.split())}»", width))
+    else:
+        _print_line(_cut(f"   {_refusal_line(cited)}", width))
+    console.out.print()
+
+
+OUTCOME_CELLS = {
+    "refused": "не знаю ✓",
+    "unverified": "неподтв.",
+    "format": "ошибка формата",
+    "answered": "ответил ✗",
+}
+
+
+def _outcome_cell(run: ModeRun) -> str:
+    """`≈` marks the `says_unknown` heuristic used for modes without a structured result."""
+    cell = OUTCOME_CELLS[rag_module.unanswerable_outcome(run.text, run.cited)]
+    return cell if run.cited is not None else f"≈{cell}"
+
+
+def _print_un_line(row: UnRow, pair: tuple[str, str]) -> None:
+    width = console.out.width
+    head = f"#{row.question.id} "
+    question = " ".join(row.question.question.split())
+    if not row.ok:
+        tail = " · ошибка"
+    else:
+        tail = f" · {pair[0]} {_outcome_cell(row.first)} · cite {_outcome_cell(row.second)}"
+    _print_line(head + _cut(question, width - len(head) - cell_len(tail)) + tail)
+
+
+def unanswerable_table(rows: list[UnRow], pair: tuple[str, str]) -> Table:
+    first, second = _labels(pair)
+    table = Table(
+        title=f"Вопросы без ответа в репо: {first} и {second} (≈ — эвристика по тексту)",
+        title_justify="left",
+    )
+    table.add_column("#", justify="right", no_wrap=True)
+    table.add_column("вопрос", no_wrap=True)
+    table.add_column(pair[0], justify="right", no_wrap=True)
+    table.add_column("cite", justify="right", no_wrap=True)
+    for row in rows:
+        question = _cut(" ".join(row.question.question.split()), UN_QUESTION_CELL)
+        if not row.ok:
+            table.add_row(str(row.question.id), question, "ошибка", "ошибка")
+        else:
+            table.add_row(
+                str(row.question.id), question, _outcome_cell(row.first), _outcome_cell(row.second)
+            )
+    return table
+
+
+def print_cite_summary(rows: list[EvalRow], un_rows: list[UnRow], pair: tuple[str, str]) -> None:
+    """Last screen. Every share is over the pairs actually obtained (M), never the plan."""
+    first, second = _labels(pair)
+    done = [row for row in rows if row.ok]
+    planned, got = len(rows), len(done)
+    _out(f"Запланировано {planned} · получено {got} · без ответа {planned - got}")
+    if done:
+        cites = [row.second.cited for row in done]
+        sources = sum(1 for c in cites if c is not None and c.quoted_sources)
+        with_quotes = sum(1 for c in cites if c is not None and c.quotes)
+        verbatim = sum(
+            1 for c in cites if c is not None and c.quotes and c.verified_quotes == len(c.quotes)
+        )
+        unknown = sum(1 for c in cites if c is not None and c.status == "unknown")
+        _out(
+            f"Источники в ответе {sources}/{got} · цитаты {with_quotes}/{got} · "
+            f"все цитаты дословны {verbatim}/{got} · «не знаю» на отвечаемых {unknown}/{got}"
+        )
+        verdicts = [_verdict(row) for row in done]
+        counts = {v: verdicts.count(v) for v in ("да", "частично", "нет", NOT_RATED, NOT_JUDGED)}
+        _out(
+            f"Смысл по judge, из {got}: да {counts['да']} · частично {counts['частично']} · "
+            f"нет {counts['нет']} · н/о {counts[NOT_RATED]} · не оценивался {counts[NOT_JUDGED]}"
+        )
+        facts_total = sum(len(row.question.expect) for row in done)
+        first_facts = sum(row.first_score.facts_found for row in done)
+        second_facts = sum(row.second_score.facts_found for row in done)
+        _out(
+            f"Фактов найдено: {first} {first_facts}/{facts_total} · "
+            f"{second} {second_facts}/{facts_total} (из текста ответа, не из цитат)"
+        )
+    else:
+        _out("Ни одна пара ответов не получена — сравнивать нечего.")
+    got_un = [row for row in un_rows if row.ok]
+    if un_rows:
+        _out(
+            f"Без ответа в репо: запланировано {len(un_rows)} · получено {len(got_un)} · "
+            f"без ответа {len(un_rows) - len(got_un)}"
+        )
+        outcomes = [rag_module.unanswerable_outcome(r.second.text, r.second.cited) for r in got_un]
+        first_refused = sum(
+            1
+            for r in got_un
+            if rag_module.unanswerable_outcome(r.first.text, r.first.cited) == "refused"
+        )
+        _out(
+            f"«Не знаю» на неотвечаемых: cite {outcomes.count('refused')}/{len(got_un)} · "
+            f"{first} ≈{first_refused}/{len(got_un)} (эвристика) · "
+            f"неподтв. {outcomes.count('unverified')} · ошибка формата {outcomes.count('format')}"
+        )
+    # Spend counts every completed call, including the first run of a failed pair.
+    pair_runs = [run for row in rows for run in (row.first, row.second) if run is not None]
+    pair_runs += [run for row in un_rows for run in (row.first, row.second) if run is not None]
+    cite_runs = [run for run in pair_runs if run.mode == "cite"]
+    _out(f"Без вызова модели: {sum(1 for run in cite_runs if not run.model_called)}")
+    first_runs = [run for run in pair_runs if run.mode == pair[0]]
+    p1 = _sum([run.prompt_tokens for run in first_runs])
+    c1 = _sum([run.completion_tokens for run in first_runs])
+    p2 = _sum([run.prompt_tokens for run in cite_runs])
+    c2 = _sum([run.completion_tokens for run in cite_runs])
+    embed = _sum([run.ctx.embed_tokens for run in pair_runs if run.ctx is not None] or [0])
+    _out(
+        f"Токены prompt/completion: {first} {_tokens(p1)}/{_tokens(c1)} · "
+        f"{second} {_tokens(p2)}/{_tokens(c2)} · embed {_tokens(embed)}"
+    )
+    staged = [run for run in pair_runs if run.mode in ("full", "cite")]
+    judged = [row.grounding.result for row in done if row.grounding and row.grounding.result]
+    aux_p = _sum(
+        [run.ctx.aux_prompt_tokens if run.ctx else None for run in staged]
+        + [result.usage.prompt_tokens for result in judged]
+    )
+    aux_c = _sum(
+        [run.ctx.aux_completion_tokens if run.ctx else None for run in staged]
+        + [result.usage.completion_tokens for result in judged]
+    )
+    _out(f"aux (rewrite+rerank+judge) prompt/completion: {_tokens(aux_p)}/{_tokens(aux_c)}")
+    _out(
+        "Один прогон на ячейку. «Цитаты дословны» — не «ответ подтверждён»: смысл оценивает "
+        "judge (та же ministral-14b), его вердикт — оценка, не истина."
+    )
+
+
 def run_eval(
     questions_path: Path | None = None,
     strategy: str = "structure",
@@ -557,32 +998,46 @@ def run_eval(
     pair: str = DEFAULT_PAIR,
     k_before: int = 20,
     threshold: float = 5.0,
+    unanswerable: bool = True,
+    unanswerable_path: Path | None = None,
 ) -> list[EvalRow]:
     """Run the control-question evaluation and print the result."""
     modes = parse_pair(pair)
+    cite_pair = modes[1] == "cite"
     db_path = Path(db) if db is not None else None
     config = make_config(model, strategy, k, k_before, threshold)
     rag_module.check_index(db_path, strategy)
     valid, _ = _load_valid_questions(questions_path, db_path, strategy)
-    day = journal_day(modes)
-    agent = build_agent(config, db_path, day)
+    un_questions: list[rag_module.UnanswerableQuestion] = []
+    if cite_pair and unanswerable:
+        un_questions = rag_module.load_unanswerable(unanswerable_path or UNANSWERABLE_PATH)
+    days = mode_days(modes)
+    agents = build_agents(config, db_path, modes)
     rows: list[EvalRow] = []
     for n, question in enumerate(valid, start=1):
+        first = second = None
         try:
-            first = _run_mode_retry(agent, question, mode=modes[0], day=day)
-            second = _run_mode_retry(agent, question, mode=modes[1], day=day)
+            first = _run_mode_retry(agents[modes[0]], question, mode=modes[0], day=days[modes[0]])
+            second = _run_mode_retry(agents[modes[1]], question, mode=modes[1], day=days[modes[1]])
         except AdventError as error:
             console.warn(f"вопрос #{question.id} не оценён: {error.message}")
-            rows.append(EvalRow(question, None, None, None, None, error=error.message))
+            # A completed first run is already paid for: keep it so the spend
+            # totals count it (comparison metrics still use complete pairs only).
+            rows.append(EvalRow(question, first, second, None, None, error=error.message))
             _print_pair(n, rows[-1], detail, modes)
             continue
+        grounding, judge_error = _judge(question, second) if cite_pair else (None, None)
         rows.append(
             EvalRow(
                 question=question,
                 first=first,
                 second=second,
-                first_score=rag_module.score_answer(question, first.text, first.ctx),
-                second_score=rag_module.score_answer(question, second.text, second.ctx),
+                first_score=rag_module.score_answer(question, first.text, first.ctx, first.cited),
+                second_score=rag_module.score_answer(
+                    question, second.text, second.ctx, second.cited
+                ),
+                grounding=grounding,
+                judge_error=judge_error,
             )
         )
         _print_pair(n, rows[-1], detail, modes)
@@ -592,10 +1047,30 @@ def run_eval(
             )
             print_mode_answer(modes[0], first)
             print_mode_answer(modes[1], second)
+    un_rows: list[UnRow] = []
+    if un_questions:
+        console.out.print()
+        for uq in un_questions:
+            first = second = None
+            try:
+                first = _run_mode_retry(agents[modes[0]], uq, mode=modes[0], day=days[modes[0]])
+                second = _run_mode_retry(agents[modes[1]], uq, mode=modes[1], day=days[modes[1]])
+            except AdventError as error:
+                console.warn(f"вопрос #{uq.id} не оценён: {error.message}")
+                un_rows.append(UnRow(uq, first, second, error=error.message))
+            else:
+                un_rows.append(UnRow(uq, first, second))
+            _print_un_line(un_rows[-1], modes)
     if rows:
         console.out.print()
     console.out.print(eval_table(rows, modes))
-    print_summary(rows, modes)
+    if cite_pair:
+        if un_rows:
+            console.out.print()
+            console.out.print(unanswerable_table(un_rows, modes))
+        print_cite_summary(rows, un_rows, modes)
+    else:
+        print_summary(rows, modes)
     return rows
 
 
@@ -608,7 +1083,9 @@ def register_eval(app: typer.Typer) -> None:
             None, "--questions", help="Файл контрольных вопросов."
         ),
         pair: str = typer.Option(
-            DEFAULT_PAIR, "--pair", help="Пара режимов: off,plain | off,full | plain,full."
+            DEFAULT_PAIR,
+            "--pair",
+            help="Пара режимов: off,plain | off,full | plain,full | off,cite | full,cite.",
         ),
         strategy: str = typer.Option("structure", "--strategy", help="fixed | structure."),
         k: int = typer.Option(5, "-k", "--top-k", min=1, help="Сколько чанков прикладывать."),
@@ -629,6 +1106,11 @@ def register_eval(app: typer.Typer) -> None:
             min=0,
             help="Сколько первых вопросов показать подробно: ожидаемое и выдержки ответов.",
         ),
+        unanswerable: bool = typer.Option(
+            True,
+            "--unanswerable/--no-unanswerable",
+            help="Режим cite: добавить вопросы без ответа в репо (ожидается «не знаю»).",
+        ),
     ) -> None:
         """10 контрольных вопросов: ответы в двух режимах, факты и источники."""
         run_eval(
@@ -642,6 +1124,7 @@ def register_eval(app: typer.Typer) -> None:
             pair,
             k_before,
             threshold,
+            unanswerable,
         )
 
 

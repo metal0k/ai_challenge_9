@@ -166,6 +166,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 5 and day == 24:
+        return _demo_steps_w05d24()
     if week == 5 and day == 23:
         return _demo_steps_w05d23()
     if week == 5 and day == 22:
@@ -2008,6 +2010,66 @@ def _demo_steps_w05d23() -> list[Step]:
             module="week_05.cli",
             args=["eval", "--pair", "plain,full", "--detail", "3"],
             timeout=600,
+            line_pause=8.0,
+        ),
+    ]
+
+
+_W05D24_HIT_QUESTION = _W05D23_HIT_QUESTION
+_W05D24_TARIFF_QUESTION = (
+    "Какой тариф Mistral оплачен на аккаунте проекта и сколько он стоит в месяц?"
+)
+_W05D24_PG_QUESTION = "Какая база данных PostgreSQL используется для хранения сессий агента?"
+_W05D24_CLARIFY = "про хранение сессий в файлах"
+_W05D24_SESSION_ARGS = ["--session", "w05d24-demo", "--max-tokens", "400"]
+
+
+def _demo_steps_w05d24() -> list[Step]:
+    """Day 24 — cited answers and «не знаю»: cite ask, full vs cite on a repo-shaped question
+    without an answer, the agent's refusal and clarification, eval with the unanswerable set.
+
+    `eval` is last: the cite table and the summary are the day's headline and belong on
+    the closing screen. The agent step ends with `/rag off` so the saved session state
+    does not carry `cite` into later sessions.
+    """
+    return [
+        Step(
+            title="1. adventrag ask --cite — ответ с источниками и цитатами",
+            module="week_05.cli",
+            args=["ask", "--cite", _W05D24_HIT_QUESTION],
+            timeout=180,
+            line_pause=8.0,
+        ),
+        Step(
+            title=(
+                "2. adventrag ask --pair full,cite — вопрос без ответа: "
+                "cite говорит «не знаю» и просит уточнить"
+            ),
+            module="week_05.cli",
+            args=["ask", _W05D24_TARIFF_QUESTION, "--pair", "full,cite"],
+            timeout=240,
+            line_pause=8.0,
+        ),
+        Step(
+            title="3. Агент: /rag cite — отказ, уточнение, ответ",
+            module="week_02.cli",
+            args=_W05D24_SESSION_ARGS,
+            stdin_lines=[
+                "/new",
+                "/rag cite",
+                _W05D24_PG_QUESTION,
+                _W05D24_CLARIFY,
+                "/rag off",
+                "/exit",
+            ],
+            timeout=240,
+            line_pause=6.0,
+        ),
+        Step(
+            title="4. adventrag eval — full против cite: 2 подробно, неотвечаемые, итог",
+            module="week_05.cli",
+            args=["eval", "--pair", "full,cite", "--detail", "2"],
+            timeout=900,
             line_pause=8.0,
         ),
     ]

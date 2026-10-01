@@ -67,9 +67,21 @@ from advent_core.params import (
     DEFAULT_RAG_THRESHOLD,
 )
 from advent_core.profiles import messages as profile_messages
-from advent_core.rag import RagContext, RagSettings, RetrieveFn, build_rag_prompt
+from advent_core.rag import (
+    RAG_UNKNOWN_PREFIX,
+    CitedAnswer,
+    RagContext,
+    RagHit,
+    RagSettings,
+    RetrieveFn,
+    build_cite_prompt,
+    build_rag_prompt,
+    parse_cited,
+    render_cited,
+    unknown_answer,
+)
 from advent_core.task_state import TaskState, task_messages
-from advent_core.telemetry import CallResult
+from advent_core.telemetry import CallResult, Usage
 from advent_core.tokens import TokenCounter, reconcile
 
 if TYPE_CHECKING:
@@ -352,6 +364,17 @@ class AgentReply:
     tool_round_results: tuple[CallResult, ...] = ()
     # Day 22: retrieval done for this turn (None when rag is off or unwired).
     rag: RagContext | None = None
+    # Day 24 (cite mode). `result` stays the raw model call (journal, reconcile);
+    # `text` is the history form, `display_text` the screen form (adds the
+    # rejected draft of an unverified answer). All three are None/default
+    # outside cite mode.
+    cited: CitedAnswer | None = None
+    display_text: str | None = None
+    # False for a refusal made by code: `result` is then a synthetic zero-usage
+    # CallResult that must not be journaled, reconciled or footed.
+    model_called: bool = True
+    # Set only when a cite refusal's follow-up passed the refused question to the rewrite step.
+    rag_previous: str | None = None
 
 
 def marker_instruction(kind: str, needle: str) -> str:
@@ -584,13 +607,17 @@ class Agent:
     @property
     def rag_settings(self) -> RagSettings:
         p = self.config.params
+        # cite forces both stages: without rerank there is no usable threshold
+        # (cosine is too compressed to cut on, CLAUDE.md day 23).
+        cite = bool(p.rag_cite)
         return RagSettings(
             strategy=self.rag_strategy,
             k=self.rag_k,
             k_before=DEFAULT_RAG_K_BEFORE if p.rag_k_before is None else p.rag_k_before,
-            rewrite=bool(p.rag_rewrite),
-            rerank=bool(p.rag_rerank),
+            rewrite=bool(p.rag_rewrite) or cite,
+            rerank=bool(p.rag_rerank) or cite,
             threshold=DEFAULT_RAG_THRESHOLD if p.rag_threshold is None else p.rag_threshold,
+            cite=cite,
         )
 
     # --- предупреждения наверх -------------------------------------------
@@ -1654,7 +1681,58 @@ class Agent:
         # keep the bare question, so chunks are never re-sent on later turns.
         rag_ctx: RagContext | None = None
         request_input = user_input
-        if self.rag_enabled:
+        cite = bool(self.config.params.rag_cite)
+        cite_hits: tuple[RagHit, ...] | None = None
+        rag_previous: str | None = None
+        if cite:
+            # JSON answer + stop sequence, a tool loop, or the dialog marker
+            # would each break the contract; refuse before anything is paid.
+            if self.mcp_enabled or self.mode == "dialog":
+                raise ConfigurationError(
+                    "rag_cite несовместим с "
+                    + ("MCP-инструментами" if self.mcp_enabled else "mode=dialog"),
+                    hint="выключи один из двух: /rag off или "
+                    + ("/mcp off" if self.mcp_enabled else "/mode chat"),
+                )
+            refusal: CitedAnswer | None = None
+            if not self.rag_enabled or self._retrieve is None:
+                self._warn(
+                    "rag_cite включён, но rag выключен или индекс не подключён — "
+                    "ответ «не знаю», модель не вызывается",
+                    once=True,
+                )
+                refusal = unknown_answer("no_index")
+            else:
+                # The bare input is the search query; the refused question goes
+                # only to the rewrite step (a cancelled premise must not be searched).
+                prior = self._refused_question(history)
+                settings = self.rag_settings
+                if prior is not None:
+                    settings = replace(settings, previous=prior)
+                    rag_previous = prior
+                rag_ctx = self._retrieve(user_input, settings)
+                for warning in rag_ctx.warnings:
+                    self._warn(warning)
+                if not rag_ctx.hits:
+                    near = rag_ctx.trace.reranked if rag_ctx.trace is not None else ()
+                    refusal = unknown_answer("empty_context", near)
+                else:
+                    cite_hits = rag_ctx.hits
+                    request_input = build_cite_prompt(user_input, cite_hits)
+            if refusal is not None:
+                return self._cite_refusal(
+                    refusal,
+                    user_input,
+                    history,
+                    rag_ctx=rag_ctx,
+                    rag_previous=rag_previous,
+                    summary=summary,
+                    facts=facts,
+                    facts_upto=facts_upto,
+                    memory=memory,
+                    memory_upto=memory_upto,
+                )
+        elif self.rag_enabled:
             if self._retrieve is None:
                 self._warn("rag включён, но индекс не подключён — ход идёт без RAG", once=True)
             else:
@@ -1918,7 +1996,11 @@ class Agent:
         # Whether `tools` went into the payload this turn — decided BEFORE the
         # call, so it holds even when the model never touched a tool.
         tool_messages_sent = bool(self.mcp_enabled and self.tools and self._call_tool)
-        if tool_messages_sent:
+        if cite_hits is not None:
+            # Cite: JSON for THIS request only, never streamed (the answer is
+            # rendered by code from the parsed fields).
+            result = self._complete(self._cite_config(), messages, self.capabilities)
+        elif tool_messages_sent:
             # Tools take the complete() path whatever on_chunk says — the
             # decision is made before it is known whether the model will even
             # call a tool, so /mcp on silences streaming for the whole session
@@ -1981,7 +2063,19 @@ class Agent:
 
         new_history = [*trimmed.history, {"role": "user", "content": user_input}]
         assistant_text = result.text
-        if result.truncated:
+        cited: CitedAnswer | None = None
+        display_text: str | None = None
+        if cite_hits is not None:
+            # Total: nothing between complete() and the return can raise on the
+            # content of the reply (the call is paid and the caller journals it).
+            cited = parse_cited(
+                result.text,
+                cite_hits,
+                truncated=result.finish_reason == "length" or result.truncated,
+            )
+            assistant_text = render_cited(cited, cite_hits, for_history=True)
+            display_text = render_cited(cited, cite_hits, for_history=False)
+        elif result.truncated:
             # Сохранённая часть остаётся, но едет с пометкой: следующий ход
             # модели должен видеть обрыв (SPEC-w02d06.md §12).
             assistant_text = f"{assistant_text}\n\n{INTERRUPT_NOTE}".strip()
@@ -2005,7 +2099,7 @@ class Agent:
             context_exact = True
 
         return AgentReply(
-            text=result.text,
+            text=assistant_text if cited is not None else result.text,
             history=new_history,
             result=result,
             dropped=trimmed.dropped,
@@ -2029,6 +2123,79 @@ class Agent:
             tool_calls=tuple(tool_logs),
             tool_round_results=tuple(tool_rounds),
             rag=rag_ctx,
+            cited=cited,
+            display_text=display_text,
+            rag_previous=rag_previous,
+        )
+
+    # --- cite mode (day 24) --------------------------------------------------
+
+    @staticmethod
+    def _refused_question(history: Sequence[Message]) -> str | None:
+        """The user question a cite refusal answered, when the last turn was one.
+
+        A follow-up to «Не знаю: ... Уточните вопрос» is a clarification, and
+        retrieval on the clarification alone would lose what it clarifies.
+        """
+        if len(history) < 2:
+            return None
+        last, before = history[-1], history[-2]
+        if last.get("role") != "assistant" or before.get("role") != "user":
+            return None
+        if not str(last.get("content", "")).startswith(RAG_UNKNOWN_PREFIX):
+            return None
+        return str(before.get("content", "")) or None
+
+    def _cite_config(self) -> Config:
+        """A copy for the cite request: JSON, no stream, no `stop` (it could cut the JSON)."""
+        if self.config.params.stop:
+            self._warn(
+                "в режиме rag_cite stop не отправляется: он мог бы оборвать JSON ответа",
+                once=True,
+            )
+        params = replace(self.config.params, format="json", schema_file=None, stop=None)
+        return replace(self.config, stream=False, params=params)
+
+    def _cite_refusal(
+        self,
+        refusal: CitedAnswer,
+        user_input: str,
+        history: list[Message],
+        *,
+        rag_ctx: RagContext | None,
+        rag_previous: str | None,
+        summary: str | None,
+        facts: dict[str, str] | None,
+        facts_upto: int,
+        memory: MemorySnapshot | None,
+        memory_upto: int,
+    ) -> AgentReply:
+        """A refusal made by code: no model call, bare question + «Не знаю…» into history."""
+        text = render_cited(refusal, (), for_history=True)
+        strategy = self.context_strategy
+        return AgentReply(
+            text=text,
+            history=[
+                *history,
+                {"role": "user", "content": user_input},
+                {"role": "assistant", "content": text},
+            ],
+            # Synthetic, zero usage: the caller must not journal or reconcile it.
+            result=CallResult(
+                model_requested=self.config.model,
+                stream=False,
+                usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+            ),
+            summary=summary,
+            facts=dict(facts) if facts else {},
+            facts_upto=facts_upto,
+            memory=(memory or MemorySnapshot()) if strategy == "memory" else None,
+            memory_upto=memory_upto if strategy == "memory" else 0,
+            rag=rag_ctx,
+            cited=refusal,
+            display_text=text,
+            model_called=False,
+            rag_previous=rag_previous,
         )
 
     def _detect_done(self, text: str) -> bool:

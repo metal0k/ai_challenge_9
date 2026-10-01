@@ -142,6 +142,11 @@ INVARIANT_DAY = 14
 MCP_WEEK = 4
 MCP_DAY = 17
 MCP_ROUTER_DAY = 20
+# RAG turns journal under week 05 and the day of the /rag mode in effect (SPEC-w05d24 §9a.14).
+RAG_WEEK = 5
+RAG_DAY_PLAIN = 22
+RAG_DAY_FULL = 23
+RAG_DAY_CITE = 24
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -807,6 +812,7 @@ class AgentShell:
             "rag": lambda v: isinstance(v, bool),
             "rag_rewrite": lambda v: isinstance(v, bool),
             "rag_rerank": lambda v: isinstance(v, bool),
+            "rag_cite": lambda v: isinstance(v, bool),
             "rag_k_before": lambda v: isinstance(v, int) and not isinstance(v, bool),
             "rag_threshold": lambda v: (
                 isinstance(v, int | float)
@@ -836,6 +842,10 @@ class AgentShell:
             except AdventError as error:
                 self.config.params.set("rag", False)
                 console.warn(f"rag не включён: {_with_hint(error)}")
+        # Invariant: rag_cite implies rag (SPEC-w05d24 §9a.6).
+        if self.config.params.rag_cite and not self.config.params.rag:
+            self.config.params.set("rag_cite", False)
+            console.warn("rag_cite не включён: rag выключен")
 
     def _apply_session_mcp(self, session: Session) -> None:
         """Reads the `mcp_enabled` key — three cases, like `context_limit` above.
@@ -891,6 +901,30 @@ class AgentShell:
         """
         if not hasattr(self, "agent"):
             return
+        # Before the tools: a session that wants MCP must not be refused by a
+        # rag_cite that only survived from the previous session.
+        self._reconcile_cite()
+        self._restore_mcp_tools()
+
+    def _reconcile_cite(self) -> None:
+        """Turn a restored rag_cite off when the session's mode/MCP conflicts with it.
+
+        The per-key reads cannot see this: a session file without a `rag_cite`
+        key keeps the loaded value, while its own mode=dialog or MCP wish loads
+        next to it (SPEC-w05d24 §9c.3). Runs after both are applied.
+        """
+        if not self.config.params.rag_cite:
+            return
+        reason = None
+        if self.mcp_restore or self.agent.mcp_enabled:
+            reason = "сессия с MCP-инструментами"
+        elif self.agent.mode == "dialog":
+            reason = "сессия в mode=dialog"
+        if reason is not None:
+            self.config.params.set("rag_cite", False)
+            console.warn(f"rag_cite выключен: {reason} несовместима с ним")
+
+    def _restore_mcp_tools(self) -> None:
         if self.mcp_restore and not self.agent.mcp_enabled:
             console.note(f"в сессии {self.session.name} инструменты MCP были включены")
             if not _mcp_enable(self):
@@ -1298,7 +1332,12 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
     # result.stream, а не streaming: решение о стриме принимает агент, и
     # печатать ответ второй раз на несовпадении этих двух значений — самый
     # дешёвый способ получить дубль в кадре.
-    if reply.result.stream:
+    if reply.cited is not None:
+        # Product to stdout, rendered by code (the raw JSON stays in `result`).
+        console.out.print(
+            reply.display_text or reply.text, markup=False, highlight=False, emoji=False
+        )
+    elif reply.result.stream:
         console.finish_answer()
     else:
         console.print_answer(reply.result, shell.config.params.format or "text")
@@ -1352,11 +1391,20 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
         rewrite_line = _rag_rewrite_note(reply.rag)
         if rewrite_line:
             console.note(rewrite_line)
+    if reply.rag_previous is not None:
+        console.note("rag: rewrite учёл предыдущий вопрос")
+    if reply.cited is not None:
+        console.note(_cite_note(reply))
+    if not reply.model_called:
+        # A refusal made by code: no model call, so no footer, no reconcile and
+        # no chat row in the journal (the aux calls are already journaled).
+        return reply
     console.footer(reply.result, completion_estimate=_completion_estimate(shell, reply))
     # reconcile() — чистая функция: калибровку счётчика уже сделал агент, здесь
     # только показ. Сверять надо с тем, что РЕАЛЬНО ушло в API (sent_messages):
     # слой формата дописывает инструкцию внутри chat._payload(), и сверка «до
     # слоя» дала бы стабильную ложную дельту.
+    journal_week, journal_day = _journal_coords(shell, reply)
     if not shell.agent.mcp_enabled:
         # С инструментами сверять нечего: схемы tools уходят в запрос отдельным
         # полем payload, в sent_messages их нет, и локальный счёт занижен ровно
@@ -1375,14 +1423,52 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             invariants=shell.invariants,
         )
         or [{"role": "user", "content": question}],
-        week=WEEK,
-        day=DAY,
+        week=journal_week,
+        day=journal_day,
     )
     # Right after the turn's own row: the extra function-calling rounds and
     # the tool invocations themselves (day 17). Here rather than in _turn()
     # because /again goes through _ask() too and its rounds cost the same.
     _report_tool_use(shell, reply)
     return reply
+
+
+def _journal_coords(shell: AgentShell, reply: AgentReply) -> tuple[int, int]:
+    """(week, day) of the turn's chat row: a RAG turn follows the /rag mode in effect."""
+    if reply.rag is None:
+        return WEEK, DAY
+    settings = shell.agent.rag_settings
+    if settings.cite:
+        return RAG_WEEK, RAG_DAY_CITE
+    if settings.rewrite or settings.rerank:
+        return RAG_WEEK, RAG_DAY_FULL
+    return RAG_WEEK, RAG_DAY_PLAIN
+
+
+def _cite_note(reply: AgentReply) -> str:
+    """One stderr line for a cite turn; never says the answer is «подтверждён»."""
+    cited = reply.cited
+    assert cited is not None
+    if not reply.model_called:
+        line = "не знаю · модель не вызывалась"
+        ctx = reply.rag
+        if (
+            ctx is not None
+            and ctx.aux_prompt_tokens is not None
+            and ctx.aux_completion_tokens is not None
+        ):
+            line += (
+                f" · aux {_thousands(ctx.aux_prompt_tokens)}+"
+                f"{_thousands(ctx.aux_completion_tokens)} ток."
+            )
+        return line
+    total = len(cited.quotes)
+    quotes = f"цитаты: {cited.verified_quotes}/{total} дословны"
+    if cited.quoted:
+        return quotes
+    if total:
+        return f"не знаю · {cited.reason} · {quotes}"
+    return f"не знаю · {cited.reason}"
 
 
 def _journal_messages(
@@ -1733,6 +1819,8 @@ def _save_state(shell: AgentShell) -> None:
     shell.session.state["rag_rerank"] = rag_settings.rerank
     shell.session.state["rag_k_before"] = rag_settings.k_before
     shell.session.state["rag_threshold"] = rag_settings.threshold
+    # Day 24, additive (no SESSION_VERSION bump): absent in older files.
+    shell.session.state["rag_cite"] = rag_settings.cite
     shell.session.state["facts"] = shell.facts
     shell.session.state["facts_pinned"] = list(shell.facts_pinned)
     shell.session.state["facts_upto"] = shell.facts_upto
@@ -2174,6 +2262,9 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
     if name == "mode" and raw.strip().lower() == "dialog" and shell.task is not None:
         console.warn("mode=dialog несовместим с retained task — сначала /task clear")
         return False
+    if name == "mode" and raw.strip().lower() == "dialog" and shell.agent.rag_settings.cite:
+        console.warn("mode=dialog несовместим с rag_cite — сначала /rag plain или /rag off")
+        return False
 
     # Captured BEFORE .set() mutates it: _maybe_backfill_facts needs to know
     # what the strategy was to tell "just switched to facts" from "already
@@ -2190,6 +2281,20 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
     # правило живёт в реестре параметров, а не здесь.
     shell.config.params.apply_defaults(AGENT_COMMAND)
     value = getattr(shell.config.params, name)
+    # rag off takes rag_cite with it (rag_cite implies rag, SPEC-w05d24 §9a.6).
+    if name == "rag" and not value:
+        shell.config.params.set("rag_cite", False)
+    if name == "rag_cite" and value:
+        reason = _cite_conflict(shell)
+        if reason is None and not shell.agent.rag_enabled:
+            # Same enable path as /rag: the index check lives in the recursive call.
+            _apply_set(shell, "rag", "on")
+            if not shell.agent.rag_enabled:
+                reason = "rag не включился"
+        if reason is not None:
+            shell.config.params.set("rag_cite", False)
+            console.warn(f"rag_cite не включён: {reason}")
+            return False
     # The one enable path (also behind /rag): an index that is not there refuses
     # BEFORE the confirmation, and the value goes back to what it was.
     if (name == "rag" and value) or (name == "rag_strategy" and shell.agent.rag_enabled):
@@ -2335,7 +2440,17 @@ RAG_PARAMS = (
     "rag_rerank",
     "rag_k_before",
     "rag_threshold",
+    "rag_cite",
 )
+
+
+def _cite_conflict(shell: AgentShell) -> str | None:
+    """Why rag_cite cannot be on right now (SPEC-w05d24 §9a.10), None when it can."""
+    if shell.agent.mcp_enabled:
+        return "несовместим с MCP-инструментами — сначала /mcp off"
+    if shell.agent.mode == "dialog":
+        return "несовместим с mode=dialog — сначала /mode chat"
+    return None
 
 
 def _rag_retriever():
@@ -2347,7 +2462,18 @@ def _rag_retriever():
     # importable without week_05.
     from week_05.rag import make_retriever
 
-    return make_retriever()
+    def retrieve(question, settings):
+        # The /rag mode can change between turns, so journal coordinates are
+        # resolved per call: embed and aux rows follow the mode, like the chat row.
+        if settings.cite:
+            day = RAG_DAY_CITE
+        elif settings.rewrite or settings.rerank:
+            day = RAG_DAY_FULL
+        else:
+            day = RAG_DAY_PLAIN
+        return make_retriever(day=day, aux_day=day)(question, settings)
+
+    return retrieve
 
 
 def _rag_check_index(strategy: str):
@@ -2364,20 +2490,30 @@ def _with_hint(error: AdventError) -> str:
 @command(
     "/rag",
     "RAG по индексу репозитория: без значения — состояние; plain — косинус top-k, "
-    "full — rewrite + rerank + порог",
-    usage="/rag on | off | plain | full",
+    "full — rewrite + rerank + порог; cite — full + ответ с дословными цитатами и «не знаю»",
+    usage="/rag on | off | plain | full | cite",
 )
 def _cmd_rag(shell: AgentShell, args: list[str]) -> bool:
     """Shorthand for `/set rag`, like /strategy: one enable path, one check."""
-    if args and args[0].lower() in ("plain", "full") and len(args) == 1:
-        full = args[0].lower() == "full"
+    if args and args[0].lower() in ("plain", "full", "cite") and len(args) == 1:
+        mode = args[0].lower()
+        if mode == "cite":
+            reason = _cite_conflict(shell)
+            if reason is not None:
+                console.warn(f"rag_cite не включён: {reason}")
+                return False
         # Enable first (the one index check): a refused enable must not leave
         # stage flags switched behind a rag that is off.
         _cmd_set(shell, ["rag", "on"])
         if not shell.agent.rag_enabled:
             return False
+        if mode != "cite":
+            # Before the stage flags below, whose _save_state then writes it.
+            shell.config.params.set("rag_cite", False)
         for name in ("rag_rewrite", "rag_rerank"):
-            _cmd_set(shell, [name, "on" if full else "off"])
+            _cmd_set(shell, [name, "on" if mode != "plain" else "off"])
+        if mode == "cite":
+            _cmd_set(shell, ["rag_cite", "on"])
         return False
     if args:
         return _cmd_set(shell, ["rag", *args])
@@ -2403,6 +2539,8 @@ def _cmd_rag(shell: AgentShell, args: list[str]) -> bool:
         shown = " · ".join(stages)
     else:
         shown = f"k={settings.k}"
+    if settings.cite:
+        shown += " · cite on"
     console.note(
         f"rag: on · {strategy} · {shown} · индекс {info.corpus_rev[:12]} ({info.n_chunks} чанков)"
     )
@@ -2649,6 +2787,13 @@ def _mcp_enable(shell: AgentShell) -> bool:
     gets it too — it used to respawn the server on every session switch.
     """
     from advent_core import mcp_client
+
+    if shell.agent.rag_settings.cite:
+        console.warn(
+            "инструменты MCP не включены: rag_cite несовместим с ними — "
+            "сначала /rag plain или /rag off"
+        )
+        return False
 
     partial = shell.mcp_router is not None and bool(shell.mcp_router.failed)
     if shell.agent.tools and shell.agent.call_tool and not partial:

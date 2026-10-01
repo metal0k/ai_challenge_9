@@ -674,3 +674,235 @@ def test_relevant_chunk_ids_is_empty_when_facts_are_spread_over_chunks():
     q = _question(expect=(("альфа",), ("бета",)))
 
     assert rag.relevant_chunk_ids(q, [_chunk("альфа", n=1), _chunk("бета", n=2)]) == frozenset()
+
+
+# --- Day 24: journal day, judge, cite scoring, unanswerable set ------------------------------
+
+
+def _cited(answer="окно 262144 токена", quote="окно 262144 токена", verified=True, hits=None):
+    from advent_core.rag import CitedAnswer, Quote
+
+    hit = RagHit("structure:CLAUDE.md#1", "CLAUDE.md", "Раздел", 0.9, "окно 262144 токена")
+    hits = hits if hits is not None else (hit,)
+    if not verified:
+        return CitedAnswer("unknown", "", (hit,), (), (Quote(1, quote, False),), "unverified",
+                           (), answer)  # fmt: skip
+    return CitedAnswer("answer", answer, (hit,), (hit,), (Quote(1, quote, True),), "")
+
+
+def test_aux_calls_follow_the_aux_day_argument_and_embedding_keeps_day(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1, 0.9)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever(day=24, aux_day=24)("q", _settings(rewrite=True, rerank=True))
+    assert [(r["week"], r["day"], r["extra"]["command"]) for r in seams["journal"]] == [
+        (5, 24, "rag_rewrite"),
+        (5, 24, "rag_rerank"),
+    ]
+    assert seams["embed"][0]["day"] == 24
+
+
+def test_aux_day_defaults_to_23_for_day_23_callers(seams):
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("q", _settings(rerank=True))
+    assert [r["day"] for r in seams["journal"]] == [23]
+
+
+def test_judge_journals_before_parsing_and_uses_the_given_day(seams):
+    seams["rerank_text"] = json.dumps({"verdict": "частично", "reason": " часть  ответа "})
+    cited = _cited()
+    g = rag.judge_grounding(cited, cited.sources, "Сколько?", day=24)
+    assert (g.verdict, g.reason) == ("частично", "часть ответа")
+    (row,) = seams["journal"]
+    assert (row["week"], row["day"], row["extra"]) == (5, 24, {"command": "rag_judge"})
+    assert seams["chat"][0]["config"].params.format == "json"
+    assert seams["chat"][0]["config"].params.temperature == 0
+
+
+def test_judge_prompt_shows_only_verified_quotes_and_no_expected_facts(seams):
+    from advent_core.rag import CitedAnswer, Quote
+
+    hit = RagHit("c#1", "CLAUDE.md", "Раздел", 0.9, "ПОЛНЫЙ-ТЕКСТ-ЧАНКА окно 262144 токена")
+    cited = CitedAnswer(
+        "answer", "ответ", (hit,), (hit,),
+        (Quote(1, "окно 262144 токена", True), Quote(1, "выдуманная цитата", False)), "",
+    )  # fmt: skip
+    seams["rerank_text"] = json.dumps({"verdict": "да", "reason": "ок"})
+    rag.judge_grounding(cited, (hit,), "Вопрос?", day=24)
+    prompt = seams["chat"][0]["messages"][-1]["content"]
+    assert "[1] «окно 262144 токена»" in prompt
+    assert "выдуманная" not in prompt
+    assert "ПОЛНЫЙ-ТЕКСТ-ЧАНКА" not in prompt
+    assert "Вопрос: Вопрос?" in prompt
+    assert "Ответ: ответ" in prompt
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["не JSON", "[]", '{"verdict": "возможно"}', '{"verdict": 3}', '{"reason": "x"}', "null"],
+)
+def test_judge_garbage_gives_none_not_no(seams, raw):
+    seams["rerank_text"] = raw
+    cited = _cited()
+    g = rag.judge_grounding(cited, cited.sources, "q", day=24)
+    assert g.verdict is None
+    assert len(seams["journal"]) == 1  # the paid call is on record even when unreadable
+
+
+def test_judge_accepts_a_fenced_verdict_and_normalises_case(seams):
+    seams["rerank_text"] = '```json\n{"verdict": " Да ", "reason": "ok"}\n```'
+    cited = _cited()
+    assert rag.judge_grounding(cited, cited.sources, "q", day=24).verdict == "да"
+
+
+def test_judge_is_not_called_for_a_refusal_or_an_unverified_answer(seams):
+    from advent_core.rag import unknown_answer
+
+    assert rag.judge_grounding(unknown_answer("empty_context"), (), "q", day=24).verdict is None
+    unverified = _cited(verified=False)
+    assert rag.judge_grounding(unverified, unverified.sources, "q", day=24).verdict is None
+    assert seams["chat"] == []
+    assert seams["journal"] == []
+
+
+def test_cite_score_uses_the_answer_only_and_quoted_sources_only():
+    q = _question(expect=(("262144",),), sources=("CLAUDE.md", "README.md"))
+    ctx = RagContext(
+        hits=(RagHit("c#1", "README.md", "Р", 0.9, "t"),),
+        strategy="structure",
+        k=5,
+        embed_model="m",
+        embed_tokens=1,
+        corpus_rev="r",
+    )
+    score = rag.score_answer(q, "ТЕКСТ ИЗ СТАРОГО ОТВЕТА 262144", ctx, _cited())
+    assert score.facts == (True,)
+    assert score.sources_cited == (True, False)  # CLAUDE.md is the quoted fragment
+    assert score.sources_retrieved == (False, True)
+
+
+def test_cite_score_of_refusal_and_unverified_draft_is_zero():
+    from advent_core.rag import unknown_answer
+
+    q = _question()
+    for cited in (unknown_answer("model_unknown"), _cited(answer="262144", verified=False)):
+        score = rag.score_answer(q, "262144 есть в тексте", None, cited)
+        assert score.facts == (False,)
+        assert score.sources_cited == (False,)
+
+
+def test_score_without_cite_is_unchanged():
+    score = rag.score_answer(_question(), "окно 262144, см. CLAUDE.md", None)
+    assert score.facts == (True,)
+    assert score.sources_cited == (True,)
+
+
+def test_load_unanswerable_reads_the_shipped_file():
+    items = rag.load_unanswerable(ROOT / "week_05" / "rag_unanswerable.json")
+    assert [i.id for i in items] == [101, 102, 103]
+    assert items[0].question == "Как приготовить борщ?"
+    assert items[1].question == (
+        "Какая база данных PostgreSQL используется для хранения сессий агента?"
+    )
+    assert items[2].question == (
+        "Какой тариф Mistral оплачен на аккаунте проекта и сколько он стоит в месяц?"
+    )
+    assert all(i.note for i in items)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"a": 1},
+        [1],
+        [{"question": "q"}],
+        [{"id": True, "question": "q"}],
+        [{"id": 1, "question": "  "}],
+        [{"id": 1, "question": "q", "note": 3}],
+        [{"id": 1, "question": "q"}, {"id": 1, "question": "r"}],
+    ],
+)
+def test_load_unanswerable_rejects_bad_files(tmp_path, data):
+    with pytest.raises(AdventError):
+        rag.load_unanswerable(_write(tmp_path, data))
+
+
+def test_load_unanswerable_missing_and_corrupt(tmp_path):
+    with pytest.raises(AdventError):
+        rag.load_unanswerable(tmp_path / "none.json")
+    bad = tmp_path / "bad.json"
+    bad.write_text("{", encoding="utf-8")
+    with pytest.raises(AdventError):
+        rag.load_unanswerable(bad)
+
+
+@pytest.mark.parametrize(
+    ("text", "answer", "quote", "expected"),
+    [
+        ("рендер без факта", "ответ без факта", "окно 262144 токена", False),  # only in the quote
+        ("Окно 262144 токена (рендер)", "ответ без факта", "цитата без факта", False),  # rendered
+        ("рендер без факта", "окно 262144 токена", "цитата без факта", True),  # only in answer
+    ],
+)
+def test_cite_score_counts_facts_from_cited_answer_alone(text, answer, quote, expected):
+    cited = _cited(answer=answer, quote=quote)
+    score = rag.score_answer(_question(expect=(("262144",),)), text, None, cited)
+    assert score.facts == (expected,)
+
+
+def _followup_agent():
+    from advent_core import chat as chat_core
+    from advent_core.agent import Agent
+    from advent_core.config import Config
+
+    main_calls: list[list[dict]] = []
+    answer = json.dumps(
+        {
+            "status": "answer",
+            "answer": "Порог равен 4242.",
+            "sources": [1],
+            "quotes": [{"id": 1, "text": "порог compaction равен 4242 токена"}],
+        },
+        ensure_ascii=False,
+    )
+
+    def main_complete(config, messages, capabilities=None, **kwargs):
+        main_calls.append(list(messages))
+        return CallResult(text=answer, usage=Usage(10, 5), stream=False, sent_messages=messages)
+
+    config = Config.resolve(model="ministral-14b-latest", stream=False)
+    config.params.rag = True
+    config.params.rag_cite = True
+    agent = Agent(
+        config,
+        complete=main_complete,
+        stream=chat_core.stream,
+        retrieve=rag.make_retriever(),
+    )
+    return agent, main_calls
+
+
+def test_cite_follow_up_embeds_the_bare_clarification_and_only_rewrite_sees_both(seams):
+    seams["search_fn"] = lambda row, k: [_sr("порог compaction равен 4242 токена", 1, 0.9)]
+    agent, main_calls = _followup_agent()
+
+    seams["rerank_text"] = _scores((1, 0))  # turn 1: below the threshold -> refusal
+    first = agent.ask("как оно устроено?", [])
+    assert first.cited is not None and first.cited.reason == "empty_context"
+    assert main_calls == []
+
+    seams["rerank_text"] = _scores((1, 9))
+    second = agent.ask("про порог compaction", first.history)
+
+    assert second.cited is not None and second.cited.quoted
+    embed_texts = [e["texts"] for e in seams["embed"]]
+    assert embed_texts[0][0] == "как оно устроено?"
+    assert embed_texts[1][0] == "про порог compaction"  # bare clarification, no concatenation
+    rewrite_prompts = [
+        c["messages"][-1]["content"]
+        for c in seams["chat"]
+        if c["messages"][-1]["content"].startswith("Перепиши")
+    ]
+    assert "Предыдущий вопрос" not in rewrite_prompts[0]
+    assert "Предыдущий вопрос: как оно устроено?" in rewrite_prompts[1]
+    assert "Уточнение: про порог compaction" in rewrite_prompts[1]
+    assert second.rag_previous == "как оно устроено?"

@@ -89,6 +89,7 @@ AGENT_PARAMS: tuple[str, ...] = (
     "rag_rerank",
     "rag_k_before",
     "rag_threshold",
+    "rag_cite",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -325,6 +326,13 @@ SPECS: tuple[Spec, ...] = (
         "rag_rerank",
         "bool",
         "RAG: LLM-rerank кандидатов и отсечение по порогу.",
+        local=True,
+        defaults={AGENT_COMMAND: False},
+    ),
+    Spec(
+        "rag_cite",
+        "bool",
+        "RAG: ответ JSON с источниками и дословными цитатами; без ответа в контексте — «не знаю».",
         local=True,
         defaults={AGENT_COMMAND: False},
     ),
@@ -570,6 +578,8 @@ class GenerationParams:
     rag_rerank: bool | None = None
     rag_k_before: int | None = None
     rag_threshold: float | None = None
+    # Day 24: cited answers; same None-means-command-default rule.
+    rag_cite: bool | None = None
 
     # Override лимита окна (день 08, SPEC-w02d08.md §4). None — «из карточки
     # модели»: у агента свой контракт на None, чем у max_turns выше — там

@@ -27,6 +27,18 @@ RAG_REWRITE_PROMPT = (
     "идентификаторы и английские эквиваленты. Верни только запрос одной "
     "строкой.\n\nВопрос: {question}"
 )
+# Follow-up after a cite refusal: only the rewrite sees the previous question,
+# retrieval's own query stays the bare clarification (a premise the clarification
+# cancels would otherwise be searched for again).
+RAG_REWRITE_FOLLOWUP_PROMPT = (
+    "Перепиши уточнение пользователя в поисковый запрос по документации и коду "
+    "Python-проекта: раскрой подразумеваемые термины, добавь вероятные "
+    "идентификаторы и английские эквиваленты. Сначала пользователь задал "
+    "предыдущий вопрос и получил отказ, затем уточнил. Уточнение важнее "
+    "предыдущего вопроса: посылки предыдущего вопроса, которые уточнение "
+    "отменяет, отбрось. Верни только запрос одной строкой.\n\n"
+    "Предыдущий вопрос: {previous}\n\nУточнение: {question}"
+)
 # "{n}" is substituted with str.replace: the JSON braces rule out str.format.
 RAG_RERANK_INSTRUCTION = (
     "Оцени, насколько каждый фрагмент помогает ответить на вопрос. "
@@ -66,6 +78,9 @@ class RagSettings:
     rewrite: bool
     rerank: bool
     threshold: float
+    cite: bool = False  # day 24: JSON answer with verbatim quotes, "don't know" refusal
+    # Day 24: question a cite refusal answered; only the rewrite step reads it.
+    previous: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,3 +323,225 @@ def cited_sources(answer: str, sources: Sequence[str]) -> tuple[bool, ...]:
         shared = sum(1 for other in sources if other.rsplit("/", 1)[-1] == base)
         results.append("/" in source and shared == 1 and _has_path(haystack, normalize(base)))
     return tuple(results)
+
+
+# --- Day 24: cited answers (SPEC-w05d24.md §2 + §9a) ---
+
+RAG_MIN_QUOTE_CHARS = 12  # after normalisation; shorter is not a quote ("1.5")
+RAG_CITE_INSTRUCTION = (
+    "Ответь только по фрагментам документации ниже. Верни JSON "
+    '{"status": "answer" или "unknown", "answer": "...", "sources": [номера фрагментов], '
+    '"quotes": [{"id": номер фрагмента, "text": "дословная цитата"}]}. '
+    "Цитата — точная копия куска фрагмента, 1–2 предложения, без пересказа и без "
+    "форматирования. Каждое утверждение ответа подтверждается хотя бы одной цитатой. "
+    'Если во фрагментах ответа нет — "status": "unknown", остальные поля пустые.'
+)
+RAG_UNKNOWN_PREFIX = "Не знаю:"
+RAG_UNKNOWN_TEXTS = {
+    "empty_context": "в документации проекта не нашлось фрагментов, относящихся к вопросу",
+    "model_unknown": "во фрагментах документации нет ответа на вопрос",
+    "unverified": "ни одна цитата модели не нашлась дословно во фрагментах",
+    "bad_json": "ответ модели не удалось разобрать",
+    "truncated": "ответ модели оборван по длине",
+    "no_index": "индекс документации недоступен",
+}
+RAG_CLARIFY_HEADER = "Уточните вопрос — возможно, вы про:"
+RAG_CLARIFY_MAX = 3
+RAG_UNKNOWN_PHRASES = (
+    "не знаю",
+    "нет информации",
+    "не нашлось",
+    "не нашёл",
+    "не нашел",
+    "нет в документации",
+    "в документации нет",
+    "нет данных",
+    "не упоминается",
+    "не содержится",
+)
+_SAYS_UNKNOWN_HEAD = 200
+_SAYS_UNKNOWN_MAX_LEN = 400
+_QUOTE_EDGE = "«»“”„\"' .…"
+_SPACES_RE = re.compile(r"\s+")
+
+
+@dataclass(frozen=True, slots=True)
+class Quote:
+    n: int  # 1-based fragment number in the context
+    text: str  # as the model returned it
+    verified: bool  # verbatim in the text of fragment n
+    claimed: int | None = None  # the model's original id when n was re-attributed
+
+
+@dataclass(frozen=True, slots=True)
+class CitedAnswer:
+    status: str  # "answer" | "unknown"
+    answer: str  # "" unless status == "answer"
+    sources: tuple[RagHit, ...]  # declared ids in range, ordered by fragment number
+    quoted_sources: tuple[RagHit, ...]  # fragments of verbatim quotes, ordered by number
+    quotes: tuple[Quote, ...]
+    reason: str  # "" | empty_context | model_unknown | unverified | bad_json | truncated | no_index
+    clarify: tuple[str, ...] = ()  # "source — section" of the nearest candidates
+    draft: str = ""  # unverified only: the model's rejected answer, screen-only
+
+    @property
+    def verified_quotes(self) -> int:
+        return sum(1 for q in self.quotes if q.verified)
+
+    @property
+    def quoted(self) -> bool:
+        """An answer with at least one verbatim quote; says nothing about meaning."""
+        return self.status == "answer" and self.verified_quotes > 0
+
+
+def quote_norm(text: str) -> str:
+    """Strip bold/code markers and edge quotes, collapse spaces, casefold.
+
+    Underscores and single asterisks inside stay: `rag_cite` must not match `ragcite`.
+    """
+    text = text.replace("**", "").replace("__", "").replace("`", "")
+    text = _SPACES_RE.sub(" ", text).strip()
+    return text.strip(_QUOTE_EDGE).casefold()
+
+
+def quote_in(quote: str, chunk_text: str) -> bool:
+    """Verbatim (after quote_norm on both sides) and at least RAG_MIN_QUOTE_CHARS long."""
+    needle = quote_norm(quote)
+    return len(needle) >= RAG_MIN_QUOTE_CHARS and needle in quote_norm(chunk_text)
+
+
+def build_cite_prompt(question: str, hits: Sequence[RagHit]) -> str:
+    """Cite request: instruction, question, numbered whole chunks, question again."""
+    blocks: list[str] = []
+    for n, hit in enumerate(hits, start=1):
+        header = f"[{n}] {hit.source}"
+        if hit.section.strip():
+            header += f" — {hit.section}"
+        blocks.append(header + "\n" + hit.text.strip())
+    line = f"{RAG_QUESTION_LABEL} {question}"
+    return "\n\n".join([RAG_CITE_INSTRUCTION, line, *blocks, line])
+
+
+def _label(hit: RagHit) -> str:
+    return f"{hit.source} — {hit.section}" if hit.section.strip() else hit.source
+
+
+def _clarify(near: Sequence[RagHit]) -> tuple[str, ...]:
+    seen: list[str] = []
+    for hit in near:
+        label = _label(hit)
+        if label not in seen:
+            seen.append(label)
+        if len(seen) == RAG_CLARIFY_MAX:
+            break
+    return tuple(seen)
+
+
+def unknown_answer(reason: str, near: Sequence[RagHit] = ()) -> CitedAnswer:
+    """Refusal; clarify lists up to three distinct nearest `source — section`."""
+    return CitedAnswer("unknown", "", (), (), (), reason, _clarify(near))
+
+
+def _valid_id(value: object, n: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= n
+
+
+def _parse_cited(raw: str, hits: Sequence[RagHit]) -> CitedAnswer:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        return unknown_answer("bad_json")
+    status = data.get("status")
+    if not isinstance(status, str) or status not in ("answer", "unknown"):
+        return unknown_answer("bad_json")
+    if status == "unknown":
+        return unknown_answer("model_unknown", hits)
+    answer = data.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return unknown_answer("bad_json")
+    n = len(hits)
+    declared = data.get("sources")
+    ids = {i for i in declared if _valid_id(i, n)} if isinstance(declared, list) else set()
+    quotes: list[Quote] = []
+    entries = data.get("quotes")
+    for entry in entries if isinstance(entries, list) else ():
+        if not isinstance(entry, dict):
+            continue
+        ident, body = entry.get("id"), entry.get("text")
+        if (
+            not isinstance(ident, int)
+            or isinstance(ident, bool)
+            or not isinstance(body, str)
+            or not body.strip()
+        ):
+            continue
+        in_range = _valid_id(ident, n)
+        if in_range and quote_in(body, hits[ident - 1].text):
+            quotes.append(Quote(ident, body, True))
+            continue
+        # Right sentence, wrong label (incl. out-of-range id): lowest fragment that holds it.
+        found = next((i for i, h in enumerate(hits, start=1) if quote_in(body, h.text)), None)
+        if found is None:
+            # Out-of-range and found nowhere: no fragment to show it against, drop.
+            if in_range:
+                quotes.append(Quote(ident, body, False))
+        else:
+            quotes.append(Quote(found, body, True, claimed=ident))
+    quoted_ids = {q.n for q in quotes if q.verified}
+    sources = tuple(hits[i - 1] for i in sorted(ids))
+    if not quoted_ids:
+        return CitedAnswer(
+            "unknown", "", sources, (), tuple(quotes), "unverified", _clarify(hits), answer.strip()
+        )
+    quoted_sources = tuple(hits[i - 1] for i in sorted(quoted_ids))
+    return CitedAnswer("answer", answer.strip(), sources, quoted_sources, tuple(quotes), "")
+
+
+def parse_cited(raw: object, hits: Sequence[RagHit], truncated: bool = False) -> CitedAnswer:
+    """Total: any input yields a CitedAnswer, never an exception (the call is already paid)."""
+    if truncated:
+        return unknown_answer("truncated")
+    try:
+        if not isinstance(raw, str):
+            return unknown_answer("bad_json")
+        return _parse_cited(raw, hits)
+    except Exception:  # noqa: BLE001 - invalid JSON, recursion depth, anything in the payload
+        return unknown_answer("bad_json")
+
+
+def render_cited(c: CitedAnswer, hits: Sequence[RagHit], *, for_history: bool) -> str:
+    """Screen/history text; numbers are context numbers. History omits the unverified draft."""
+    if not c.quoted:
+        reason = RAG_UNKNOWN_TEXTS.get(c.reason, c.reason)
+        lines = [f"{RAG_UNKNOWN_PREFIX} {reason}."]
+        if c.reason == "unverified" and c.draft and not for_history:
+            lines.append(f"неподтверждённый ответ модели: «{c.draft}»")
+        if c.clarify:
+            lines.append(RAG_CLARIFY_HEADER)
+            lines.extend(f"· {label}" for label in c.clarify)
+        return "\n".join(lines)
+
+    number = {hit.chunk_id: i for i, hit in enumerate(hits, start=1)}
+    quoted_ids = {number.get(h.chunk_id) for h in c.quoted_sources}
+    shown = {number[h.chunk_id]: h for h in (*c.sources, *c.quoted_sources) if h.chunk_id in number}
+    lines = [c.answer, "", "Источники:"]
+    for n in sorted(shown):
+        mark = " · цитата ✓" if n in quoted_ids else ""
+        lines.append(f"[{n}] {_label(shown[n])} · {shown[n].chunk_id}{mark}")
+    if c.quotes:
+        lines.append("Цитаты:")
+        for q in c.quotes:
+            note = f" (модель указала [{q.claimed}])" if q.claimed is not None else ""
+            lines.append(f"[{q.n}] {'✓' if q.verified else '✗'}{note} «{q.text.strip()}»")
+    return "\n".join(lines)
+
+
+def says_unknown(text: str) -> bool:
+    """Heuristic for non-cite modes: a refusal phrase up front in a short answer."""
+    stripped = text.strip()
+    if not stripped or len(stripped) > _SAYS_UNKNOWN_MAX_LEN:
+        return False
+    head = stripped[:_SAYS_UNKNOWN_HEAD].casefold()
+    return any(phrase in head for phrase in RAG_UNKNOWN_PHRASES)

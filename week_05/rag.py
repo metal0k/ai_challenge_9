@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,9 @@ from advent_core.errors import AdventError
 from advent_core.journal import log_call
 from advent_core.params import GenerationParams
 from advent_core.rag import (
+    RAG_REWRITE_FOLLOWUP_PROMPT,
     RAG_REWRITE_PROMPT,
+    CitedAnswer,
     RagContext,
     RagHit,
     RagSettings,
@@ -33,6 +36,7 @@ from advent_core.rag import (
     order_by_rerank,
     parse_rerank,
     rrf_merge,
+    says_unknown,
 )
 from advent_core.telemetry import CallResult
 from week_05 import index as index_module
@@ -41,6 +45,8 @@ from week_05.chunking import Chunk
 RAG_WEEK = 5
 RAG_DAY = 22
 RAG_AUX_DAY = 23
+RAG_CITE_DAY = 24
+JUDGE_MAX_TOKENS = 300
 RAG_AUX_MODEL = "ministral-14b-latest"
 REWRITE_MAX_TOKENS = 200
 RERANK_MAX_TOKENS = 2000
@@ -57,7 +63,9 @@ def check_index(db_path: Path | None, strategy: str) -> index_module.RunInfo:
     return runs[strategy]
 
 
-def _aux_call(prompt: str, *, command: str, max_tokens: int, json_mode: bool) -> CallResult:
+def _aux_call(
+    prompt: str, *, command: str, max_tokens: int, json_mode: bool, day: int
+) -> CallResult:
     """One isolated helper call: nothing from .env params, no system persona.
 
     Journaled here, before the caller parses the reply, so a paid call is on record
@@ -75,7 +83,7 @@ def _aux_call(prompt: str, *, command: str, max_tokens: int, json_mode: bool) ->
         result,
         list(result.sent_messages or messages),
         week=RAG_WEEK,
-        day=RAG_AUX_DAY,
+        day=day,
         extra={"command": command},
     )
     return result
@@ -104,13 +112,30 @@ def _add_tokens(total: int | None, value: int | None, first: bool) -> int | None
     return total + value
 
 
+def rewrite_prompt(question: str, previous: str | None) -> str:
+    """Rewrite prompt; a follow-up (previous question known) uses the follow-up wording."""
+    if previous:
+        values = {"{previous}": previous, "{question}": question}
+        # Single pass: user text containing a placeholder must not be substituted.
+        return re.sub(
+            r"\{previous\}|\{question\}",
+            lambda m: values[m.group(0)],
+            RAG_REWRITE_FOLLOWUP_PROMPT,
+        )
+    return RAG_REWRITE_PROMPT.replace("{question}", question)
+
+
 def make_retriever(
     db_path: Path | None = None,
     *,
     week: int = RAG_WEEK,
     day: int = RAG_DAY,
+    aux_day: int = RAG_AUX_DAY,
 ) -> RetrieveFn:
-    """Create a retriever bound to a database path and journal coordinates."""
+    """Create a retriever bound to a database path and journal coordinates.
+
+    `day` is the embedding row's day, `aux_day` the rewrite/rerank rows' day.
+    """
 
     def retrieve(question: str, settings: RagSettings) -> RagContext:
         """Rewrite -> embed -> search -> RRF -> rerank -> threshold -> top-k."""
@@ -124,10 +149,11 @@ def make_retriever(
         rewritten: str | None = None
         if settings.rewrite:
             result = _aux_call(
-                RAG_REWRITE_PROMPT.replace("{question}", question),
+                rewrite_prompt(question, settings.previous),
                 command="rag_rewrite",
                 max_tokens=REWRITE_MAX_TOKENS,
                 json_mode=False,
+                day=aux_day,
             )
             aux_calls.append(result)
             rewritten = clean_rewrite(result.text)
@@ -161,6 +187,7 @@ def make_retriever(
                 command="rag_rerank",
                 max_tokens=RERANK_MAX_TOKENS,
                 json_mode=True,
+                day=aux_day,
             )
             aux_calls.append(result)
             scores = parse_rerank(result.text, len(fused))
@@ -345,8 +372,19 @@ class AnswerScore:
         return all(self.facts)
 
 
-def score_answer(question: ControlQuestion, answer: str, ctx: RagContext | None) -> AnswerScore:
-    """Score an answer using facts, retrieved sources, and cited sources."""
+def score_answer(
+    question: ControlQuestion,
+    answer: str,
+    ctx: RagContext | None,
+    cited: CitedAnswer | None = None,
+) -> AnswerScore:
+    """Score an answer using facts, retrieved sources, and cited sources.
+
+    Cite mode scores only `cited.answer` of an accepted answer (a refusal and an
+    unverified draft score zero facts) and takes sources from the verbatim quotes.
+    """
+    if cited is not None:
+        answer = cited.answer if cited.quoted else ""
     facts = check_facts(answer, question.expect)
 
     if ctx is None:
@@ -355,12 +393,16 @@ def score_answer(question: ControlQuestion, answer: str, ctx: RagContext | None)
         found = {hit.source for hit in ctx.hits}
         retrieved = tuple(source in found for source in question.sources)
 
-    cited = cited_sources(answer, question.sources)
+    if cited is not None:
+        quoted = {hit.source for hit in cited.quoted_sources}
+        cited_flags = tuple(source in quoted for source in question.sources)
+    else:
+        cited_flags = cited_sources(answer, question.sources)
 
     return AnswerScore(
         facts=facts,
         sources_retrieved=retrieved,
-        sources_cited=cited,
+        sources_cited=cited_flags,
     )
 
 
@@ -369,3 +411,146 @@ def relevant_chunk_ids(q: ControlQuestion, chunks: Sequence[Chunk]) -> frozenset
     return frozenset(
         c.chunk_id for c in chunks if c.source in q.sources and all(check_facts(c.text, q.expect))
     )
+
+
+# --- Day 24: grounding judge, questions without an answer ---------------------------------
+
+JUDGE_VERDICTS = ("да", "частично", "нет")
+JUDGE_INSTRUCTION = (
+    "Ты проверяешь, подтверждают ли цитаты ответ. Ниже вопрос, ответ и цитаты из "
+    "документации. Подтверждают ли цитаты каждое утверждение ответа? Оценивай только "
+    "по цитатам, свои знания не используй. Верни JSON "
+    '{"verdict": "да" | "частично" | "нет", "reason": "одна короткая фраза"}.'
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Grounding:
+    """Judge verdict on answer-vs-quotes; `verdict` None means unreadable or not asked."""
+
+    verdict: str | None
+    reason: str
+    result: CallResult | None
+
+
+def build_judge_prompt(question: str, cited: CitedAnswer, hits: Sequence[RagHit]) -> str:
+    """Question, answer and verified quotes only: no expected facts, no whole fragments."""
+    quotes = [
+        f"[{q.n}] «{q.text.strip()}»" for q in cited.quotes if q.verified and 1 <= q.n <= len(hits)
+    ]
+    return "\n\n".join(
+        [
+            JUDGE_INSTRUCTION,
+            f"Вопрос: {question}",
+            f"Ответ: {cited.answer}",
+            "Цитаты:\n" + "\n".join(quotes),
+        ]
+    )
+
+
+def parse_judge(raw: object) -> tuple[str | None, str]:
+    """Total: anything but a clean verdict is (None, reason-if-any)."""
+    try:
+        if not isinstance(raw, str):
+            return None, ""
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.strip("`").removeprefix("json").strip()
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return None, ""
+        reason = data.get("reason")
+        reason = " ".join(reason.split()) if isinstance(reason, str) else ""
+        verdict = data.get("verdict")
+        if isinstance(verdict, str) and verdict.strip().casefold() in JUDGE_VERDICTS:
+            return verdict.strip().casefold(), reason
+        return None, reason
+    except Exception:  # noqa: BLE001 - garbage from the model must never raise
+        return None, ""
+
+
+def judge_grounding(
+    cited: CitedAnswer,
+    hits: Sequence[RagHit],
+    question: str,
+    *,
+    day: int = RAG_CITE_DAY,
+) -> Grounding:
+    """Ask the isolated judge whether the verbatim quotes support the answer.
+
+    Only a `quoted` answer is judged; a refusal makes no call. The call is journaled
+    inside `_aux_call` before the reply is parsed.
+    """
+    if not cited.quoted:
+        return Grounding(None, "", None)
+    result = _aux_call(
+        build_judge_prompt(question, cited, hits),
+        command="rag_judge",
+        max_tokens=JUDGE_MAX_TOKENS,
+        json_mode=True,
+        day=day,
+    )
+    verdict, reason = parse_judge(result.text)
+    return Grounding(verdict, reason, result)
+
+
+@dataclass(frozen=True, slots=True)
+class UnanswerableQuestion:
+    """A question the repo cannot answer: the expected outcome is a refusal."""
+
+    id: int
+    question: str
+    note: str = ""
+
+
+def load_unanswerable(path: Path) -> list[UnanswerableQuestion]:
+    """Load and validate the questions without an answer."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise AdventError(f"Файл вопросов без ответа не найден: {path.name}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AdventError(f"Файл вопросов без ответа повреждён ({path.name}): {exc}") from exc
+    if not isinstance(data, list):
+        raise AdventError(f"Файл вопросов без ответа ({path.name}): ожидался список.")
+    out: list[UnanswerableQuestion] = []
+    seen: set[int] = set()
+    for n, item in enumerate(data, start=1):
+        where = f"Файл вопросов без ответа ({path.name}), запись {n}"
+        if not isinstance(item, dict):
+            raise AdventError(f"{where}: ожидался объект")
+        ident = item.get("id")
+        if not isinstance(ident, int) or isinstance(ident, bool):
+            raise AdventError(f"{where}: id должен быть целым числом")
+        text = item.get("question")
+        if not isinstance(text, str) or not text.strip():
+            raise AdventError(f"{where}: question должен быть непустой строкой")
+        note = item.get("note", "")
+        if not isinstance(note, str):
+            raise AdventError(f"{where}: note должен быть строкой")
+        if ident in seen:
+            raise AdventError(f"Файл вопросов без ответа ({path.name}): id повторяются.")
+        seen.add(ident)
+        out.append(UnanswerableQuestion(ident, text, note))
+    return out
+
+
+REFUSAL_REASONS = ("empty_context", "model_unknown", "no_index")
+
+
+def unanswerable_outcome(text: str, cited: CitedAnswer | None) -> str:
+    """`refused` | `unverified` | `format` | `answered`; only `refused` is the right outcome.
+
+    Cite mode reads the structured result; other modes use the `says_unknown` heuristic.
+    """
+    if cited is None:
+        return "refused" if says_unknown(text) else "answered"
+    if cited.status == "answer":
+        return "answered"
+    if cited.reason in REFUSAL_REASONS:
+        return "refused"
+    if cited.reason == "unverified":
+        return "unverified"
+    return "format"

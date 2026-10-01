@@ -115,6 +115,7 @@ NON_CHAT_PARAMS = {
     "rag_rerank": "adventagent и adventrag (неделя 05)",
     "rag_k_before": "adventagent и adventrag (неделя 05)",
     "rag_threshold": "adventagent и adventrag (неделя 05)",
+    "rag_cite": "adventagent и adventrag (неделя 05)",
 }
 
 REPL_COMMANDS = [

@@ -2516,3 +2516,288 @@ def test_summary_budget_trigger_counts_the_augmented_request():
     agent.ask("вопрос", list(HISTORY_6))
     # Only the chunk text tipped it over: the summarizer ran first.
     assert recorder.calls[0][0] == {"role": "system", "content": "сожми"}
+
+
+# --- Day 24: cite mode ---------------------------------------------------------
+
+from advent_core.rag import RAG_CITE_INSTRUCTION, RetrievalTrace  # noqa: E402
+
+CITE_QUOTE = "порог compaction равен 4242"
+STOP_WARNING = "в режиме rag_cite stop не отправляется: он мог бы оборвать JSON ответа"
+
+
+def _cite_json(**over) -> str:
+    data = {
+        "status": "answer",
+        "answer": "Порог равен 4242.",
+        "sources": [1],
+        "quotes": [{"id": 1, "text": CITE_QUOTE}],
+    }
+    data.update(over)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _cite_agent(retriever=None, *replies, **params):
+    recorder = _ConfigRecorder(*(CallResult(text=r, model_requested="m") for r in replies))
+    params.setdefault("rag", True)
+    params.setdefault("rag_cite", True)
+    agent = build_agent(recorder, make_config(**params), retrieve=retriever)
+    return agent, recorder
+
+
+def _empty_ctx(*near: RagHit) -> RagContext:
+    trace = RetrievalTrace(original=near, fused=near, reranked=near)
+    return RagContext((), "structure", 5, "mistral-embed", 7, "abc123", passed=0, trace=trace)
+
+
+def test_cite_empty_context_refuses_without_a_model_call():
+    near = (
+        RagHit("c1", "CLAUDE.md", "OBS", 0.8, "t"),
+        RagHit("c2", "CLAUDE.md", "OBS", 0.7, "t"),
+        RagHit("c3", "README.md", "Старт", 0.6, "t"),
+    )
+    agent, recorder = _cite_agent(lambda q, s: _empty_ctx(*near), "не должно уйти")
+
+    reply = agent.ask("как борщ?", [])
+
+    assert recorder.calls == []
+    assert reply.model_called is False
+    assert reply.cited is not None
+    assert (reply.cited.status, reply.cited.reason) == ("unknown", "empty_context")
+    assert reply.cited.clarify == ("CLAUDE.md — OBS", "README.md — Старт")
+    assert reply.text.startswith("Не знаю: ")
+    assert reply.display_text == reply.text
+    assert reply.history == [
+        {"role": "user", "content": "как борщ?"},
+        {"role": "assistant", "content": reply.text},
+    ]
+    assert reply.result.usage.prompt_tokens == 0
+    assert reply.result.usage.completion_tokens == 0
+    assert reply.result.stream is False
+
+
+def test_cite_refusal_echoes_summary_and_facts_unchanged():
+    agent, _ = _cite_agent(lambda q, s: _empty_ctx())
+    reply = agent.ask("q", [], summary="сводка", facts={"k": "v"}, facts_upto=3)
+    assert (reply.summary, reply.facts, reply.facts_upto) == ("сводка", {"k": "v"}, 3)
+
+
+def test_cite_forces_rewrite_and_rerank_into_the_retriever_settings():
+    retriever = _Retriever()
+    agent, _ = _cite_agent(retriever, _cite_json())
+    agent.ask("q", [])
+    assert retriever.settings == [RagSettings("structure", 5, 20, True, True, 5.0, cite=True)]
+
+
+def test_cite_request_is_json_unstreamed_and_stopless_for_this_request_only():
+    agent, recorder = _cite_agent(_Retriever(), _cite_json(), stop=["КОНЕЦ"], format="text")
+    chunks: list[str] = []
+
+    reply = agent.ask("какой порог?", [], on_chunk=chunks.append)
+
+    assert chunks == []
+    assert len(recorder.configs) == 1
+    sent = recorder.configs[0]
+    assert (sent.params.format, sent.stream, sent.params.stop) == ("json", False, None)
+    assert agent.config.params.format == "text"
+    assert agent.config.params.stop == ["КОНЕЦ"]
+    last = recorder.calls[-1][-1]["content"]
+    assert last.startswith(RAG_CITE_INSTRUCTION)
+    assert CHUNK_TEXT in last
+    assert last.endswith("Вопрос: какой порог?")
+    assert reply.history[0] == {"role": "user", "content": "какой порог?"}
+    assert agent.warnings.count(STOP_WARNING) == 1
+
+
+def test_cite_stop_warning_is_said_once_across_turns():
+    agent, _ = _cite_agent(_Retriever(), _cite_json(), stop=["КОНЕЦ"])
+    first = agent.ask("q1", [])
+    agent.ask("q2", first.history)
+    assert agent.warnings.count(STOP_WARNING) == 1
+
+
+def test_cite_accepted_answer_keeps_raw_json_in_result_and_renders_the_rest():
+    agent, _ = _cite_agent(_Retriever(), _cite_json())
+
+    reply = agent.ask("какой порог?", [])
+
+    raw = _cite_json()
+    assert reply.result.text == raw
+    assert reply.model_called is True
+    assert reply.cited is not None and reply.cited.quoted
+    assert reply.cited.verified_quotes == 1
+    assert reply.display_text is not None
+    assert reply.display_text.startswith("Порог равен 4242.\n\nИсточники:\n[1] CLAUDE.md — Раздел")
+    assert "[1] ✓ «порог compaction равен 4242»" in reply.display_text
+    assert reply.history[-1] == {"role": "assistant", "content": reply.text}
+    assert raw not in reply.history[-1]["content"]
+
+
+def test_cite_unverified_draft_is_on_screen_but_not_in_history_or_text():
+    raw = _cite_json(
+        answer="Секретный черновик 777.",
+        quotes=[{"id": 1, "text": "выдуманная цитата номер раз"}],
+    )
+    agent, _ = _cite_agent(_Retriever(), raw)
+
+    reply = agent.ask("q", [])
+
+    assert reply.cited is not None
+    assert (reply.cited.status, reply.cited.reason) == ("unknown", "unverified")
+    assert "неподтверждённый ответ модели: «Секретный черновик 777.»" in reply.display_text
+    assert "Секретный черновик" not in reply.text
+    assert "Секретный черновик" not in reply.history[-1]["content"]
+    assert reply.history[-1]["content"].startswith("Не знаю: ")
+    assert reply.result.text == raw
+
+
+@pytest.mark.parametrize(
+    ("raw", "reason"),
+    [
+        ("совсем не json", "bad_json"),
+        ("[1, 2]", "bad_json"),
+        ("null", "bad_json"),
+        ('{"status": "answer", "answer": "x", "sources": "1", "quotes": null}', "unverified"),
+        ('{"status": "answer", "answer": "x", "quotes": [{"id": true, "text": 5}]}', "unverified"),
+        ('{"status": "unknown"}', "model_unknown"),
+    ],
+)
+def test_cite_garbage_reply_still_returns_with_the_raw_text_for_the_journal(raw, reason):
+    agent, _ = _cite_agent(_Retriever(), raw)
+
+    reply = agent.ask("q", [])
+
+    assert reply.result.text == raw
+    assert reply.cited is not None and reply.cited.reason == reason
+    assert reply.history[-1]["content"].startswith("Не знаю: ")
+
+
+def test_cite_length_finish_reason_is_a_truncated_refusal():
+    recorder = _ConfigRecorder(
+        CallResult(text=_cite_json(), model_requested="m", finish_reason="length")
+    )
+    agent = build_agent(recorder, make_config(rag=True, rag_cite=True), retrieve=_Retriever())
+    reply = agent.ask("q", [])
+    assert reply.cited is not None and reply.cited.reason == "truncated"
+    assert reply.model_called is True
+
+
+def test_cite_model_unknown_takes_clarify_from_the_context_hits():
+    agent, _ = _cite_agent(_Retriever(), '{"status": "unknown"}')
+    reply = agent.ask("q", [])
+    assert reply.cited is not None
+    assert reply.cited.reason == "model_unknown"
+    assert reply.cited.clarify == ("CLAUDE.md — Раздел",)
+    assert "Уточните вопрос — возможно, вы про:\n· CLAUDE.md — Раздел" in reply.text
+
+
+def test_cite_without_a_retriever_refuses_with_no_index_and_warns():
+    agent, recorder = _cite_agent(None, _cite_json())
+    reply = agent.ask("q", [])
+    assert recorder.calls == []
+    assert reply.model_called is False
+    assert reply.cited is not None and reply.cited.reason == "no_index"
+    assert reply.rag is None
+    assert len([w for w in agent.warnings if "rag_cite включён" in w]) == 1
+
+
+def test_cite_with_rag_off_never_retrieves_and_refuses_with_no_index():
+    def boom(*_args):
+        raise AssertionError("retriever must not run")
+
+    agent, recorder = _cite_agent(boom, _cite_json(), rag=False)
+    reply = agent.ask("q", [])
+    assert recorder.calls == []
+    assert reply.cited is not None and reply.cited.reason == "no_index"
+
+
+def test_cite_refuses_with_mcp_on_before_anything_is_paid():
+    retriever = _Retriever()
+    agent, recorder = _cite_agent(retriever, _cite_json())
+    agent.mcp_enabled = True
+    with pytest.raises(ConfigurationError, match="MCP"):
+        agent.ask("q", [])
+    assert recorder.calls == [] and retriever.calls == []
+
+
+def test_cite_refuses_in_dialog_mode():
+    retriever = _Retriever()
+    agent, recorder = _cite_agent(retriever, _cite_json(), mode="dialog", done="text:ГОТОВО")
+    with pytest.raises(ConfigurationError, match="dialog"):
+        agent.ask("q", [])
+    assert recorder.calls == [] and retriever.calls == []
+
+
+def test_cite_follow_up_after_a_refusal_searches_the_bare_input_and_hands_the_prior_to_rewrite():
+    contexts = [_empty_ctx(), _rag_ctx()]
+    seen: list[tuple[str, str | None]] = []
+
+    def retriever(question, settings):
+        seen.append((question, settings.previous))
+        return contexts[len(seen) - 1]
+
+    agent, recorder = _cite_agent(retriever, _cite_json())
+    first = agent.ask("как оно устроено?", [])
+    assert first.rag_previous is None
+
+    second = agent.ask("про порог compaction", first.history)
+
+    # The search query is the bare clarification; only `previous` carries the old question.
+    assert seen == [("как оно устроено?", None), ("про порог compaction", "как оно устроено?")]
+    assert second.rag_previous == "как оно устроено?"
+    # The model sees the history as usual and the clarification as the question.
+    sent = recorder.calls[-1]
+    assert sent[-3] == {"role": "user", "content": "как оно устроено?"}
+    assert sent[-2]["role"] == "assistant" and sent[-2]["content"].startswith("Не знаю:")
+    assert sent[-1]["content"].endswith("Вопрос: про порог compaction")
+    assert second.history[-2] == {"role": "user", "content": "про порог compaction"}
+
+
+def test_cite_question_after_an_ordinary_answer_is_not_glued():
+    queries: list[str] = []
+
+    def retriever(question, settings):
+        queries.append(question)
+        return _rag_ctx()
+
+    agent, _ = _cite_agent(retriever, _cite_json())
+    first = agent.ask("q1", [])
+    second = agent.ask("q2", first.history)
+    assert queries == ["q1", "q2"]
+    assert second.rag_previous is None
+
+
+def test_cite_budget_trim_sees_the_augmented_prompt():
+    history = [
+        {"role": "user", "content": "а" * 50},
+        {"role": "assistant", "content": "б" * 50},
+    ]
+
+    def build(**params):
+        agent, _ = _cite_agent(_Retriever(), _cite_json(), max_tokens=10, **params)
+        agent.context_limit = 310
+        agent.counter = _CharCounter()
+        return agent
+
+    # Bare question: 100 + 6 chars fit the 300-token budget.
+    assert build(rag_cite=False, rag=False).ask("вопрос", list(history)).dropped == 0
+    # The cite prompt (instruction + chunk) alone is over it: history goes.
+    assert build().ask("вопрос", list(history)).dropped == 2
+
+
+def test_without_cite_the_request_is_day_23s_and_format_is_untouched():
+    recorder = _ConfigRecorder(CallResult(text="ответ", model_requested="m"))
+    agent = build_agent(
+        recorder, make_config(rag=True, rag_rewrite=True, rag_rerank=True), retrieve=_Retriever()
+    )
+
+    reply = agent.ask("q", [])
+
+    assert recorder.configs[-1].params.format is None
+    assert RAG_CITE_INSTRUCTION not in recorder.calls[-1][-1]["content"]
+    assert (reply.cited, reply.display_text, reply.model_called, reply.rag_previous) == (
+        None,
+        None,
+        True,
+        None,
+    )

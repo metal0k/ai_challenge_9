@@ -8,6 +8,7 @@ import pytest
 from rich.cells import cell_len
 from rich.console import Console
 
+from advent_core import chat as chat_core
 from advent_core import config as config_module
 from advent_core import console
 from advent_core.errors import AdventError, NetworkError
@@ -15,6 +16,8 @@ from advent_core.rag import RagContext, RagHit, RetrievalTrace
 from advent_core.telemetry import CallResult, Usage
 from week_05 import rag_cli
 from week_05.chunking import Chunk
+
+_REAL_COMPLETE = chat_core.complete  # captured before any fixture patches it
 
 CHUNK_TEXT = "ТЕКСТ-ЧАНКА: окно 262144 токена, тег w01d01"
 
@@ -448,7 +451,9 @@ def test_commands_are_registered_on_the_adventrag_app():
     assert "index" in names
 
 
-def test_eval_error_in_the_rag_half_of_a_pair_drops_the_whole_pair(fakes, out, err, tmp_path):
+def test_eval_error_in_the_rag_half_drops_the_pair_from_metrics_but_not_from_spend(
+    fakes, out, err, tmp_path
+):
     fakes.fail_on_call = 4
     fakes.fail_count = 2
     rows = rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]))
@@ -456,9 +461,10 @@ def test_eval_error_in_the_rag_half_of_a_pair_drops_the_whole_pair(fakes, out, e
     assert "│ 2 │ Какой тег? │ ошибка │ ошибка │ — │ — │" in flat
     assert "Завершено пар: 1/2 — сравнение неполное, вердикта нет." in flat
     assert "Фактов найдено: без RAG 0/1 · RAG 1/1" in flat
-    assert "Токены prompt/completion: без RAG 10/5 · RAG 100/5 · embed 7" in flat
+    # The failed pair's completed first run (10/5) is paid for and stays in the totals.
+    assert "Токены prompt/completion: без RAG 20/10 · RAG 100/5 · embed 7" in flat
     assert "выше:" not in flat and "Ничья" not in flat
-    assert rows[1].ok is False and rows[1].first is None
+    assert rows[1].ok is False and rows[1].first is not None and rows[1].second is None
     assert len(fakes.complete_calls) == 5
 
 
@@ -967,3 +973,376 @@ def test_stages_command_is_registered():
 
     names = [c.name for c in typer.main.get_command(cli.app).commands.values()]
     assert "stages" in names
+
+
+# --- Day 24: cite mode ------------------------------------------------------------------
+
+QUOTE = "окно 262144 токена, тег w01d01"
+CITE_JSON = json.dumps(
+    {
+        "status": "answer",
+        "answer": "окно 262144 токена, тег w01d01",
+        "sources": [1],
+        "quotes": [{"id": 1, "text": QUOTE}],
+    },
+    ensure_ascii=False,
+)
+
+
+def _refusal_ctx():
+    return _full_ctx(hits=[], reranked=[_h("structure:CLAUDE.md#9", rerank=2.0)], passed=0)
+
+
+def _grounded(verdict="да", reason="цитата прямо называет окно"):
+    from week_05.rag import Grounding
+
+    return Grounding(verdict, reason, CallResult(usage=Usage(30, 5), stream=False))
+
+
+@pytest.fixture
+def judge(monkeypatch):
+    calls: list[tuple] = []
+    state = {"value": _grounded(), "raise": None}
+
+    def fake(cited, hits, question, *, day):
+        calls.append((question, day))
+        if state["raise"] is not None:
+            raise state["raise"]
+        return state["value"]
+
+    monkeypatch.setattr(rag_cli.rag_module, "judge_grounding", fake)
+    fake.calls = calls
+    fake.state = state
+    return fake
+
+
+def _unanswerable(tmp_path, items):
+    path = tmp_path / "unanswerable.json"
+    path.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+U1 = {"id": 101, "question": "Как приготовить борщ?", "note": "н"}
+U2 = {"id": 102, "question": "Какая PostgreSQL?", "note": "н"}
+
+
+def test_ask_cite_prints_rendered_answer_with_chunk_id_and_quote_marks(fakes, out, err):
+    fakes.answer_rag = CITE_JSON
+    rag_cli.ask_question("Какое окно?", mode="cite")
+    text = _plain(out.getvalue())
+    assert text.count("── RAG+цитаты ──") == 1
+    assert "Источники:" in text
+    assert "[1] CLAUDE.md — Раздел · structure:CLAUDE.md#1 · цитата ✓" in text
+    assert "[1] ✓ «окно 262144 токена, тег w01d01»" in text
+    assert "цитаты: 1/1 дословны" in _flat(err.getvalue())
+    assert fakes.retriever_days == [24]
+    assert fakes.journal == [
+        {
+            "week": 5,
+            "day": 24,
+            "extra": {"command": "ask", "rag": True, "question_id": None, "mode": "cite"},
+        }
+    ]
+    s = fakes.settings_seen[0]
+    assert (s.rewrite, s.rerank, s.cite) == (True, True, True)
+
+
+def test_ask_cite_empty_context_makes_no_model_call_and_no_journal_row(fakes, out, err):
+    fakes.full_default = _refusal_ctx()
+    rag_cli.ask_question("Как приготовить борщ?", mode="cite")
+    text = _plain(out.getvalue())
+    assert fakes.complete_calls == []
+    assert fakes.journal == []
+    assert "Не знаю: в документации проекта не нашлось фрагментов, относящихся к вопросу." in text
+    assert "Уточните вопрос — возможно, вы про:" in text
+    assert "· CLAUDE.md — Раздел" in text
+    assert "кандидатов 31 → прошли порог 0 → в контексте 0" in text
+    flat_err = _flat(err.getvalue())
+    assert "RAG+цитаты: не знаю · модель не вызывалась · aux 100+10 ток." in flat_err
+    assert "prompt" not in flat_err
+
+
+def test_ask_cite_garbage_json_is_journaled_and_shown_as_refusal(fakes, out, err):
+    fakes.answer_rag = "это не JSON"
+    rag_cli.ask_question("Какое окно?", mode="cite")
+    assert [r["day"] for r in fakes.journal] == [24]
+    assert "Не знаю: ответ модели не удалось разобрать." in _plain(out.getvalue())
+
+
+def test_ask_cite_unverified_shows_the_draft_on_screen(fakes, out, err):
+    fakes.answer_rag = json.dumps(
+        {
+            "status": "answer",
+            "answer": "выдумка",
+            "sources": [1],
+            "quotes": [{"id": 1, "text": "такого в чанке нет совсем"}],
+        },
+        ensure_ascii=False,
+    )
+    rag_cli.ask_question("Какое окно?", mode="cite")
+    text = _plain(out.getvalue())
+    assert "Не знаю: ни одна цитата модели не нашлась дословно во фрагментах." in text
+    assert "неподтверждённый ответ модели: «выдумка»" in text
+
+
+def test_ask_pair_full_cite_splits_the_journal_days_by_mode(fakes, out, err):
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    fakes.answer_rag = CITE_JSON
+    rag_cli.ask_question("Какое окно?", pair="full,cite")
+    text = _plain(out.getvalue())
+    assert text.index("── RAG+rerank ──") < text.index("── RAG+цитаты ──")
+    assert fakes.retriever_days == [23, 24]
+    assert [(r["day"], r["extra"]["mode"]) for r in fakes.journal] == [(23, "full"), (24, "cite")]
+
+
+def test_pairs_with_cite_are_allowed_and_old_pairs_keep_one_day():
+    assert rag_cli.parse_pair("off,cite") == ("off", "cite")
+    assert rag_cli.parse_pair("full,cite") == ("full", "cite")
+    assert rag_cli.mode_days(("plain", "full")) == {"plain": 23, "full": 23}
+    assert rag_cli.mode_days(("off", "plain")) == {"off": 22, "plain": 22}
+    assert rag_cli.mode_days(("full", "cite")) == {"full": 23, "cite": 24}
+    with pytest.raises(AdventError):
+        rag_cli.parse_pair("cite,full")
+
+
+def test_ask_cite_flag_conflicts_with_other_mode_flags(fakes, out, err):
+    from week_05 import cli
+
+    for extra in (["--rag"], ["--full"]):
+        with pytest.raises(AdventError):
+            cli.app(["ask", "q", "--cite", *extra], standalone_mode=False)
+    with pytest.raises(AdventError):
+        rag_cli.ask_question("q", mode="cite", pair="full,cite")
+    assert fakes.complete_calls == []
+
+
+def test_eval_cite_pair_table_columns_summary_and_no_ellipsis_in_numbers(
+    fakes, out, err, tmp_path, judge
+):
+    fakes.answer_rag = CITE_JSON
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    fakes.full_by_question["Как приготовить борщ?"] = _refusal_ctx()
+    rows = rag_cli.run_eval(
+        _questions(tmp_path, [Q1, Q2]),
+        pair="full,cite",
+        unanswerable_path=_unanswerable(tmp_path, [U1, U2]),
+    )
+    text = _plain(out.getvalue())
+    flat = _flat(text)
+    assert len(rows) == 2
+    assert text.count("Контрольные вопросы: RAG+rerank и RAG+цитаты") == 1
+    assert text.count("источн.") == 1
+    assert "│ 1 │ Какое окно? │ 1/1 │ 1/1 │ да │ 1/1 │ да │ нет │" in flat
+    assert "#1 Какое окно? · full 1/1 · cite 1/1 · цитаты 1/1 · смысл да" in text
+    assert text.count("Вопросы без ответа в репо") == 1
+    assert "│ 101 │ Как приготовить борщ? │ ≈не знаю ✓ │ не знаю ✓ │" in flat
+    assert "│ 102 │ Какая PostgreSQL? │ ≈ответил ✗ │ ответил ✗ │" in flat
+    assert text.index("Вопросы без ответа в репо") < text.index("Запланировано 2")
+    assert "Запланировано 2 · получено 2 · без ответа 0" in flat
+    assert (
+        "Источники в ответе 2/2 · цитаты 2/2 · все цитаты дословны 2/2 · "
+        "«не знаю» на отвечаемых 0/2" in flat
+    )
+    assert "Смысл по judge, из 2: да 2 · частично 0 · нет 0 · н/о 0 · не оценивался 0" in flat
+    assert "Без ответа в репо: запланировано 2 · получено 2 · без ответа 0" in flat
+    assert "«Не знаю» на неотвечаемых: cite 1/2 · RAG+rerank ≈1/2 (эвристика)" in flat
+    assert "Без вызова модели: 1" in flat
+    assert flat.rstrip().endswith("его вердикт — оценка, не истина.")
+    for line in text.splitlines():
+        if line.startswith("│ 1 "):
+            assert "…" not in line
+    assert [q for q, _ in judge.calls] == ["Какое окно?", "Какой тег?"]
+    assert {d for _, d in judge.calls} == {24}
+
+
+def test_eval_cite_aux_tokens_include_the_judge(fakes, out, err, tmp_path, judge):
+    fakes.answer_rag = CITE_JSON
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    rag_cli.run_eval(_questions(tmp_path, [Q1]), pair="full,cite", unanswerable=False)
+    flat = _flat(out.getvalue())
+    assert "aux (rewrite+rerank+judge) prompt/completion: 230/25" in flat
+    assert "Вопросы без ответа" not in flat
+
+
+def test_eval_cite_counts_the_cite_answer_only_never_the_draft(fakes, out, err, tmp_path, judge):
+    fakes.answer_rag = json.dumps(
+        {
+            "status": "answer",
+            "answer": "окно 262144 токена",
+            "sources": [1],
+            "quotes": [{"id": 1, "text": "такого в чанке нет совсем"}],
+        },
+        ensure_ascii=False,
+    )
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    rows = rag_cli.run_eval(_questions(tmp_path, [Q1]), pair="full,cite", unanswerable=False)
+    assert rows[0].second_score.facts == (False,)
+    assert rows[0].second_score.sources_cited == (False,)
+    assert judge.calls == []
+    flat = _flat(out.getvalue())
+    assert "│ 1 │ Какое окно? │ 1/1 │ 0/1 │ — │ 0/1 │ — │ да·цитаты │" in flat
+    assert "не оценивался 1" in flat
+    text = _plain(out.getvalue())
+    assert "#1 Какое окно? · full 1/1 · cite 0/1 · не знаю·цитаты" in text
+    for line in text.splitlines():
+        assert cell_len(line) <= 80, line
+        if line.startswith("│ 1 "):
+            assert "…" not in line
+    assert text.count("источн.") == 1
+
+
+def test_eval_judge_garbage_and_exception_show_no_rating_and_keep_the_pair(
+    fakes, out, err, tmp_path, judge
+):
+    fakes.answer_rag = CITE_JSON
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    judge.state["value"] = _grounded(None, "")
+    rows = rag_cli.run_eval(_questions(tmp_path, [Q1]), pair="full,cite", unanswerable=False)
+    assert "│ 1 │ Какое окно? │ 1/1 │ 1/1 │ да │ 1/1 │ н/о │ нет │" in _flat(out.getvalue())
+    assert rows[0].ok
+
+    out.truncate(0)
+    out.seek(0)
+    judge.state["raise"] = ValueError("boom")
+    rows = rag_cli.run_eval(_questions(tmp_path, [Q1]), pair="full,cite", unanswerable=False)
+    flat = _flat(out.getvalue())
+    assert rows[0].ok and rows[0].judge_error == "boom"
+    assert "│ 1 │ Какое окно? │ 1/1 │ 1/1 │ да │ 1/1 │ н/о │ нет │" in flat
+    assert "н/о 1" in flat
+
+
+def test_eval_detail_cite_shows_expected_answer_quotes_and_judge_reason(
+    fakes, out, err, tmp_path, judge
+):
+    fakes.answer_rag = CITE_JSON
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    rag_cli.run_eval(_questions(tmp_path, [Q1]), pair="full,cite", detail=1, unanswerable=False)
+    text = _plain(out.getvalue())
+    assert "   ожидается: 262144" in text
+    assert "   full ✓" in text
+    assert "   cite ✓" in text
+    assert "   цитаты 1/1 дословны · источник да · смысл да — цитата прямо называет окно" in text
+    assert "   [1] ✓ «окно 262144 токена, тег w01d01»" in text
+
+
+def test_eval_cite_refusal_on_an_answerable_question_is_counted_apart(
+    fakes, out, err, tmp_path, judge
+):
+    fakes.full_default = _refusal_ctx()
+    rag_cli.run_eval(_questions(tmp_path, [Q1]), pair="off,cite", unanswerable=False)
+    flat = _flat(out.getvalue())
+    assert "│ 1 │ Какое окно? │ 0/1 │ 0/1 │ — │ — │ — │ да·порог │" in flat
+    text = _plain(out.getvalue())
+    assert "#1 Какое окно? · off 0/1 · cite 0/1 · не знаю·порог" in text
+    assert text.count("Контрольные вопросы: без RAG и RAG+цитаты") == 1
+    for line in text.splitlines():
+        assert cell_len(line) <= 80, line
+    assert "«не знаю» на отвечаемых 1/1" in flat
+    assert "Без вызова модели: 1" in flat
+    assert judge.calls == []
+
+
+def test_eval_cite_failed_pair_keeps_the_denominators_honest(fakes, out, err, tmp_path, judge):
+    fakes.answer_rag = CITE_JSON
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    fakes.fail_on_call, fakes.fail_count, fakes.fail_exc = 1, 1, AdventError
+    rows = rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]), pair="full,cite", unanswerable=False)
+    flat = _flat(out.getvalue())
+    assert [r.ok for r in rows] == [False, True]
+    assert "Запланировано 2 · получено 1 · без ответа 1" in flat
+    assert "цитаты 1/1" in flat
+
+
+def test_unanswerable_outcome_covers_every_cite_reason_and_the_heuristic():
+    from advent_core.rag import unknown_answer
+    from week_05.rag import unanswerable_outcome
+
+    assert unanswerable_outcome("", unknown_answer("empty_context")) == "refused"
+    assert unanswerable_outcome("", unknown_answer("model_unknown")) == "refused"
+    assert unanswerable_outcome("", unknown_answer("no_index")) == "refused"
+    assert unanswerable_outcome("", unknown_answer("unverified")) == "unverified"
+    assert unanswerable_outcome("", unknown_answer("bad_json")) == "format"
+    assert unanswerable_outcome("", unknown_answer("truncated")) == "format"
+    assert unanswerable_outcome("Не знаю, в документации нет.", None) == "refused"
+    assert unanswerable_outcome("Борщ варят так: ...", None) == "answered"
+
+
+# --- Day 24 review fixes (SPEC-w05d24 §9c) ------------------------------------------------
+
+
+def test_eval_cite_pair_failure_on_the_cite_run_keeps_the_full_run_spend(
+    fakes, out, err, judge, tmp_path
+):
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    fakes.answer_rag = CITE_JSON
+    fakes.fail_on_call = 2
+    fakes.fail_count = 2
+    rag_cli.run_eval(_questions(tmp_path, [Q1]), pair="full,cite", unanswerable=False)
+    flat = _flat(out.getvalue())
+    assert "Запланировано 1 · получено 0 · без ответа 1" in flat
+    assert "Токены prompt/completion: RAG+rerank 100/5 · RAG+цитаты 0/0" in flat
+
+
+def test_ask_cite_quotes_note_is_its_own_line_and_token_line_fits_80(fakes, out, err):
+    fakes.answer_rag = CITE_JSON
+    fakes.full_default = _full_ctx(hits=[_relevant_hit(rerank=9.0, rank=1)], passed=1)
+    rag_cli.ask_question("Какое окно?", mode="cite")
+    lines = [_plain(line) for line in err.getvalue().splitlines()]
+    token_lines = [line for line in lines if line.startswith("RAG+цитаты:")]
+    assert len(token_lines) == 1
+    assert "цитаты: 1/1" not in token_lines[0] and token_lines[0].rstrip().endswith("1.5 с")
+    assert "цитаты: 1/1 дословны" in lines
+    assert all(cell_len(line) <= 80 for line in lines)
+
+
+def test_ask_forwards_agent_warnings_to_stderr_once(fakes, out, err, monkeypatch):
+    real = rag_cli.make_config
+
+    def with_stop(*args, **kwargs):
+        config = real(*args, **kwargs)
+        config.params.stop = ["###"]
+        return config
+
+    monkeypatch.setattr(rag_cli, "make_config", with_stop)
+    fakes.answer_rag = CITE_JSON
+    rag_cli.ask_question("Какое окно?", mode="cite")
+    text = _flat(err.getvalue())
+    assert text.count("в режиме rag_cite stop не отправляется") == 1
+    assert "max_context_length" not in text
+
+
+def test_ask_without_cite_prints_no_unknown_window_noise(fakes, out, err):
+    rag_cli.ask_question("Какое окно?", pair="plain,full")
+    assert "max_context_length" not in _flat(err.getvalue())
+
+
+def test_cite_answer_of_nested_brackets_survives_the_real_complete_and_is_journaled(
+    fakes, out, err, monkeypatch
+):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    raw = "[" * 10000  # json.loads raises RecursionError on this, not JSONDecodeError
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=raw), finish_reason="stop")],
+        model="m",
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+    @contextmanager
+    def fake_client(config):
+        yield SimpleNamespace(chat=SimpleNamespace(complete=lambda **kw: response))
+
+    monkeypatch.setattr(rag_cli.chat_core, "complete", _REAL_COMPLETE)
+    monkeypatch.setattr(chat_core, "mistral_client", fake_client)
+    journaled: list[str] = []
+    monkeypatch.setattr(
+        rag_cli,
+        "log_call",
+        lambda result, messages, *, week, day, extra=None: journaled.append(result.text),
+    )
+
+    rag_cli.ask_question("Какое окно?", mode="cite")
+
+    assert journaled == [raw]
+    assert "Не знаю: ответ модели не удалось разобрать." in _plain(out.getvalue())

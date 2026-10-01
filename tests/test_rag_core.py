@@ -347,3 +347,370 @@ def test_filtered_out_prompt_is_the_empty_instruction():
 def test_empty_hits_without_filtered_out_stay_the_bare_question():
     assert build_rag_prompt("q", []) == "q"
     assert build_rag_prompt("q", [], filtered_out=False) == "q"
+
+
+# --- Day 24: cited answers ---
+
+CITE_HITS = (
+    RagHit(
+        "s:a#1", "CLAUDE.md", "OBS recording", 0.8, "Run `rag_cite` mode. Window is 262144 tokens."
+    ),
+    RagHit("s:b#2", "README.md", "", 0.7, "Tag w01d01 must exist on the remote before submit."),
+    RagHit(
+        "s:c#3", "CLAUDE.md", "Secrets", 0.6, "The env file is gitignored from the first commit."
+    ),
+    RagHit("s:d#4", "x.md", "Other", 0.5, "Fourth fragment text goes right here."),
+)
+
+
+def _cited_json(**over):
+    import json
+
+    data = {
+        "status": "answer",
+        "answer": "Тег должен быть на remote.",
+        "sources": [2],
+        "quotes": [{"id": 2, "text": "Tag w01d01 must exist on the remote"}],
+    }
+    data.update(over)
+    return json.dumps(data, ensure_ascii=False)
+
+
+def test_quote_norm_strips_markdown_edge_quotes_and_casefolds():
+    from advent_core.rag import quote_norm
+
+    assert quote_norm("**«Hello   World.»**") == "hello world"
+    assert quote_norm("  `rag_cite` mode… ") == "rag_cite mode"
+    assert quote_norm("a_b *c*") == "a_b *c*"
+
+
+def test_quote_in_accepts_markdown_wrapped_verbatim_quote():
+    from advent_core.rag import quote_in
+
+    assert quote_in("**«Window is 262144 tokens.»**", CITE_HITS[0].text)
+
+
+def test_quote_in_rejects_identifier_glued_together():
+    from advent_core.rag import quote_in
+
+    assert not quote_in("Run ragcite mode", CITE_HITS[0].text)
+
+
+def test_quote_in_rejects_short_quote_and_paraphrase():
+    from advent_core.rag import quote_in
+
+    assert not quote_in("262144", CITE_HITS[0].text)
+    assert not quote_in("The window holds 262144 tokens", CITE_HITS[0].text)
+
+
+def test_build_cite_prompt_puts_the_question_at_both_ends_with_numbering():
+    from advent_core.rag import RAG_CITE_INSTRUCTION, build_cite_prompt
+
+    prompt = build_cite_prompt("Как?", CITE_HITS[:2])
+    parts = prompt.split("\n\n")
+    assert parts[0] == RAG_CITE_INSTRUCTION
+    assert parts[1] == "Вопрос: Как?"
+    assert parts[-1] == "Вопрос: Как?"
+    assert "[1] CLAUDE.md — OBS recording\nRun `rag_cite` mode." in prompt
+    assert "[2] README.md\nTag w01d01" in prompt
+    assert prompt.count("Вопрос: Как?") == 2
+    assert "JSON" in RAG_CITE_INSTRUCTION
+
+
+def test_parse_cited_accepts_a_verbatim_answer():
+    from advent_core.rag import parse_cited
+
+    c = parse_cited(_cited_json(), CITE_HITS)
+    assert c.status == "answer" and c.reason == ""
+    assert c.answer == "Тег должен быть на remote."
+    assert [h.chunk_id for h in c.sources] == ["s:b#2"]
+    assert [h.chunk_id for h in c.quoted_sources] == ["s:b#2"]
+    assert c.quotes[0].verified is True and c.quotes[0].n == 2
+    assert c.verified_quotes == 1 and c.quoted is True
+
+
+def test_parse_cited_sources_are_declared_quoted_sources_are_verbatim_only():
+    from advent_core.rag import parse_cited
+
+    raw = _cited_json(
+        sources=[3, 1],
+        quotes=[
+            {"id": 1, "text": "Window is 262144 tokens."},
+            {"id": 3, "text": "something the model made up here"},
+        ],
+    )
+    c = parse_cited(raw, CITE_HITS)
+    assert [h.chunk_id for h in c.sources] == ["s:a#1", "s:c#3"]
+    assert [h.chunk_id for h in c.quoted_sources] == ["s:a#1"]
+    assert [q.verified for q in c.quotes] == [True, False]
+
+
+def test_parse_cited_without_verbatim_quote_is_unverified_and_keeps_the_draft():
+    from advent_core.rag import parse_cited
+
+    raw = _cited_json(quotes=[{"id": 2, "text": "Tag must be somewhere maybe"}])
+    c = parse_cited(raw, CITE_HITS)
+    assert (c.status, c.reason, c.answer) == ("unknown", "unverified", "")
+    assert c.draft == "Тег должен быть на remote."
+    assert c.quoted is False and c.quoted_sources == ()
+    assert len(c.quotes) == 1 and c.quotes[0].verified is False
+
+
+def test_parse_cited_model_unknown_clarifies_from_hits():
+    from advent_core.rag import parse_cited
+
+    c = parse_cited('{"status": "unknown", "answer": "", "sources": [], "quotes": []}', CITE_HITS)
+    assert (c.status, c.reason) == ("unknown", "model_unknown")
+    assert c.clarify == ("CLAUDE.md — OBS recording", "README.md", "CLAUDE.md — Secrets")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json at all",
+        "[1, 2]",
+        "null",
+        "42",
+        '{"status": "maybe"}',
+        '{"status": 1}',
+        '{"status": "answer"}',
+        '{"status": "answer", "answer": 5}',
+        None,
+        b"bytes",
+    ],
+)
+def test_parse_cited_is_total_on_garbage(raw):
+    from advent_core.rag import parse_cited
+
+    c = parse_cited(raw, CITE_HITS)
+    assert (c.status, c.reason, c.answer) == ("unknown", "bad_json", "")
+
+
+def test_parse_cited_survives_pathological_nesting():
+    from advent_core.rag import parse_cited
+
+    c = parse_cited("[" * 100000, CITE_HITS)
+    assert (c.status, c.reason) == ("unknown", "bad_json")
+
+
+def test_parse_cited_empty_answer_with_status_answer_is_bad_json():
+    from advent_core.rag import parse_cited
+
+    assert parse_cited(_cited_json(answer="   "), CITE_HITS).reason == "bad_json"
+
+
+def test_parse_cited_quotes_null_and_sources_not_a_list_are_tolerated():
+    from advent_core.rag import parse_cited
+
+    c = parse_cited(_cited_json(quotes=None, sources="2"), CITE_HITS)
+    assert (c.status, c.reason) == ("unknown", "unverified")
+    assert c.sources == () and c.quotes == ()
+
+
+def test_parse_cited_skips_bool_out_of_range_and_garbage_ids_and_entries():
+    from advent_core.rag import parse_cited
+
+    raw = _cited_json(
+        sources=[True, 0, 5, "2", 2.0, 4, 4],
+        quotes=[
+            {"id": True, "text": "Tag w01d01 must exist on the remote"},
+            {"id": 9, "text": "a sentence nobody wrote anywhere"},
+            {"id": 2, "text": 7},
+            {"id": 2, "text": "  "},
+            "junk",
+            {"id": 2, "text": "Tag w01d01 must exist on the remote"},
+        ],
+    )
+    c = parse_cited(raw, CITE_HITS)
+    assert [h.chunk_id for h in c.sources] == ["s:d#4"]
+    assert len(c.quotes) == 1 and c.quotes[0].n == 2 and c.quoted is True
+
+
+def test_parse_cited_truncated_wins_even_over_valid_json():
+    from advent_core.rag import parse_cited
+
+    c = parse_cited(_cited_json(), CITE_HITS, True)
+    assert (c.status, c.reason) == ("unknown", "truncated")
+
+
+def test_parse_cited_accepts_a_json_code_fence():
+    from advent_core.rag import parse_cited
+
+    assert parse_cited("```json\n" + _cited_json() + "\n```", CITE_HITS).quoted is True
+
+
+def test_unknown_answer_dedupes_sections_and_caps_at_three():
+    from advent_core.rag import unknown_answer
+
+    near = [CITE_HITS[0], CITE_HITS[0], CITE_HITS[1], CITE_HITS[2], CITE_HITS[3]]
+    c = unknown_answer("empty_context", near)
+    assert c.clarify == ("CLAUDE.md — OBS recording", "README.md", "CLAUDE.md — Secrets")
+    assert (c.status, c.reason, c.answer, c.sources, c.quotes) == (
+        "unknown",
+        "empty_context",
+        "",
+        (),
+        (),
+    )
+    assert unknown_answer("no_index").clarify == ()
+
+
+def test_render_cited_answer_literal_with_context_numbers_and_marks():
+    from advent_core.rag import parse_cited, render_cited
+
+    raw = _cited_json(
+        sources=[2, 3],
+        quotes=[
+            {"id": 2, "text": "Tag w01d01 must exist on the remote"},
+            {"id": 3, "text": "an invented sentence for fragment three"},
+        ],
+    )
+    c = parse_cited(raw, CITE_HITS)
+    expected = (
+        "Тег должен быть на remote.\n"
+        "\n"
+        "Источники:\n"
+        "[2] README.md · s:b#2 · цитата ✓\n"
+        "[3] CLAUDE.md — Secrets · s:c#3\n"
+        "Цитаты:\n"
+        "[2] ✓ «Tag w01d01 must exist on the remote»\n"
+        "[3] ✗ «an invented sentence for fragment three»"
+    )
+    assert render_cited(c, CITE_HITS, for_history=False) == expected
+    assert render_cited(c, CITE_HITS, for_history=True) == expected
+    assert "подтвержд" not in expected
+
+
+def test_parse_cited_reattributes_a_quote_to_the_fragment_that_holds_it():
+    from advent_core.rag import parse_cited
+
+    raw = _cited_json(
+        sources=[3],
+        quotes=[{"id": 3, "text": "Tag w01d01 must exist on the remote"}],
+    )
+    c = parse_cited(raw, CITE_HITS)
+    assert c.status == "answer" and c.reason == ""
+    q = c.quotes[0]
+    assert (q.n, q.claimed, q.verified) == (2, 3, True)
+    assert [h.chunk_id for h in c.quoted_sources] == ["s:b#2"]
+
+
+def test_parse_cited_reattribution_picks_the_lowest_fragment():
+    from advent_core.rag import parse_cited
+
+    hits = (*CITE_HITS, CITE_HITS[1])
+    raw = _cited_json(quotes=[{"id": 4, "text": "Tag w01d01 must exist on the remote"}])
+    q = parse_cited(raw, hits).quotes[0]
+    assert (q.n, q.claimed) == (2, 4)
+
+
+def test_parse_cited_quote_found_nowhere_stays_unverified_with_its_claimed_id():
+    from advent_core.rag import parse_cited
+
+    raw = _cited_json(quotes=[{"id": 3, "text": "a sentence nobody wrote anywhere"}])
+    c = parse_cited(raw, CITE_HITS)
+    q = c.quotes[0]
+    assert (q.n, q.claimed, q.verified) == (3, None, False)
+    assert c.reason == "unverified"
+
+
+def test_parse_cited_out_of_range_id_is_reattributed_when_the_quote_is_verbatim():
+    from advent_core.rag import parse_cited
+
+    raw = _cited_json(
+        sources=[5], quotes=[{"id": 5, "text": "Tag w01d01 must exist on the remote"}]
+    )
+    c = parse_cited(raw, CITE_HITS)
+    q = c.quotes[0]
+    assert (q.n, q.claimed, q.verified) == (2, 5, True)
+    assert c.status == "answer" and c.quoted is True
+    assert c.sources == ()  # declared out-of-range source stays dropped
+
+
+def test_parse_cited_out_of_range_id_found_nowhere_is_dropped():
+    from advent_core.rag import parse_cited
+
+    raw = _cited_json(quotes=[{"id": 5, "text": "a sentence nobody wrote anywhere"}])
+    c = parse_cited(raw, CITE_HITS)
+    assert c.quotes == ()
+    assert (c.status, c.reason) == ("unknown", "unverified")
+
+
+def test_parse_cited_bool_id_is_still_rejected_even_with_a_verbatim_quote():
+    from advent_core.rag import parse_cited
+
+    raw = _cited_json(quotes=[{"id": True, "text": "Tag w01d01 must exist on the remote"}])
+    assert parse_cited(raw, CITE_HITS).quotes == ()
+
+
+def test_parse_cited_quote_in_its_claimed_fragment_is_not_marked_corrected():
+    from advent_core.rag import parse_cited
+
+    q = parse_cited(_cited_json(), CITE_HITS).quotes[0]
+    assert (q.n, q.claimed, q.verified) == (2, None, True)
+
+
+def test_render_cited_shows_the_correction_literal():
+    from advent_core.rag import parse_cited, render_cited
+
+    raw = _cited_json(
+        sources=[3],
+        quotes=[{"id": 3, "text": "Tag w01d01 must exist on the remote"}],
+    )
+    out = render_cited(parse_cited(raw, CITE_HITS), CITE_HITS, for_history=False)
+    assert "[2] ✓ (модель указала [3]) «Tag w01d01 must exist on the remote»" in out
+    assert out.endswith("«Tag w01d01 must exist on the remote»")
+
+
+def test_render_cited_unknown_literal():
+    from advent_core.rag import render_cited, unknown_answer
+
+    c = unknown_answer("empty_context", CITE_HITS[:2])
+    expected = (
+        "Не знаю: в документации проекта не нашлось фрагментов, относящихся к вопросу.\n"
+        "Уточните вопрос — возможно, вы про:\n"
+        "· CLAUDE.md — OBS recording\n"
+        "· README.md"
+    )
+    assert render_cited(c, CITE_HITS, for_history=True) == expected
+    assert render_cited(c, CITE_HITS, for_history=False) == expected
+
+
+def test_render_cited_unverified_draft_is_screen_only():
+    from advent_core.rag import RAG_UNKNOWN_PREFIX, parse_cited, render_cited
+
+    raw = _cited_json(quotes=[{"id": 2, "text": "Tag must be somewhere maybe"}])
+    c = parse_cited(raw, CITE_HITS)
+    screen = render_cited(c, CITE_HITS, for_history=False)
+    history = render_cited(c, CITE_HITS, for_history=True)
+    assert screen.startswith("Не знаю: ни одна цитата модели не нашлась дословно")
+    assert "неподтверждённый ответ модели: «Тег должен быть на remote.»" in screen
+    assert "Тег должен быть на remote." not in history
+    assert "неподтверждённый" not in history
+    assert history.startswith("Не знаю:")
+    assert RAG_UNKNOWN_PREFIX == "Не знаю:"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Не знаю: в документации нет этого.", True),
+        ("К сожалению, в документации проекта нет информации об этом.", True),
+        ("Этот факт не нашлось где подтвердить.", True),
+        ("Окно контекста — 262144 токена.", False),
+        ("", False),
+        ("Не знаю. " + "очень длинное пояснение " * 30, False),
+        ("Длинный ответ " * 20 + "не знаю", False),
+    ],
+)
+def test_says_unknown_heuristic(text, expected):
+    from advent_core.rag import says_unknown
+
+    assert says_unknown(text) is expected
+
+
+def test_rag_settings_cite_defaults_to_false():
+    from advent_core.rag import RagSettings
+
+    assert RagSettings("structure", 5, 20, False, False, 5.0).cite is False
+    assert RagSettings("structure", 5, 20, True, True, 5.0, cite=True).cite is True
