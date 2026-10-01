@@ -1118,14 +1118,6 @@ demonstration. `eval --detail 3` prints each question's expected facts and
 answer excerpts as the pair finishes. Judge a step by what a viewer learns
 while it runs, not only by how it ends.
 
-**A local coder working from dictation does not save tokens.** Day 22 ran the
-coding through bonsai-2-27b (`local-model-delegation`): ten calls, ten usable
-first drafts, two model defects. But a dictation precise enough for a small
-model is about as long as the code itself (~13k output tokens of the main
-model here), the 16k window cannot hold `agent.py` or `week_02/cli.py`, and one
-dictation error was carried over verbatim into five failing tests. The
-experiment was closed on 2026-10-01; coding stays with `worker-sonnet`.
-
 **Terminal width is measured in cells, not characters, and only a dry-run at 80
 columns shows it.** Three defects of this kind passed the tests, which rendered
 at width 200 and searched for substrings: a nine-column table truncated to
