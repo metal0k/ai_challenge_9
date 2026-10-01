@@ -1127,3 +1127,39 @@ because an emoji occupies two cells — `rich.cells.cell_len` is the measure. Th
 tests now render at width 80 and assert concrete cells and the absence of `…`.
 Related: a path printed on success was made repo-relative while the same path in
 the *error* message stayed absolute until a second review caught it.
+
+**`mistral-embed` cosine is too compressed to threshold on — put the cutoff on
+a reranker score.** Measured 2026-10-01 on the 10 control questions, top-20
+`structure`: every score falls in 0.73–0.89, the median relevant chunk scores
+0.799 against 0.795 for irrelevant ones, and even off-topic does not separate —
+"how to cook borscht" tops out at 0.779 while a genuine repo question's best hit
+is 0.772. Day 23's threshold is therefore on the LLM reranker's 0–10 score, and
+cosine stays a ranking signal only.
+
+**In a long rerank prompt, where the question sits decided more than the
+threshold did.** With the question only after ~40 whole chunks, ministral-14b
+gave the relevant chunk 2/0/0 (q3) and 8/3/0 (q8) across three runs; with the
+question repeated *before* the fragments too, 7/7/10 and 10/10/10.
+`build_rerank_prompt` carries it at both ends. The scores themselves are
+bimodal — almost always 10/8 or 0 — so moving the threshold between 1 and 9
+changes little, and run-to-run variance is the reranker's noise, not the
+threshold's. Rerank by truncated chunks (1200 chars) scored relevant chunks 0
+because the fact sat further down; rerank gets chunks whole. Nothing larger
+than `ministral-14b` is reachable on this account (small/magistral/devstral
+429, large 403).
+
+**An empty context plus "do not answer from memory" does not make the model say
+it does not know.** When the threshold cut all 37 candidates for the
+`cut_static` question, the RAG_EMPTY_INSTRUCTION prompt still produced an
+invented `select`+`md5(h)` filter chain; the borscht question, same
+instruction, was refused correctly. Day 24's "не знаю" mode has to be enforced,
+not requested.
+
+**`Server disconnected without sending a response` is a network error, and it
+used to bypass the retry.** `translate()` mapped it (and SSL
+`UNEXPECTED_EOF_WHILE_READING`) to the generic "unexpected error", exit 1, so
+the transient-only retry (exit 4/5/6) never fired; it killed three live runs on
+2026-10-01. It is exit 6 now. Same day, this machine's TLS to `yadi.sk` failed
+with the same SSL EOF while the publication itself had succeeded — verify a
+public Disk link through `cloud-api.yandex.net/v1/disk/public/resources?public_key=…`,
+not by fetching `yadi.sk`.
