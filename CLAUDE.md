@@ -726,6 +726,12 @@ deliberately fixed: the model answers differently every time, the script must no
 
 ## Submitting a day
 
+**After every recording, give the user the full absolute path to the video
+file** (the `готово: <path>` line `advent record` prints) so it can be opened
+for review straight away — set by the user 2026-10-01. The path goes into the
+chat reply only, never into a tracked file: it is a local path and
+`tools/check_staged.py` would rightly block it.
+
 `advent submit --day N` refuses to print links until the tag exists **on the
 remote** — a local-only tag yields a 404 for the reviewer. It then publishes the
 video via the Yandex Disk API (`PUT /resources/publish`, then read `public_url`)
@@ -1081,6 +1087,44 @@ text, with every anchor shorter than the fixed overlap (150) so some fixed chunk
 can always contain it whole. Questions and anchors were frozen before the first
 run; an anchor missing from the snapshot drops the whole question as a dataset
 error instead of counting as a miss.
+
+**RAG augments the request, never the history.** Day 22's retrieval runs as
+the first step of `Agent.ask()`; the chunks and the question become one user
+message for THIS request only, while `new_history` keeps the bare question —
+otherwise every later turn re-sends five chunks per past question. The budget
+side is the opposite: `_trim`, the summary-branch `_count_request` and the
+final-budget checks must see the augmented text, or a big context never
+triggers compaction and the request overshoots. Retrieval runs before the
+invariant preflight so a failed embed cannot take a paid preflight down with it.
+
+**Expected sources in a RAG control set are alternatives, not a checklist.**
+This repo states most facts twice — `CLAUDE.md` and the week README, often the
+code too. The first eval listed one source per question and scored 2/11
+"expected source in top-k" while the answers were right: the retriever had
+found the README copy. Sources are now every file that holds the facts, and the
+metric is "at least one in top-k / named in the answer".
+
+**A fact checked by substring needs number boundaries.** `"1.5" in "11.5"` and
+`"1024" in "10240"` are both true, so a wrong answer scored as correct
+(Codex review, day 22). `check_facts` refuses a digit-led or digit-ended match
+that sits inside a longer number; `fact_span` applies the same rules to find
+the excerpt window.
+
+**A technically clean take can still be a rejected take.** Day 22's first take
+passed every frame check — clean start, no freeze over 8 s, final table on the
+last screen — and the user rejected step 3: two minutes of "вопрос N/10"
+progress lines, no answer visible until the table. A progress counter is not a
+demonstration. `eval --detail 3` prints each question's expected facts and
+answer excerpts as the pair finishes. Judge a step by what a viewer learns
+while it runs, not only by how it ends.
+
+**A local coder working from dictation does not save tokens.** Day 22 ran the
+coding through bonsai-2-27b (`local-model-delegation`): ten calls, ten usable
+first drafts, two model defects. But a dictation precise enough for a small
+model is about as long as the code itself (~13k output tokens of the main
+model here), the 16k window cannot hold `agent.py` or `week_02/cli.py`, and one
+dictation error was carried over verbatim into five failing tests. The
+experiment was closed on 2026-10-01; coding stays with `worker-sonnet`.
 
 **Terminal width is measured in cells, not characters, and only a dry-run at 80
 columns shows it.** Three defects of this kind passed the tests, which rendered
