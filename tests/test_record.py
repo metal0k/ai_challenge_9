@@ -1527,7 +1527,10 @@ def test_day_22_steps_pin_modules_and_args():
         "Какое максимальное значение temperature принимает Mistral API?",
     ]
     assert steps[1].args == ["--session", "w05d22-demo", "--max-tokens", "400"]
-    assert steps[2].args == ["eval"]
+    assert steps[2].args == ["eval", "--detail", "3"]
+    assert (
+        steps[2].title == "3. adventrag eval — 10 контрольных вопросов: 3 подробно, итог по всем 10"
+    )
 
 
 def test_day_22_agent_step_asks_the_same_question_before_and_after_rag_on():
@@ -1546,7 +1549,7 @@ def test_day_22_agent_step_asks_the_same_question_before_and_after_rag_on():
 
 
 def test_day_22_last_step_is_eval_for_the_closing_headline():
-    assert record_mod.demo_steps(5, 22)[-1].args == ["eval"]
+    assert record_mod.demo_steps(5, 22)[-1].args == ["eval", "--detail", "3"]
 
 
 def test_day_22_titles_are_short_and_numbered():

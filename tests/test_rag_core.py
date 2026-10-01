@@ -4,9 +4,72 @@ from advent_core.rag import (
     build_rag_prompt,
     check_facts,
     cited_sources,
+    fact_span,
     fit_hits,
     normalize,
 )
+
+
+def test_fact_span_covers_the_digit_gap_in_the_original():
+    text = "Окно 262 144 токена"
+    span = fact_span(text, ["262144"])
+    assert span == (5, 12)
+    assert text[span[0] : span[1]] == "262 144"
+
+
+def test_fact_span_accepts_nbsp_and_narrow_nbsp_between_digits():
+    assert fact_span("окно 262 144 и 8 192", ["262144"]) == (5, 12)
+    assert fact_span("окно 8 192", ["8192"]) == (5, 10)
+
+
+def test_fact_span_is_case_insensitive():
+    text = "см. Alice тут"
+    assert fact_span(text, ["alice"]) == (4, 9)
+
+
+def test_fact_span_refuses_a_longer_number():
+    assert fact_span("максимум 11.5", ["1.5"]) is None
+    assert fact_span("размерность 10240", ["1024"]) is None
+    assert fact_span("Потолок — 1.5.", ["1.5"]) == (10, 13)
+
+
+def test_fact_span_refuses_a_number_glued_across_whitespace():
+    assert fact_span("1 262 144", ["262144"]) is None
+    assert fact_span("262144 5", ["262144"]) is None
+
+
+def test_fact_span_takes_the_first_alternative_in_order_not_the_first_in_text():
+    text = "сначала beta, потом alpha"
+    assert fact_span(text, ["alpha", "beta"]) == (20, 25)
+    assert fact_span(text, ["beta", "alpha"]) == (8, 12)
+
+
+def test_fact_span_none_when_absent_or_empty():
+    assert fact_span("ничего", ["262144", "w01d01"]) is None
+    assert fact_span("ничего", ["", "ни"]) == (0, 2)
+    assert fact_span("ничего", [""]) is None
+    assert fact_span("ничего", []) is None
+
+
+def test_fact_span_agrees_with_check_facts():
+    cases = [
+        ("окно 262 144 токена", ["262144"]),
+        ("окно 262144", ["262 144"]),
+        ("максимум 11.5", ["1.5"]),
+        ("потолок 1.5.", ["1.5"]),
+        ("версия 1.55", ["1.5"]),
+        ("1 262 144", ["262144"]),
+        ("262144 5", ["262144"]),
+        ("ТЕГ W01D01", ["w01d01"]),
+        ("ничего", ["w01d01", "x"]),
+        ("(1024) и 8192!", ["8192", "1024"]),
+        ("размерность 10240", ["1024"]),
+        ("окно 262 144", ["262144"]),
+    ]
+    for answer, alternatives in cases:
+        assert (fact_span(answer, alternatives) is not None) == check_facts(answer, [alternatives])[
+            0
+        ], (answer, alternatives)
 
 
 def _hit(

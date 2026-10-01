@@ -90,6 +90,7 @@ RAG — это режим **постоянного агента** (`advent_core.
 uv run adventrag ask "вопрос"            # ответ без RAG и с RAG рядом
 uv run adventrag ask "вопрос" --rag      # только с RAG (--no-rag — только без)
 uv run adventrag eval                    # 10 контрольных вопросов, таблица и итог
+uv run adventrag eval --detail 3         # первые 3 вопроса подробно: ожидаемое и выдержки
 uv run adventrag eval --answers          # то же + оба ответа на каждый вопрос
 uv run adventagent                       # в REPL: /rag on | off, /rag — состояние
 ```

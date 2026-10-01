@@ -93,6 +93,39 @@ def _has_fact(haystack: str, needle: str) -> bool:
     return re.search(pattern, haystack) is not None
 
 
+def fact_span(answer: str, alternatives: Sequence[str]) -> tuple[int, int] | None:
+    """Span in the original answer of the first alternative `check_facts` would accept.
+
+    Same rules as `_has_fact` on `normalize`d text: case-insensitive, whitespace allowed
+    between digits, no landing inside a longer number (also across a digit gap).
+    IGNORECASE vs casefold can disagree ("Straße"/"strasse"): scoring always goes through
+    `check_facts`, so a disagreement only makes the snippet fall back to the answer start.
+    """
+    for alt in alternatives:
+        needle = normalize(alt)
+        if not needle:
+            continue
+        parts: list[str] = []
+        for i, ch in enumerate(needle):
+            if i and ch.isdigit() and needle[i - 1].isdigit():
+                parts.append(r"\s*")
+            parts.append(re.escape(ch))
+        pattern = "".join(parts)
+        if needle[0].isdigit():
+            pattern = r"(?<![\d.,])" + pattern
+        if needle[-1].isdigit():
+            pattern = pattern + r"(?![.,]?\d)"
+        for match in re.finditer(pattern, answer, re.IGNORECASE):
+            start, end = match.span()
+            # normalize() glues digits across whitespace, so "1 " + "262 144" is one number.
+            if needle[0].isdigit() and re.search(r"\d\s+\Z", answer[:start]):
+                continue
+            if needle[-1].isdigit() and re.match(r"\s+\d", answer[end:]):
+                continue
+            return start, end
+    return None
+
+
 def _has_path(haystack: str, path: str) -> bool:
     """Match a file path that is not the tail of a longer path."""
     if not path:

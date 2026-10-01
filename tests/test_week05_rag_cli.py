@@ -5,6 +5,7 @@ import json
 import re
 
 import pytest
+from rich.cells import cell_len
 from rich.console import Console
 
 from advent_core import config as config_module
@@ -55,11 +56,19 @@ class Fakes:
         self.answer_plain = "не знаю"
         self.answer_rag = "окно 262 144, тег w01d01, см. CLAUDE.md"
         self.fail_on_call: int | None = None
+        self.fail_count = 1
+        self.on_call = None
         self.chunks = [_chunk()]
 
     def complete(self, config, messages, capabilities=None, **kwargs):
         self.complete_calls.append(list(messages))
-        if self.fail_on_call == len(self.complete_calls):
+        n = len(self.complete_calls)
+        if self.on_call is not None:
+            self.on_call(n)
+        if (
+            self.fail_on_call is not None
+            and self.fail_on_call <= n < self.fail_on_call + self.fail_count
+        ):
             raise AdventError("сервер недоступен")
         has_chunk = any(CHUNK_TEXT in str(m.get("content", "")) for m in messages)
         return CallResult(
@@ -238,6 +247,7 @@ def test_eval_plain_winner(fakes, out, err, tmp_path):
 
 def test_eval_error_row_means_no_verdict(fakes, out, err, tmp_path):
     fakes.fail_on_call = 3
+    fakes.fail_count = 2
     rows = rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]))
     flat = _flat(_plain(out.getvalue()))
     assert "│ 2 │ Какой тег? │ ошибка │ ошибка │ — │ — │" in flat
@@ -251,6 +261,7 @@ def test_eval_error_row_means_no_verdict(fakes, out, err, tmp_path):
 
 def test_eval_all_errors(fakes, out, err, tmp_path):
     fakes.fail_on_call = 1
+    fakes.fail_count = 2
     rag_cli.run_eval(_questions(tmp_path, [Q1]))
     flat = _flat(_plain(out.getvalue()))
     assert "Ни одна пара ответов не получена — сравнивать нечего." in flat
@@ -297,10 +308,103 @@ def test_eval_journals_question_ids(fakes, out, err, tmp_path):
     ]
 
 
-def test_eval_progress_goes_to_stderr(fakes, out, err, tmp_path):
+def test_eval_has_no_stderr_progress_lines_any_more(fakes, out, err, tmp_path):
     rag_cli.run_eval(_questions(tmp_path, [Q1]))
-    assert "вопрос 1/1 · без RAG" in _flat(_plain(err.getvalue()))
+    assert "вопрос 1/1" not in _plain(err.getvalue())
     assert "вопрос 1/1" not in _plain(out.getvalue())
+
+
+Q3 = {
+    "id": 3,
+    "question": "Какой тег и окно?",
+    "expect": [["262144"], ["w01d01"]],
+    "sources": ["CLAUDE.md"],
+}
+
+
+def _lines(out) -> list[str]:
+    return _plain(out.getvalue()).splitlines()
+
+
+def test_eval_detail_prints_blocks_then_short_lines_before_the_table(fakes, out, err, tmp_path):
+    rag_cli.run_eval(_questions(tmp_path, [Q1, Q2, Q3]), detail=2)
+    text = _plain(out.getvalue())
+    lines = text.splitlines()
+    assert text.count("#1 ") == 1
+    assert lines[0] == "#1 Какое окно?"
+    assert lines[1] == "   ожидается: 262144"
+    assert lines[2] == "   без RAG ✗  «не знаю»"
+    assert lines[3] == "   с RAG   ✓  «окно 262 144, тег w01d01, см. CLAUDE.md»"
+    assert lines[4] == ""
+    assert lines[5] == "#2 Какой тег?"
+    assert lines[6] == "   ожидается: w01d01"
+    assert lines[9] == ""
+    assert "#3 Какой тег и окно? · без RAG 0/2 · с RAG 2/2" in lines
+    assert "   ожидается: 262144 · w01d01" not in text
+    assert lines[10] == "#3 Какой тег и окно? · без RAG 0/2 · с RAG 2/2"
+    assert lines[11] == ""
+    assert lines[12].strip() == "Контрольные вопросы: без RAG и с RAG"
+    assert text.index("#3 Какой тег") < text.index("Контрольные вопросы")
+
+
+def test_eval_detail_zero_prints_short_lines_only(fakes, out, err, tmp_path):
+    rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]))
+    lines = _lines(out)
+    assert "ожидается" not in "\n".join(lines)
+    assert lines[0] == "#1 Какое окно? · без RAG 0/1 · с RAG 1/1"
+    assert lines[1] == "#2 Какой тег? · без RAG 0/1 · с RAG 1/1"
+    assert "«" not in "\n".join(lines)
+
+
+def test_eval_two_fact_block_has_two_marks_and_aligned_answers(fakes, out, err, tmp_path):
+    fakes.answer_plain = "тег w01d01 и всё"
+    rag_cli.run_eval(_questions(tmp_path, [Q3, Q1]), detail=2)
+    lines = _lines(out)
+    assert lines[1] == "   ожидается: 262144 · w01d01"
+    assert lines[2] == "   без RAG ✗✓ «тег w01d01 и всё»"
+    assert lines[3].startswith("   с RAG   ✓✓ «")
+    q1_plain = lines[7]
+    assert q1_plain.startswith("   без RAG ✗  «")
+    assert {line.index("«") for line in (lines[2], lines[3], q1_plain, lines[8])} == {14}
+
+
+def test_eval_error_pair_prints_an_error_line_and_still_the_table(fakes, out, err, tmp_path):
+    fakes.fail_on_call = 3
+    fakes.fail_count = 2
+    rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]), detail=5)
+    text = _plain(out.getvalue())
+    assert "#2 Какой тег? · ошибка" in text.splitlines()
+    assert text.index("#2 Какой тег? · ошибка") < text.index("Контрольные вопросы")
+    assert "Завершено пар: 1/2" in _flat(text)
+
+
+def test_eval_detail_lines_fit_80_cells_and_snippet_centres_on_the_fact(fakes, out, err, tmp_path):
+    q = dict(Q1, question="Очень длинный вопрос про окно модели 🚀 и ещё много слов подряд " * 3)
+    fakes.answer_rag = "слово " * 60 + "окно 262 144 токена" + " слово" * 60
+    fakes.answer_plain = "начало " * 60
+    rag_cli.run_eval(_questions(tmp_path, [q]), detail=1)
+    lines = _lines(out)
+    assert all(cell_len(line) <= 80 for line in lines)
+    rag_line = next(line for line in lines if line.startswith("   с RAG   ✓  «"))
+    assert rag_line.startswith("   с RAG   ✓  «…")
+    assert rag_line.endswith("…»")
+    assert "262 144" in rag_line
+    assert lines[0].endswith("…")
+
+
+def test_eval_snippet_without_the_fact_is_the_start_of_the_answer(fakes, out, err, tmp_path):
+    fakes.answer_plain = "Начало ответа без факта " + "слово " * 60
+    rag_cli.run_eval(_questions(tmp_path, [Q1]), detail=1)
+    plain_line = _lines(out)[2]
+    assert plain_line.startswith("   без RAG ✗  «Начало ответа без факта слово")
+    assert plain_line.endswith("…»")
+    assert "«…" not in plain_line
+
+
+def test_eval_answers_come_after_the_row(fakes, out, err, tmp_path):
+    rag_cli.run_eval(_questions(tmp_path, [Q1]), answers=True)
+    text = _plain(out.getvalue())
+    assert text.index("#1 Какое окно? · без RAG 0/1 · с RAG 1/1") < text.index("── без RAG ──")
 
 
 def test_long_question_is_cut_in_cells(fakes, out, err, tmp_path):
@@ -324,6 +428,7 @@ def test_commands_are_registered_on_the_adventrag_app():
 
 def test_eval_error_in_the_rag_half_of_a_pair_drops_the_whole_pair(fakes, out, err, tmp_path):
     fakes.fail_on_call = 4
+    fakes.fail_count = 2
     rows = rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]))
     flat = _flat(out.getvalue())
     assert "│ 2 │ Какой тег? │ ошибка │ ошибка │ — │ — │" in flat
@@ -332,4 +437,112 @@ def test_eval_error_in_the_rag_half_of_a_pair_drops_the_whole_pair(fakes, out, e
     assert "Токены prompt/completion: без RAG 10/5 · с RAG 100/5 · embed 7" in flat
     assert "выше:" not in flat and "Ничья" not in flat
     assert rows[1].ok is False and rows[1].plain is None
+    assert len(fakes.complete_calls) == 5
+
+
+def test_eval_block_is_printed_before_the_next_question_starts(fakes, out, err, tmp_path):
+    seen = []
+
+    def check(n):
+        if n == 3:
+            seen.append("   ожидается: 262144" in _plain(out.getvalue()))
+
+    fakes.on_call = check
+    rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]), detail=1)
+    assert seen == [True]
+
+
+def test_eval_short_line_is_printed_before_the_next_question_starts(fakes, out, err, tmp_path):
+    seen = []
+
+    def check(n):
+        if n == 3:
+            seen.append("#1 Какое окно? · без RAG 0/1 · с RAG 1/1" in _plain(out.getvalue()))
+
+    fakes.on_call = check
+    rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]))
+    assert seen == [True]
+
+
+def test_eval_error_line_is_printed_before_the_next_pair_starts(fakes, out, err, tmp_path):
+    seen = []
+
+    def check(n):
+        if n == 5:
+            seen.append("#2 Какой тег? · ошибка" in _plain(out.getvalue()))
+
+    fakes.on_call = check
+    fakes.fail_on_call = 3
+    fakes.fail_count = 2
+    rag_cli.run_eval(_questions(tmp_path, [Q1, Q2, Q3]))
+    assert seen == [True]
+
+
+def test_eval_retries_a_failed_call_once(fakes, out, err, tmp_path):
+    fakes.fail_on_call = 3
+    rows = rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]))
+    assert rows[1].ok is True
+    assert len(fakes.complete_calls) == 5
+    assert _plain(err.getvalue()).count("вопрос #2: сервер недоступен — повтор") == 1
+    assert "не оценён" not in _flat(err.getvalue())
+
+
+def test_eval_two_failures_in_a_row_make_an_error_row(fakes, out, err, tmp_path):
+    fakes.fail_on_call = 3
+    fakes.fail_count = 2
+    rows = rag_cli.run_eval(_questions(tmp_path, [Q1, Q2]))
+    assert rows[1].ok is False
     assert len(fakes.complete_calls) == 4
+    assert _plain(err.getvalue()).count("— повтор") == 1
+    assert "вопрос #2 не оценён: сервер недоступен" in _flat(err.getvalue())
+
+
+def test_eval_blank_line_separates_live_rows_from_the_table(fakes, out, err, tmp_path):
+    rag_cli.run_eval(_questions(tmp_path, [Q1]))
+    lines = _lines(out)
+    assert lines[0] == "#1 Какое окно? · без RAG 0/1 · с RAG 1/1"
+    assert lines[1] == ""
+    assert lines[2].strip() == "Контрольные вопросы: без RAG и с RAG"
+
+
+def test_snippet_keeps_a_fact_wider_than_the_left_third_whole():
+    text = "x " * 60 + "A" * 50
+    got = rag_cli._snippet(text, [("A" * 50,)], 65)
+    assert got.startswith("…")
+    assert got.endswith("A" * 50)
+    assert cell_len(got) <= 65
+
+
+def test_snippet_fact_wider_than_the_budget_shows_its_start():
+    got = rag_cli._snippet("x " * 10 + "A" * 50, [("A" * 50,)], 20)
+    assert got == "A" * 19 + "…"
+
+
+def test_snippet_measures_a_wide_fact_in_cells():
+    fact = "界" * 25
+    got = rag_cli._snippet("слово " * 20 + fact + " слово" * 20, [(fact,)], 60)
+    assert fact in got
+    assert cell_len(got) <= 60
+
+
+def test_snippet_finds_a_fact_with_double_space_inside():
+    text = "слово " * 30 + "foo  bar" + " слово" * 30
+    got = rag_cli._snippet(text, [("foo  bar",)], 40)
+    assert "foo bar" in got
+    assert got.startswith("…")
+
+
+def test_expected_line_collapses_whitespace_inside_a_fact(fakes, out, err, tmp_path):
+    q = dict(Q1, expect=[["x" + chr(10) + "  y", "262144"]])
+    rag_cli.run_eval(_questions(tmp_path, [q]), detail=1)
+    assert "   ожидается: x y" in _lines(out)
+
+
+def test_snippet_falls_back_to_the_start_when_casefold_and_ignorecase_disagree():
+    from advent_core.rag import check_facts
+
+    answer = "Straße " + "слово " * 30
+    assert check_facts(answer, [["strasse"]]) == (True,)
+    got = rag_cli._snippet(answer, [("strasse",)], 40)
+    assert got.startswith("Straße слово")
+    assert got.endswith("…")

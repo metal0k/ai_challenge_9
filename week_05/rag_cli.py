@@ -15,7 +15,7 @@ from advent_core.agent import Agent
 from advent_core.config import PROJECT_ROOT, Config
 from advent_core.errors import AdventError
 from advent_core.journal import log_call
-from advent_core.rag import RagContext
+from advent_core.rag import RagContext, fact_span
 from week_05 import index as index_module
 from week_05 import rag as rag_module
 
@@ -303,6 +303,102 @@ def print_summary(rows: list[EvalRow]) -> None:
     )
 
 
+def _print_line(text: str) -> None:
+    """Print one line that must never wrap (the caller sizes it to the width)."""
+    console.out.print(text, markup=False, highlight=False, no_wrap=True, overflow="ellipsis")
+
+
+def _snippet(answer: str, facts: tuple[tuple[str, ...], ...] | list, width: int) -> str:
+    """Window of at most `width` cells around the first found fact."""
+    text = " ".join(answer.split())
+    if cell_len(text) <= width:
+        return text
+    span = None
+    for fact in facts:
+        # The alternative is collapsed too: spans refer to the collapsed text.
+        span = fact_span(text, [" ".join(alt.split()) for alt in fact])
+        if span is not None:
+            break
+
+    def fill(start: int, budget: int) -> int:
+        end, used = start, 0
+        while end < len(text) and used + cell_len(text[end]) <= budget:
+            used += cell_len(text[end])
+            end += 1
+        return end
+
+    start = 0
+    if span is not None:
+        s, e = span
+        fact_w = cell_len(text[s:e])
+        # Fact first (plus both ellipses), then context: left ~1/3 of what remains.
+        rem = width - fact_w - (1 if s > 0 else 0) - (1 if e < len(text) else 0)
+        if rem < 0:
+            return text[s : fill(s, width - 1)] + "…"
+        right_all = cell_len(text[e:])
+        left = rem // 3
+        if right_all <= rem - left:
+            left = rem + (1 if e < len(text) else 0) - right_all
+        start = s
+        used = 0
+        while start > 0 and used + cell_len(text[start - 1]) <= left:
+            start -= 1
+            used += cell_len(text[start])
+    prefix = "…" if start > 0 else ""
+    end = fill(start, width - len(prefix))
+    if end >= len(text):
+        return prefix + text[start:]
+    return prefix + text[start : fill(start, width - len(prefix) - 1)] + "…"
+
+
+def _print_pair(n: int, row: EvalRow, detail: int) -> None:
+    """Print one question's result right after its pair of answers."""
+    width = console.out.width
+    head = f"#{row.question.id} "
+    if not row.ok or row.plain_score is None or row.rag_score is None:
+        tail = " · ошибка"
+        _print_line(
+            head
+            + _cut(" ".join(row.question.question.split()), width - len(head) - len(tail))
+            + tail
+        )
+        return
+    question = " ".join(row.question.question.split())
+    if n > detail:
+        tail = f" · без RAG {_ratio(row.plain_score.facts)} · с RAG {_ratio(row.rag_score.facts)}"
+        _print_line(head + _cut(question, width - len(head) - cell_len(tail)) + tail)
+        return
+    _print_line(head + _cut(question, width - len(head)))
+    expected = " · ".join(" ".join(fact[0].split()) for fact in row.question.expect)
+    label = "   ожидается: "
+    _print_line(label + _cut(expected, width - cell_len(label)))
+    marks_w = max(2, len(row.question.expect))
+    for label, run, score in (
+        ("без RAG", row.plain, row.plain_score),
+        ("с RAG", row.rag, row.rag_score),
+    ):
+        marks = "".join("✓" if found else "✗" for found in score.facts)
+        lead = f"   {label:<7} {marks:<{marks_w}} «"
+        room = width - cell_len(lead) - 1
+        _print_line(f"{lead}{_snippet(run.text, row.question.expect, room)}»")
+    console.out.print()
+
+
+def _run_mode_retry(
+    agent: Agent, question: rag_module.ControlQuestion, *, use_rag: bool
+) -> ModeRun:
+    """One retry per mode: a transient network error must not cost the whole pair."""
+    try:
+        return run_mode(
+            agent, question.question, use_rag=use_rag, command="eval", question_id=question.id
+        )
+    except AdventError as error:
+        console.warn(f"вопрос #{question.id}: {error.message} — повтор")
+        return run_mode(
+            agent, question.question, use_rag=use_rag, command="eval", question_id=question.id
+        )
+
+
 def run_eval(
     questions_path: Path | None = None,
     strategy: str = "structure",
@@ -310,6 +406,7 @@ def run_eval(
     db: str | None = None,
     model: str | None = None,
     answers: bool = False,
+    detail: int = 0,
 ) -> list[EvalRow]:
     """Run the control-question evaluation and print the result."""
     db_path = Path(db) if db is not None else None
@@ -322,24 +419,17 @@ def run_eval(
         questions, index_module.load_chunks(db_path, strategy)
     )
     if broken:
-        detail = "; ".join(f"#{question.id}: {reason}" for question, reason in broken)
+        problems = "; ".join(f"#{question.id}: {reason}" for question, reason in broken)
         raise AdventError(
-            f"Набор контрольных вопросов не согласован с индексом — {detail}.",
+            f"Набор контрольных вопросов не согласован с индексом — {problems}.",
             hint="Исправь week_05/rag_questions.json или переиндексируй: `adventrag index`.",
         )
     agent = build_agent(config, db_path)
     rows: list[EvalRow] = []
-    total = len(valid)
     for n, question in enumerate(valid, start=1):
         try:
-            console.note(f"вопрос {n}/{total} · без RAG")
-            plain = run_mode(
-                agent, question.question, use_rag=False, command="eval", question_id=question.id
-            )
-            console.note(f"вопрос {n}/{total} · с RAG")
-            with_rag = run_mode(
-                agent, question.question, use_rag=True, command="eval", question_id=question.id
-            )
+            plain = _run_mode_retry(agent, question, use_rag=False)
+            with_rag = _run_mode_retry(agent, question, use_rag=True)
         except AdventError as error:
             console.warn(f"вопрос #{question.id} не оценён: {error.message}")
             rows.append(
@@ -352,6 +442,7 @@ def run_eval(
                     error=error.message,
                 )
             )
+            _print_pair(n, rows[-1], detail)
             continue
         rows.append(
             EvalRow(
@@ -362,12 +453,15 @@ def run_eval(
                 rag_score=rag_module.score_answer(question, with_rag.text, with_rag.ctx),
             )
         )
+        _print_pair(n, rows[-1], detail)
         if answers:
             console.out.print(
                 f"#{question.id} {question.question}", style="bold", markup=False, highlight=False
             )
             print_mode_answer(False, plain)
             print_mode_answer(True, with_rag)
+    if rows:
+        console.out.print()
     console.out.print(eval_table(rows))
     print_summary(rows)
     return rows
@@ -388,8 +482,20 @@ def register_eval(app: typer.Typer) -> None:
         answers: bool = typer.Option(
             False, "--answers", help="Печатать ответы обоих режимов целиком."
         ),
+        detail: int = typer.Option(
+            0,
+            "--detail",
+            min=0,
+            help="Сколько первых вопросов показать подробно: ожидаемое и выдержки ответов.",
+        ),
     ) -> None:
         """10 контрольных вопросов: ответы без RAG и с RAG, факты и источники."""
         run_eval(
-            Path(questions) if questions is not None else None, strategy, k, db, model, answers
+            Path(questions) if questions is not None else None,
+            strategy,
+            k,
+            db,
+            model,
+            answers,
+            detail,
         )

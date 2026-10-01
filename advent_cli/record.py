@@ -1940,9 +1940,9 @@ def _demo_steps_w05d22() -> list[Step]:
             line_pause=6.0,
         ),
         Step(
-            title="3. adventrag eval — 10 контрольных вопросов: факты и источники в обоих режимах",
+            title="3. adventrag eval — 10 контрольных вопросов: 3 подробно, итог по всем 10",
             module="week_05.cli",
-            args=["eval"],
+            args=["eval", "--detail", "3"],
             timeout=420,
             line_pause=8.0,
         ),
