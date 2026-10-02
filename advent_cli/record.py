@@ -2080,7 +2080,8 @@ def _demo_steps_w05d24() -> list[Step]:
 
 
 _W05D25_SESSION = "w05d25-demo"
-_W05D25_SESSION_ARGS = ["--session", _W05D25_SESSION, "--max-tokens", "400"]
+# Cite JSON with quotes runs ~400 tokens on 5 chunks; 400 truncated the first take's opening answer.
+_W05D25_SESSION_ARGS = ["--session", _W05D25_SESSION, "--max-tokens", "1200"]
 _W05D25_GOAL = (
     "Хочу записать демо дня через advent record, чтобы дубль не пришлось переснимать. "
     "С чего начать проверки?"

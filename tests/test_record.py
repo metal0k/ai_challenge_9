@@ -1674,7 +1674,7 @@ def test_day_24_is_not_day_23():
 def test_day_25_steps_pin_modules_args_lines_and_timeouts():
     steps = record_mod.demo_steps(5, 25)
     assert [s.module for s in steps] == ["week_02.cli", "week_05.cli"]
-    assert steps[0].args == ["--session", "w05d25-demo", "--max-tokens", "400"]
+    assert steps[0].args == ["--session", "w05d25-demo", "--max-tokens", "1200"]
     assert steps[0].stdin_lines == [
         "/new",
         "/rag chat",
