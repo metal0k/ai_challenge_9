@@ -1163,3 +1163,30 @@ the transient-only retry (exit 4/5/6) never fired; it killed three live runs on
 with the same SSL EOF while the publication itself had succeeded — verify a
 public Disk link through `cloud-api.yandex.net/v1/disk/public/resources?public_key=…`,
 not by fetching `yadi.sk`.
+
+**A model mislabels which fragment a quote came from far more often than it
+misquotes the text — attribute the source by where the quote is, not by the
+number the model wrote.** Day 24's cite mode lost a correct, verbatim-quoted
+answer twice: once the quote was labelled with a neighbouring fragment's
+number, once it was labelled `[5]` in a one-fragment context whose header read
+`[1] CLAUDE.md — … [part 5/10]`. `parse_cited` now searches every context
+fragment for a quote that is not in its claimed one (out-of-range ids
+included) and re-attributes it, keeping the model's number in
+`Quote.claimed`. The guarantee does not weaken: the quote must still be
+verbatim in the retrieved context. Facts in cite mode went 9/15 → 11/15 on
+the dry-run.
+
+**After a refusal, search the clarification on its own — gluing it to the
+refused question carries the false premise into retrieval.** "Which
+PostgreSQL stores agent sessions?" → «не знаю»; the clarification "about
+storing sessions in files", glued to it, was rewritten into a PostgreSQL
+query and the threshold again passed 0 of 29. The bare clarification passed
+8 of 31 and was answered. The previous question now reaches only the rewrite
+step, with an instruction that the clarification wins.
+
+**A verbatim-quote check must strip formatting wrappers, not identifier
+characters.** The model wraps quotes in `**…**`, «…» and backticks; without
+removing those, verbatim matches were 0 on the first probe. Stripping every
+`_` and `*` would have gone too far: `rag_cite` and `ragcite` would match.
+`quote_norm` removes only `**`, `__`, backticks and edge quotes. The model
+also splices quotes with `[...]` — those stay ✗, correctly.
