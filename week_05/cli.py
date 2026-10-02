@@ -22,9 +22,9 @@ from advent_core.client import mistral_client
 from advent_core.config import PROJECT_ROOT, Config
 from advent_core.embeddings import DEFAULT_EMBED_MODEL, embed_texts
 from advent_core.errors import AdventError
+from week_05 import chat_eval, rag_cli
 from week_05 import corpus as corpus_module
 from week_05 import index as index_module
-from week_05 import rag_cli
 from week_05.chunking import MAX_CHUNK_CHARS, STRATEGIES, Chunk, chunk_corpus
 
 DAY = 21
@@ -524,6 +524,7 @@ def show_chunk(
 rag_cli.register(app)
 rag_cli.register_eval(app)
 rag_cli.register_stages(app)
+chat_eval.register(app)
 
 
 def main() -> None:

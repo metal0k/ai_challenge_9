@@ -24,8 +24,10 @@ from rich.markup import escape as rich_escape
 
 from advent_cli import obs
 from advent_core import console
-from advent_core.config import PROJECT_ROOT, load_env
+from advent_core.config import LOG_DIR, PROJECT_ROOT, load_env
 from advent_core.errors import AdventError
+from advent_core.memory import MemoryStore
+from advent_core.session import Session
 
 # Сценарий дня 03 берёт условие задачи из банка недели, а не из копии в коде.
 # Зависимость от week_01 у этого модуля уже есть по существу — сценарии здесь
@@ -166,6 +168,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 5 and day == 25:
+        return _demo_steps_w05d25()
     if week == 5 and day == 24:
         return _demo_steps_w05d24()
     if week == 5 and day == 23:
@@ -2075,6 +2079,81 @@ def _demo_steps_w05d24() -> list[Step]:
     ]
 
 
+_W05D25_SESSION = "w05d25-demo"
+_W05D25_SESSION_ARGS = ["--session", _W05D25_SESSION, "--max-tokens", "400"]
+_W05D25_GOAL = (
+    "Хочу записать демо дня через advent record, чтобы дубль не пришлось переснимать. "
+    "С чего начать проверки?"
+)
+_W05D25_FOLLOW_UP = "Когда он ловит чёрный кадр: до записи или после?"
+_W05D25_CONSTRAINT = (
+    "Дальше отвечай коротко, по шагам. "
+    "Как OBS-файл .mkv превращается в mp4 и как называется промежуточный файл?"
+)
+_W05D25_QUESTION = "А если он упадёт на середине — старый файл пропадёт?"
+# 24 turns x ~6 calls on a 30 req/min model: 6-10 minutes measured, 25 with retries is a hang.
+_W05D25_EVAL_TIMEOUT = 1500
+
+
+def _prepare_w05d25(
+    week: int,
+    day: int,
+    *,
+    sessions_dir: Path | None = None,
+    memory_root: Path | None = None,
+) -> None:
+    """Day 25 preflight: the demo session and its working memory start empty on every run.
+
+    `/new` clears the session, but at startup the agent has already loaded the previous
+    take's working-memory file (and warns about a cursor that no longer fits), so the
+    take would open with a stale goal on screen. Delete both files before launching.
+    """
+    if (week, day) != (5, 25):
+        return
+    session_file = Session.path_for(_W05D25_SESSION, sessions_dir)
+    working_file = MemoryStore(memory_root or LOG_DIR).working_path(_W05D25_SESSION)
+    for path in (session_file, working_file):
+        with suppress(OSError):
+            path.unlink(missing_ok=True)
+
+
+def _demo_steps_w05d25() -> list[Step]:
+    """Day 25 — mini-chat with RAG, sources and task state: the agent's REPL, then chat-eval.
+
+    `chat-eval` is last: its closing table is the day's headline and belongs on the final
+    screen. The agent step ends by switching RAG and the memory strategy back to defaults
+    so the saved session state does not carry them into later sessions.
+    """
+    return [
+        Step(
+            title="1. Агент: /rag chat — цель, вопрос, follow-up с «он», ограничение, task state",
+            module="week_02.cli",
+            args=list(_W05D25_SESSION_ARGS),
+            stdin_lines=[
+                "/new",
+                "/rag chat",
+                _W05D25_GOAL,
+                _W05D25_FOLLOW_UP,
+                _W05D25_CONSTRAINT,
+                _W05D25_QUESTION,
+                "/memory working",
+                "/rag off",
+                "/set context_strategy default",
+                "/exit",
+            ],
+            timeout=600,
+            line_pause=8.0,
+        ),
+        Step(
+            title="2. adventrag chat-eval — два длинных сценария: цель, источники, итог",
+            module="week_05.cli",
+            args=["chat-eval", "--detail"],
+            timeout=_W05D25_EVAL_TIMEOUT,
+            line_pause=15.0,
+        ),
+    ]
+
+
 def _prepare_w04d20(week: int, day: int) -> None:
     """Day 20 preflight: drop the previous fs-written file, warm the npx cache.
 
@@ -2405,6 +2484,7 @@ def record(
     target = _target_path(week, day, live=True) if live else _target_path(week, day)
     _warn_if_scheduler_idle(week, day)
     _prepare_w04d20(week, day)
+    _prepare_w05d25(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")

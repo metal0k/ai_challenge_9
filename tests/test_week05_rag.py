@@ -9,7 +9,7 @@ import pytest
 
 from advent_core import config as config_module
 from advent_core.errors import AdventError
-from advent_core.rag import RagContext, RagHit, RagSettings
+from advent_core.rag import RagContext, RagHit, RagSettings, build_rerank_prompt
 from advent_core.telemetry import CallResult, Usage
 from week_05 import rag
 from week_05.chunking import Chunk
@@ -903,6 +903,249 @@ def test_cite_follow_up_embeds_the_bare_clarification_and_only_rewrite_sees_both
         if c["messages"][-1]["content"].startswith("Перепиши")
     ]
     assert "Предыдущий вопрос" not in rewrite_prompts[0]
-    assert "Предыдущий вопрос: как оно устроено?" in rewrite_prompts[1]
-    assert "Уточнение: про порог compaction" in rewrite_prompts[1]
+    assert rewrite_prompts[1] == rag.RAG_REWRITE_PROMPT.replace(
+        "{question}", "про порог compaction"
+    )
+    assert "Отказанный вопрос: как оно устроено?" in rewrite_prompts[2]
+    assert "Текущий вопрос: про порог compaction" in rewrite_prompts[2]
     assert second.rag_previous == "как оно устроено?"
+
+
+# --- Day 25: dialog context in rewrite and rerank ----------------------------------------
+
+
+def _ctx_settings(**kw):
+    return RagSettings(
+        "structure",
+        5,
+        20,
+        kw.pop("rewrite", True),
+        kw.pop("rerank", True),
+        5.0,
+        **kw,
+    )
+
+
+def _prompts(seams, command):
+    return [
+        c["messages"][-1]["content"]
+        for c in seams["chat"]
+        if c["messages"][-1]["content"].startswith("Перепиши" if command == "rewrite" else "Оцени")
+    ]
+
+
+def _ctx_rewrite(seams):
+    """The context-aware rewrite prompt: sent after the plain one."""
+    return _prompts(seams, "rewrite")[-1]
+
+
+def test_rewrite_with_task_and_last_question_uses_the_context_prompt(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()(
+        "А что, если он отсекает всё?",
+        _ctx_settings(task="Цель main: понять rerank", last_question="Как работает порог?"),
+    )
+    prompt = _ctx_rewrite(seams)
+    assert "Контекст задачи:\nЦель main: понять rerank" in prompt
+    assert "Предыдущий вопрос: Как работает порог?" in prompt
+    assert prompt.endswith("Текущий вопрос: А что, если он отсекает всё?")
+    assert "Отказанный вопрос" not in prompt
+    assert "контекст не тащи" in prompt
+
+
+def test_rewrite_prompt_carries_the_previous_answer_from_the_settings(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()(
+        "А какой --min-freeze тогда?",
+        _ctx_settings(
+            last_question="А почему нельзя через select?", last_answer="Потому что trim/concat."
+        ),
+    )
+    prompt = _ctx_rewrite(seams)
+    assert "Предыдущий вопрос: А почему нельзя через select?" in prompt
+    assert "\n\nОтвет на него (начало): Потому что trim/concat.\n\nТекущий вопрос:" in prompt
+
+
+def test_rewrite_with_only_last_question_or_only_previous_is_context_aware(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    rag.make_retriever()("q", _ctx_settings(rerank=False, last_question="прошлый"))
+    rag.make_retriever()("q", _ctx_settings(rerank=False, previous="отказанный"))
+    only_last, only_previous = _prompts(seams, "rewrite")[1::2]
+    assert "Предыдущий вопрос: прошлый" in only_last
+    assert "Контекст задачи:" not in only_last
+    assert "Отказанный вопрос: отказанный" in only_previous
+    assert "Уточнение важнее отказанного вопроса" in only_previous
+    assert "Предыдущий вопрос" not in only_previous
+
+
+def test_rewrite_with_all_three_keeps_both_blocks_and_the_refusal_rule(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    rag.make_retriever()(
+        "уточнение",
+        _ctx_settings(rerank=False, task="Цель main: g", last_question="L", previous="P"),
+    )
+    prompt = _ctx_rewrite(seams)
+    assert "Предыдущий вопрос: L" in prompt
+    assert "Отказанный вопрос: P" in prompt
+    assert "Уточнение важнее отказанного вопроса" in prompt
+
+
+def test_without_any_context_the_old_prompts_are_byte_identical(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("Сколько?", _settings(rewrite=True, rerank=True))
+    assert _prompts(seams, "rewrite") == [rag.RAG_REWRITE_PROMPT.replace("{question}", "Сколько?")]
+    expected = build_rerank_prompt(
+        "Сколько?",
+        [RagHit("structure:CLAUDE.md#1", "CLAUDE.md", "Раздел", 0.9, "a", rank=1)],
+    )
+    assert _prompts(seams, "rerank")[0] == expected
+
+
+def test_rerank_context_comes_from_raw_user_text_not_from_the_rewrite(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()(
+        "А он?",
+        _ctx_settings(task="Цель: понять rerank\nТермин: порог", last_question="Про порог"),
+    )
+    prompt = _prompts(seams, "rerank")[0]
+    line = (
+        "Вопрос: А он?\n(в контексте: предыдущий вопрос пользователя: Про порог; "
+        "цель диалога: понять rerank)"
+    )
+    assert prompt.count(line) == 2
+    assert prompt.index(line) < prompt.index("[1] CLAUDE.md")
+    assert prompt.endswith(line)
+    assert "окно контекста context window" not in prompt
+
+
+def test_rerank_context_omits_absent_parts_and_falls_back_to_previous(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    retrieve = rag.make_retriever()
+    retrieve("А он?", _ctx_settings(rewrite=False, task="Цель: g\nОграничение: коротко"))
+    retrieve("А он?", _ctx_settings(rewrite=False, last_question="Про порог"))
+    retrieve("А он?", _ctx_settings(rewrite=False, previous="Отказ"))
+    retrieve("А он?", _ctx_settings(rewrite=False, task="Термин: x"))
+    assert _prompts(seams, "rewrite") == []
+    only_goal, only_last, only_previous, no_goal = _prompts(seams, "rerank")
+    assert "Вопрос: А он?\n(в контексте: цель диалога: g)" in only_goal
+    assert "Вопрос: А он?\n(в контексте: предыдущий вопрос пользователя: Про порог)" in only_last
+    assert "Вопрос: А он?\n(в контексте: предыдущий вопрос пользователя: Отказ)" in only_previous
+    assert "в контексте" not in no_goal and "Вопрос: А он?" in no_goal
+
+
+def test_context_search_embeds_question_plain_and_context_rewrites_and_merges_three_lists(seams):
+    seams["rerank_text"] = _scores((1, 9))
+    rows = {
+        1: [_sr("q1", 1), _sr("shared", 9)],
+        2: [_sr("shared", 9), _sr("p1", 2)],
+        3: [_sr("polluted", 3), _sr("shared", 9)],
+    }
+    seams["search_fn"] = lambda row, k: list(rows[row])
+    ctx = rag.make_retriever()("А он?", _ctx_settings(task="Цель: g"))
+    texts = seams["embed"][0]["texts"]
+    assert len(texts) == 3 and texts[0] == "А он?"
+    assert texts[1] == texts[2] == "окно контекста context window"
+    assert len(seams["search"]) == 3
+    assert ctx.trace is not None
+    # shared appears in all three lists -> highest RRF sum; the polluted-only chunk survives
+    order = [h.chunk_id for h in ctx.trace.fused]
+    assert order[0].endswith("#9") and len(order) == 4
+    assert ctx.trace.fused[0].fused == pytest.approx(1 / 62 + 1 / 61 + 1 / 62)
+
+
+def test_without_context_exactly_two_texts_are_embedded(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("Сколько?", _settings(rewrite=True, rerank=True))
+    assert len(seams["embed"][0]["texts"]) == 2
+    assert len(_prompts(seams, "rewrite")) == 1
+
+
+def test_context_rewrite_shown_and_both_rewrite_calls_counted(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    ctx = rag.make_retriever()("А он?", _ctx_settings(task="Цель: g"))
+    assert ctx.rewritten == "окно контекста context window"
+    # 2 rewrites (50 + 50) + rerank (1000); completion 3 x 20
+    assert (ctx.aux_prompt_tokens, ctx.aux_completion_tokens) == (1100, 60)
+    assert [r["extra"]["command"] for r in seams["journal"]] == [
+        "rag_rewrite",
+        "rag_rewrite",
+        "rag_rerank",
+    ]
+
+
+def test_one_failing_rewrite_still_searches_with_what_is_left(seams, monkeypatch):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    real = rag.chat_core.complete
+    state = {"n": 0}
+
+    def flaky(config, messages, capabilities=None, **kwargs):
+        if messages[-1]["content"].startswith("Перепиши"):
+            state["n"] += 1
+            if state["n"] == 2:  # the context-aware one
+                raise AdventError("boom")
+        return real(config, messages, capabilities, **kwargs)
+
+    monkeypatch.setattr(rag.chat_core, "complete", flaky)
+    ctx = rag.make_retriever()("А он?", _ctx_settings(task="Цель: g"))
+    assert len(seams["embed"][0]["texts"]) == 2
+    assert ctx.rewritten == "окно контекста context window"  # the plain one is shown
+    assert len(ctx.hits) == 1
+    assert any("context rewrite не удался" in w for w in ctx.warnings)
+
+
+def test_both_rewrites_failing_searches_the_bare_question(seams, monkeypatch):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    real = rag.chat_core.complete
+
+    def flaky(config, messages, capabilities=None, **kwargs):
+        if messages[-1]["content"].startswith("Перепиши"):
+            raise AdventError("boom")
+        return real(config, messages, capabilities, **kwargs)
+
+    monkeypatch.setattr(rag.chat_core, "complete", flaky)
+    ctx = rag.make_retriever()("А он?", _ctx_settings(task="Цель: g"))
+    assert seams["embed"][0]["texts"] == ["А он?"]
+    assert ctx.rewritten is None and len(ctx.warnings) == 2 and len(ctx.hits) == 1
+
+
+def test_context_empty_rewrite_warns_and_keeps_the_other_text(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    seams["rewrite_text"] = "  **  "
+    ctx = rag.make_retriever()("А он?", _ctx_settings(task="Цель: g"))
+    assert seams["embed"][0]["texts"] == ["А он?"]
+    assert ctx.rewritten is None and len(ctx.warnings) == 2
+    assert all("rewrite" in w for w in ctx.warnings)
+
+
+def test_context_aware_aux_calls_are_journaled_as_day_25_and_the_plain_one_keeps_its_day(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    rag.make_retriever()("q", _ctx_settings(task="Цель: g"))
+    rag.make_retriever()("q", _settings(rewrite=True, rerank=True))
+    assert [(r["week"], r["day"], r["extra"]["command"]) for r in seams["journal"]] == [
+        (5, 23, "rag_rewrite"),
+        (5, 25, "rag_rewrite"),
+        (5, 25, "rag_rerank"),
+        (5, 23, "rag_rewrite"),
+        (5, 23, "rag_rerank"),
+    ]
+    assert [e["day"] for e in seams["embed"]] == [22, 22]
+
+
+def test_task_used_flag_follows_the_task_text_only(seams):
+    seams["search_fn"] = _by_vector([_sr("a", 1)])
+    seams["rerank_text"] = _scores((1, 9))
+    retrieve = rag.make_retriever()
+    assert retrieve("q", _ctx_settings(task="Цель main: g")).task_used is True
+    assert retrieve("q", _ctx_settings(last_question="L")).task_used is False
+    assert retrieve("q", _settings(rewrite=True, rerank=True)).task_used is False

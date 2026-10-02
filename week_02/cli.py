@@ -1395,6 +1395,8 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
         console.note("rag: rewrite учёл предыдущий вопрос")
     if reply.cited is not None:
         console.note(_cite_note(reply))
+        if reply.memory is not None and shell.agent.context_strategy == "memory":
+            console.note(_task_line(reply.memory))
     if not reply.model_called:
         # A refusal made by code: no model call, so no footer, no reconcile and
         # no chat row in the journal (the aux calls are already journaled).
@@ -1469,6 +1471,36 @@ def _cite_note(reply: AgentReply) -> str:
     if total:
         return f"не знаю · {cited.reason} · {quotes}"
     return f"не знаю · {cited.reason}"
+
+
+def _task_line(memory: MemorySnapshot, width: int | None = None) -> str:
+    """`задача: цель 📌 «…» · уточнено N · …` fitted to the console width in cells."""
+    if width is None:
+        width = console.err.width
+    entries = memory.working.entries
+    count = {
+        name: sum(1 for key in entries if key.startswith(name + "."))
+        for name in ("clarified", "constraints", "terms")
+    }
+    tail = (
+        f" · уточнено {count['clarified']} · ограничений {count['constraints']}"
+        f" · терминов {count['terms']}"
+    )
+    goal_key = next((k for k in sorted(entries) if k.startswith("goal.")), None)
+    if goal_key is None:
+        return "задача: цели нет" + tail
+    pin = " 📌" if goal_key in memory.working.pinned else ""
+    head = f"задача: цель{pin} «"
+    room = max(10, width - cell_len(head) - cell_len("»") - cell_len(tail) - 1)
+    goal = " ".join(entries[goal_key].split())
+    if cell_len(goal) > room:
+        out = ""
+        for ch in goal:
+            if cell_len(out + ch) > room - 1:
+                break
+            out += ch
+        goal = out + "…"
+    return rich_escape(head + goal + "»") + tail
 
 
 def _journal_messages(
@@ -2490,11 +2522,21 @@ def _with_hint(error: AdventError) -> str:
 @command(
     "/rag",
     "RAG по индексу репозитория: без значения — состояние; plain — косинус top-k, "
-    "full — rewrite + rerank + порог; cite — full + ответ с дословными цитатами и «не знаю»",
-    usage="/rag on | off | plain | full | cite",
+    "full — rewrite + rerank + порог; cite — full + ответ с дословными цитатами и «не знаю»; "
+    "chat — cite + стратегия memory (мини-чат с памятью задачи)",
+    usage="/rag on | off | plain | full | cite | chat",
 )
 def _cmd_rag(shell: AgentShell, args: list[str]) -> bool:
     """Shorthand for `/set rag`, like /strategy: one enable path, one check."""
+    if args and args[0].lower() == "chat" and len(args) == 1:
+        reason = _cite_conflict(shell)
+        if reason is not None:
+            console.warn(f"/rag chat не включён: {reason}")
+            return False
+        _cmd_set(shell, ["context_strategy", "memory"])
+        if shell.agent.context_strategy != "memory":
+            return False
+        return _cmd_rag(shell, ["cite"])
     if args and args[0].lower() in ("plain", "full", "cite") and len(args) == 1:
         mode = args[0].lower()
         if mode == "cite":
@@ -2541,6 +2583,8 @@ def _cmd_rag(shell: AgentShell, args: list[str]) -> bool:
         shown = f"k={settings.k}"
     if settings.cite:
         shown += " · cite on"
+        if shell.agent.context_strategy == "memory":
+            shown += " · task state on"
     console.note(
         f"rag: on · {strategy} · {shown} · индекс {info.corpus_rev[:12]} ({info.n_chunks} чанков)"
     )

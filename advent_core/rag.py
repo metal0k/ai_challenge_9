@@ -39,6 +39,27 @@ RAG_REWRITE_FOLLOWUP_PROMPT = (
     "отменяет, отбрось. Верни только запрос одной строкой.\n\n"
     "Предыдущий вопрос: {previous}\n\nУточнение: {question}"
 )
+# Day 25: rewrite with dialog context. Blocks are appended by build_rewrite_prompt.
+RAG_REWRITE_TASK_PROMPT = (
+    "Перепиши текущий вопрос пользователя в поисковый запрос по документации и коду "
+    "Python-проекта: раскрой подразумеваемые термины, добавь вероятные "
+    "идентификаторы и английские эквиваленты. Контекст задачи и предыдущий обмен "
+    "нужны ТОЛЬКО чтобы понять, к чему относится текущий вопрос: разреши "
+    "местоимения и отсылки («тогда», «это», «он») и поставь в запрос только предмет "
+    "текущего вопроса — раскрытые отсылки и идентификаторы. Не копируй в запрос "
+    "окружение, ограничения, термины и цель из контекста, если текущий вопрос не о "
+    "них; если он меняет тему — следуй ему, контекст не тащи. "
+    "Верни только запрос одной строкой."
+)
+RAG_REWRITE_TASK_REFUSED_NOTE = (
+    "Перед этим пользователь задал вопрос и получил отказ, затем уточнил. Уточнение "
+    "важнее отказанного вопроса: посылки отказанного вопроса, которые уточнение "
+    "отменяет, отбрось."
+)
+RAG_LAST_QUESTION_MAX = 500
+RAG_LAST_ANSWER_MAX = 300
+RAG_CONTEXT_LABEL = "(в контексте:"
+TASK_GOAL_PREFIX = "Цель: "  # as rendered by memory.task_context
 # "{n}" is substituted with str.replace: the JSON braces rule out str.format.
 RAG_RERANK_INSTRUCTION = (
     "Оцени, насколько каждый фрагмент помогает ответить на вопрос. "
@@ -81,6 +102,22 @@ class RagSettings:
     cite: bool = False  # day 24: JSON answer with verbatim quotes, "don't know" refusal
     # Day 24: question a cite refusal answered; only the rewrite step reads it.
     previous: str | None = None
+    # Day 25: working-memory task text (see memory.task_context) and the previous
+    # ANSWERED user question; both feed the rewrite and the rerank question.
+    task: str | None = None
+    last_question: str | None = None
+    # Day 25: the beginning of the answer to last_question (what "тогда" points at).
+    last_answer: str | None = None
+
+    def __post_init__(self) -> None:
+        last = (self.last_question or "").strip()
+        object.__setattr__(
+            self, "last_question", (last[:RAG_LAST_QUESTION_MAX] or None) if last else None
+        )
+        answer = (self.last_answer or "").strip()
+        object.__setattr__(
+            self, "last_answer", (answer[:RAG_LAST_ANSWER_MAX] or None) if answer else None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +138,7 @@ class RagContext:
     aux_completion_tokens: int | None = None
     warnings: tuple[str, ...] = ()
     trace: RetrievalTrace | None = None
+    task_used: bool = False  # day 25: the retrieval saw a task-state text
 
 
 RetrieveFn = Callable[[str, RagSettings], RagContext]
@@ -149,6 +187,65 @@ def rrf_merge(lists: Sequence[Sequence[RagHit]], k0: int = RRF_K0) -> tuple[RagH
         replace(first[cid], fused=fused[cid], rank=position)
         for position, cid in enumerate(order, start=1)
     )
+
+
+def has_dialog_context(task: str | None, last_question: str | None, previous: str | None) -> bool:
+    return bool(task or last_question or previous)
+
+
+def build_rewrite_prompt(
+    question: str,
+    *,
+    task: str | None = None,
+    last_question: str | None = None,
+    previous: str | None = None,
+    last_answer: str | None = None,
+) -> str:
+    """Context-aware rewrite prompt; callers use the day 23/24 prompts without any context."""
+    parts = [RAG_REWRITE_TASK_PROMPT]
+    if previous:
+        parts.append(RAG_REWRITE_TASK_REFUSED_NOTE)
+    head = " ".join(parts)
+    blocks = [head]
+    if task:
+        blocks.append(f"Контекст задачи:\n{task}")
+    if last_question:
+        blocks.append(f"Предыдущий вопрос: {last_question}")
+        if last_answer:
+            blocks.append(f"Ответ на него (начало): {last_answer}")
+    if previous:
+        blocks.append(f"Отказанный вопрос: {previous}")
+    blocks.append(f"Текущий вопрос: {question}")
+    return "\n\n".join(blocks)
+
+
+def resolved_question(
+    question: str,
+    *,
+    task: str | None = None,
+    last_question: str | None = None,
+    previous: str | None = None,
+) -> str:
+    """Question for the rerank prompt: bare, plus context taken from the user's own text.
+
+    No LLM paraphrase goes in (a polluted rewrite would be scored against); unchanged
+    when there is no usable context, so the day 23 prompt stays byte-identical.
+    """
+    parts: list[str] = []
+    prior = last_question or previous
+    if prior:
+        parts.append(f"предыдущий вопрос пользователя: {' '.join(prior.split())}")
+    goals = [
+        line[len(TASK_GOAL_PREFIX) :].strip()
+        for line in (task or "").splitlines()
+        if line.startswith(TASK_GOAL_PREFIX)
+    ]
+    goals = [" ".join(g.split()) for g in goals if g]
+    if goals:
+        parts.append(f"цель диалога: {'; '.join(goals)}")
+    if not parts:
+        return question
+    return f"{question}\n{RAG_CONTEXT_LABEL} {'; '.join(parts)})"
 
 
 def build_rerank_prompt(question: str, hits: Sequence[RagHit]) -> str:
@@ -333,7 +430,9 @@ RAG_CITE_INSTRUCTION = (
     '{"status": "answer" или "unknown", "answer": "...", "sources": [номера фрагментов], '
     '"quotes": [{"id": номер фрагмента, "text": "дословная цитата"}]}. '
     "Цитата — точная копия куска фрагмента, 1–2 предложения, без пересказа и без "
-    "форматирования. Каждое утверждение ответа подтверждается хотя бы одной цитатой. "
+    "форматирования. Поле «answer» — всегда ОДНА строка, даже если пользователь просит "
+    "шаги или список: шаги пиши строками внутри этой строки, не списком и не объектом. "
+    "Каждое утверждение ответа подтверждается хотя бы одной цитатой. "
     'Если во фрагментах ответа нет — "status": "unknown", остальные поля пустые.'
 )
 RAG_UNKNOWN_PREFIX = "Не знаю:"
@@ -459,6 +558,24 @@ def _parse_cited(raw: str, hits: Sequence[RagHit]) -> CitedAnswer:
     if status == "unknown":
         return unknown_answer("model_unknown", hits)
     answer = data.get("answer")
+    if isinstance(answer, list):
+        # "коротко, по шагам" makes the model return the steps as a list of strings.
+        steps = [item.strip() for item in answer if isinstance(item, str)]
+        if not steps or len(steps) != len(answer) or not all(steps):
+            return unknown_answer("bad_json")
+        answer = "\n".join(f"{i}. {step}" for i, step in enumerate(steps, start=1))
+    elif isinstance(answer, dict):
+        # Same cause: a flat {"keep_last": 6, ...} object; nested values stay bad_json.
+        if not answer or not all(
+            isinstance(k, str)
+            and k.strip()
+            and isinstance(v, (str, int, float))
+            and not isinstance(v, bool)
+            and str(v).strip()
+            for k, v in answer.items()
+        ):
+            return unknown_answer("bad_json")
+        answer = "\n".join(f"{k.strip()}: {str(v).strip()}" for k, v in answer.items())
     if not isinstance(answer, str) or not answer.strip():
         return unknown_answer("bad_json")
     n = len(hits)

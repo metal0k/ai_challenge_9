@@ -48,6 +48,7 @@ from advent_core.invariants import (
     parse_assessment,
 )
 from advent_core.memory import (
+    RETRIEVAL_CONTEXT_FIELDS,
     MemoryDelta,
     MemoryFailure,
     MemoryOperation,
@@ -56,6 +57,7 @@ from advent_core.memory import (
     ShortTermMemory,
     StructuredMemory,
     memory_messages,
+    task_context,
 )
 from advent_core.memory import (
     apply_delta as apply_memory_delta,
@@ -1444,21 +1446,25 @@ class Agent:
             section = raw.get(destination)
             if not isinstance(section, dict) or set(section) != {"set", "delete"}:
                 raise ValueError(f"секция {destination} должна содержать set и delete")
+            if not isinstance(section["set"], list) or not isinstance(section["delete"], list):
+                raise ValueError(f"set и delete секции {destination} должны быть списками")
+            # Structural errors above reject the whole delta; a malformed element
+            # becomes an operation that apply_delta rejects on its own.
             operations: list[MemoryOperation] = []
-            for item in section["set"]:
-                if not isinstance(item, dict) or set(item) != {"field", "key", "value", "evidence"}:
-                    raise ValueError("memory set operation имеет неверную форму")
-                operations.append(
-                    MemoryOperation(
-                        "set", item["field"], item["key"], item["value"], item["evidence"]
+            for action, items in (("set", section["set"]), ("delete", section["delete"])):
+                for item in items:
+                    if not isinstance(item, dict):
+                        operations.append(MemoryOperation(action, "?", "?", None, ""))  # type: ignore[arg-type]
+                        continue
+                    operations.append(
+                        MemoryOperation(
+                            action,  # type: ignore[arg-type]
+                            item.get("field"),  # type: ignore[arg-type]
+                            item.get("key"),  # type: ignore[arg-type]
+                            item.get("value") if action == "set" else None,
+                            item.get("evidence"),  # type: ignore[arg-type]
+                        )
                     )
-                )
-            for item in section["delete"]:
-                if not isinstance(item, dict) or set(item) != {"field", "key", "evidence"}:
-                    raise ValueError("memory delete operation имеет неверную форму")
-                operations.append(
-                    MemoryOperation("delete", item["field"], item["key"], None, item["evidence"])
-                )
             sections[destination] = tuple(operations)
         return MemoryDelta(working=sections["working"], long_term=sections["long_term"])
 
@@ -1706,7 +1712,7 @@ class Agent:
                 # The bare input is the search query; the refused question goes
                 # only to the rewrite step (a cancelled premise must not be searched).
                 prior = self._refused_question(history)
-                settings = self.rag_settings
+                settings = self._dialog_settings(self.rag_settings, history, memory)
                 if prior is not None:
                     settings = replace(settings, previous=prior)
                     rag_previous = prior
@@ -1731,12 +1737,14 @@ class Agent:
                     facts_upto=facts_upto,
                     memory=memory,
                     memory_upto=memory_upto,
+                    memory_history=memory_history,
                 )
         elif self.rag_enabled:
             if self._retrieve is None:
                 self._warn("rag включён, но индекс не подключён — ход идёт без RAG", once=True)
             else:
-                rag_ctx = self._retrieve(user_input, self.rag_settings)
+                settings = self._dialog_settings(self.rag_settings, history, memory)
+                rag_ctx = self._retrieve(user_input, settings)
                 for warning in rag_ctx.warnings:
                     self._warn(warning)
                 request_input = build_rag_prompt(
@@ -2146,6 +2154,50 @@ class Agent:
             return None
         return str(before.get("content", "")) or None
 
+    @staticmethod
+    def _last_answered(history: Sequence[Message]) -> tuple[str, str] | None:
+        """The previous user question that got a real answer (not a cite refusal), with it.
+
+        The answer is cut before the cite rendering's sources block: history stores
+        `answer + "Источники: …"`, and only the answer says what a follow-up refers to.
+        """
+        if len(history) < 2:
+            return None
+        last, before = history[-1], history[-2]
+        if last.get("role") != "assistant" or before.get("role") != "user":
+            return None
+        answer = str(last.get("content", ""))
+        if answer.startswith(RAG_UNKNOWN_PREFIX):
+            return None
+        question = str(before.get("content", ""))
+        if not question:
+            return None
+        return question, answer.split("\n\nИсточники:", 1)[0]
+
+    @staticmethod
+    def _last_answered_question(history: Sequence[Message]) -> str | None:
+        found = Agent._last_answered(history)
+        return found[0] if found else None
+
+    def _dialog_settings(
+        self,
+        settings: RagSettings,
+        history: Sequence[Message],
+        memory: MemorySnapshot | None,
+    ) -> RagSettings:
+        """Add task state and the last answered question; only under the memory strategy.
+
+        Reads memory as of BEFORE this turn: the extractor runs later (SPEC-w05d25 §4).
+        """
+        if self.context_strategy != "memory":
+            return settings
+        task = task_context(memory, RETRIEVAL_CONTEXT_FIELDS) if memory is not None else None
+        found = self._last_answered(history)
+        if task is None and found is None:
+            return settings
+        last, answer = found if found else (None, None)
+        return replace(settings, task=task, last_question=last, last_answer=answer)
+
     def _cite_config(self) -> Config:
         """A copy for the cite request: JSON, no stream, no `stop` (it could cut the JSON)."""
         if self.config.params.stop:
@@ -2169,10 +2221,35 @@ class Agent:
         facts_upto: int,
         memory: MemorySnapshot | None,
         memory_upto: int,
+        memory_history: Sequence[Message] | None = None,
     ) -> AgentReply:
-        """A refusal made by code: no model call, bare question + «Не знаю…» into history."""
+        """A refusal made by code: no model call, bare question + «Не знаю…» into history.
+
+        The memory extractor still runs (SPEC-w05d25 §9a.1): a goal stated in a
+        refused turn must reach working memory, with the same cursor and
+        pending rules as a normal turn.
+        """
         text = render_cited(refusal, (), for_history=True)
         strategy = self.context_strategy
+        memory_now = memory or MemorySnapshot()
+        memory_upto_now = memory_upto
+        memory_update: MemoryUpdate | None = None
+        memory_failed: MemoryFailure | None = None
+        if strategy == "memory":
+            memory_now, memory_upto_now, memory_update, memory_failed = self._run_memory(
+                memory_now,
+                memory_history if memory_history is not None else history,
+                user_input,
+                memory_upto_now,
+            )
+            if memory_update is not None:
+                # Same coordinate space as Session.turns: user + the refusal text.
+                transcript_len = len(memory_history) if memory_history is not None else len(history)
+                persisted_len = transcript_len + 2
+                memory_update = replace(memory_update, memory_upto=persisted_len)
+                memory_upto_now = persisted_len
+            self.pending_memory = None
+            memory_failed = self.take_pending_memory_failed() or memory_failed
         return AgentReply(
             text=text,
             history=[
@@ -2189,8 +2266,10 @@ class Agent:
             summary=summary,
             facts=dict(facts) if facts else {},
             facts_upto=facts_upto,
-            memory=(memory or MemorySnapshot()) if strategy == "memory" else None,
-            memory_upto=memory_upto if strategy == "memory" else 0,
+            memory=memory_now if strategy == "memory" else None,
+            memory_upto=memory_upto_now if strategy == "memory" else 0,
+            memory_update=memory_update,
+            memory_failed=memory_failed,
             rag=rag_ctx,
             cited=refusal,
             display_text=text,

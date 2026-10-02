@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +17,6 @@ from advent_core.errors import AdventError
 from advent_core.journal import log_call
 from advent_core.params import GenerationParams
 from advent_core.rag import (
-    RAG_REWRITE_FOLLOWUP_PROMPT,
     RAG_REWRITE_PROMPT,
     CitedAnswer,
     RagContext,
@@ -28,13 +26,16 @@ from advent_core.rag import (
     RetrieveFn,
     apply_rerank,
     build_rerank_prompt,
+    build_rewrite_prompt,
     check_facts,
     cited_sources,
     clean_rewrite,
     fit_hits,
+    has_dialog_context,
     normalize,
     order_by_rerank,
     parse_rerank,
+    resolved_question,
     rrf_merge,
     says_unknown,
 )
@@ -46,6 +47,7 @@ RAG_WEEK = 5
 RAG_DAY = 22
 RAG_AUX_DAY = 23
 RAG_CITE_DAY = 24
+RAG_TASK_DAY = 25  # rewrite/rerank that saw dialog context
 JUDGE_MAX_TOKENS = 300
 RAG_AUX_MODEL = "ministral-14b-latest"
 REWRITE_MAX_TOKENS = 200
@@ -112,15 +114,21 @@ def _add_tokens(total: int | None, value: int | None, first: bool) -> int | None
     return total + value
 
 
-def rewrite_prompt(question: str, previous: str | None) -> str:
-    """Rewrite prompt; a follow-up (previous question known) uses the follow-up wording."""
-    if previous:
-        values = {"{previous}": previous, "{question}": question}
-        # Single pass: user text containing a placeholder must not be substituted.
-        return re.sub(
-            r"\{previous\}|\{question\}",
-            lambda m: values[m.group(0)],
-            RAG_REWRITE_FOLLOWUP_PROMPT,
+def rewrite_prompt(
+    question: str,
+    previous: str | None,
+    task: str | None = None,
+    last_question: str | None = None,
+    last_answer: str | None = None,
+) -> str:
+    """Rewrite prompt: day 23/24 wording without dialog context, the task one with any."""
+    if has_dialog_context(task, last_question, previous):
+        return build_rewrite_prompt(
+            question,
+            task=task,
+            last_question=last_question,
+            previous=previous,
+            last_answer=last_answer,
         )
     return RAG_REWRITE_PROMPT.replace("{question}", question)
 
@@ -146,21 +154,58 @@ def make_retriever(
         warnings: list[str] = []
         aux_calls: list[CallResult] = []
 
-        rewritten: str | None = None
-        if settings.rewrite:
-            result = _aux_call(
-                rewrite_prompt(question, settings.previous),
-                command="rag_rewrite",
-                max_tokens=REWRITE_MAX_TOKENS,
-                json_mode=False,
-                day=aux_day,
-            )
-            aux_calls.append(result)
-            rewritten = clean_rewrite(result.text)
-            if rewritten is None:
-                warnings.append("rewrite вернул пустую строку — поиск только по исходному вопросу")
+        contextual = has_dialog_context(settings.task, settings.last_question, settings.previous)
+        stage_day = RAG_TASK_DAY if contextual else aux_day
 
-        texts = [question] if rewritten is None else [question, rewritten]
+        def rewrite_once(prompt: str, rewrite_day: int, label: str) -> str | None:
+            # With dialog context a failed rewrite only narrows the search; without it
+            # the single rewrite keeps its old contract and the error propagates.
+            try:
+                result = _aux_call(
+                    prompt,
+                    command="rag_rewrite",
+                    max_tokens=REWRITE_MAX_TOKENS,
+                    json_mode=False,
+                    day=rewrite_day,
+                )
+            except AdventError as exc:
+                if not contextual:
+                    raise
+                warnings.append(f"{label}rewrite не удался ({exc}) — поиск без него")
+                return None
+            aux_calls.append(result)
+            cleaned = clean_rewrite(result.text)
+            if cleaned is None:
+                tail = "поиск без него" if contextual else "поиск только по исходному вопросу"
+                warnings.append(f"{label}rewrite вернул пустую строку — {tail}")
+            return cleaned
+
+        # Context-free rewrite (day 23 prompt) is a search text of its own with context,
+        # so a polluted context-aware rewrite cannot drown the result.
+        rewritten: str | None = None
+        texts = [question]
+        if settings.rewrite:
+            if contextual:
+                plain = rewrite_once(
+                    RAG_REWRITE_PROMPT.replace("{question}", question), aux_day, "plain "
+                )
+                aware = rewrite_once(
+                    rewrite_prompt(
+                        question,
+                        settings.previous,
+                        settings.task,
+                        settings.last_question,
+                        settings.last_answer,
+                    ),
+                    stage_day,
+                    "context ",
+                )
+                texts += [t for t in (plain, aware) if t is not None]
+                rewritten = aware or plain
+            else:
+                rewritten = rewrite_once(rewrite_prompt(question, None), aux_day, "")
+                if rewritten is not None:
+                    texts.append(rewritten)
         config = Config.resolve()
         with mistral_client(config) as client:
             embedded = embed_texts(
@@ -176,18 +221,24 @@ def make_retriever(
             for i in range(len(texts))
         ]
         original = lists[0]
-        fused = rrf_merge(lists) if rewritten is not None else original
+        fused = rrf_merge(lists) if len(lists) > 1 else original
 
         reranked: tuple[RagHit, ...] = ()
         passed: int | None = None
         unrated = 0
         if settings.rerank:
+            resolved = resolved_question(
+                question,
+                task=settings.task,
+                last_question=settings.last_question,
+                previous=settings.previous,
+            )
             result = _aux_call(
-                build_rerank_prompt(question, fused),
+                build_rerank_prompt(resolved, fused),
                 command="rag_rerank",
                 max_tokens=RERANK_MAX_TOKENS,
                 json_mode=True,
-                day=aux_day,
+                day=stage_day,
             )
             aux_calls.append(result)
             scores = parse_rerank(result.text, len(fused))
@@ -222,6 +273,7 @@ def make_retriever(
             aux_completion_tokens=aux_completion,
             warnings=tuple(warnings),
             trace=RetrievalTrace(original, fused, reranked) if staged else None,
+            task_used=bool(settings.task),
         )
 
     return retrieve

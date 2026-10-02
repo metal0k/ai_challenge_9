@@ -22,10 +22,17 @@ from typing import Literal, NamedTuple
 from advent_core.chat import Message
 
 MemoryLayer = Literal["short_term", "working", "long_term"]
-WORKING_FIELDS = ("goal", "constraints", "decisions", "open_items")
+WORKING_FIELDS = ("goal", "clarified", "constraints", "terms", "decisions", "open_items")
+TASK_CONTEXT_FIELDS = ("goal", "clarified", "constraints", "terms")
+RETRIEVAL_CONTEXT_FIELDS = ("goal", "terms")  # clarified/constraints leak into search queries
+TASK_CONTEXT_MAX_CHARS = 1200
+# Automatic ops in these fields must quote a statement, not a question.
+QUESTION_EVIDENCE_FIELDS = ("clarified", "constraints", "terms", "open_items")
+GOAL_PINNED_REASON = "goal pinned"
 LONG_TERM_FIELDS = ("profile", "preferences", "knowledge")
 MEMORY_VERSION = 1
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]*\.[^\s.].*$")
+_ROLE_PREFIX_RE = re.compile(r"^\s*(?:user|пользователь)\s*:\s*", re.IGNORECASE)
 _CREDENTIAL_RE = re.compile(
     r"(?:password|passwd|token|api[_ -]?key|secret|private[_ -]?key|recovery[_ -]?code|"
     r"credential|card[_ -]?(?:number|cvv)|ssn|паспорт|парол|токен|секрет|ключ)",
@@ -147,7 +154,8 @@ def _normalise_operation(layer: MemoryLayer, op: MemoryOperation) -> MemoryOpera
         raise ValueError("memory operation action must be a string")
     if not isinstance(op.field, str) or not isinstance(op.key, str):
         raise ValueError("memory operation field and key must be strings")
-    field, key = op.field, op.key
+    # Automatic ops only: the model writes "мёртвое время"; manual /memory keys stay strict.
+    field, key = op.field, "_".join(op.key.split())
     validate_key(layer, field, key)
     action = op.action
     if action not in ("set", "delete"):
@@ -166,13 +174,25 @@ def _normalise_operation(layer: MemoryLayer, op: MemoryOperation) -> MemoryOpera
 
 
 def _evidence_ok(op: MemoryOperation, user_messages: tuple[Message, ...]) -> bool:
-    return any(
-        isinstance(message, Mapping)
+    """Evidence is a verbatim fragment of ONE user message; role prefixes are tolerated."""
+    contents = [
+        message["content"]
+        for message in user_messages
+        if isinstance(message, Mapping)
         and message.get("role") == "user"
         and isinstance(message.get("content"), str)
-        and op.evidence in message["content"]
-        for message in user_messages
-    )
+    ]
+    lines = [_ROLE_PREFIX_RE.sub("", line).strip() for line in op.evidence.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:  # empty once role prefixes are gone
+        return False
+    if any(op.evidence in content for content in contents):
+        return True
+    return any(all(line in content for line in lines) for content in contents)
+
+
+def _goal_keys(entries: Mapping[str, str]) -> list[str]:
+    return [key for key in entries if key.startswith("goal.")]
 
 
 def apply_delta(
@@ -184,12 +204,17 @@ def apply_delta(
     call_result: object | None = None,
     require_evidence: bool = True,
 ) -> MemoryUpdate:
-    """Validate and apply a delta without partially applying invalid sections.
+    """Validate and apply a delta; a bad operation is rejected alone.
 
-    Invalid operations reject the complete delta with ``ValueError``.  This
-    keeps the extractor cursor unchanged: callers only advance it after this
-    function returns successfully.  A pinned automatic change is different;
-    it is ``blocked`` while unrelated valid operations continue.
+    Only a structural error (a section that is not a sequence) raises
+    ``ValueError`` and rejects the whole delta, leaving the extractor cursor
+    where it was.  Invalid evidence, fields or keys land in ``rejected`` while
+    valid operations apply and the cursor advances: all-or-nothing could not
+    recover on a long dialog.  A pinned automatic change is ``blocked``.
+
+    Goal policy: an automatic ``set goal.*`` with no pinned goal drops the other
+    unpinned goals and pins the new one; once pinned, automatic goal set/delete
+    is blocked as ``goal pinned``.
     """
     applied: list[tuple[MemoryLayer, MemoryOperation]] = []
     blocked: list[tuple[MemoryLayer, MemoryOperation, str]] = []
@@ -211,23 +236,48 @@ def apply_delta(
                 op = _normalise_operation(layer, raw)
                 if op.canonical_key in seen:
                     raise ValueError("duplicate/conflicting operation")
-                seen.add(op.canonical_key)
                 if require_evidence and not _evidence_ok(op, user_messages):
-                    raise ValueError("evidence is not an exact substring of a user message")
+                    raise ValueError("evidence is not an exact fragment of one user message")
+                if (
+                    require_evidence
+                    and layer == "working"
+                    and op.action == "set"
+                    and op.field in QUESTION_EVIDENCE_FIELDS
+                    and op.evidence.rstrip().endswith("?")
+                ):
+                    raise ValueError("evidence is a question")
                 if layer == "long_term" and is_credential_like(op.canonical_key, op.value):
                     raise ValueError("credential-like data cannot enter long_term memory")
+                seen.add(op.canonical_key)
                 normalised.append(op)
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
-                raise ValueError(f"invalid {layer} memory operation: {exc}") from exc
+                bad = (
+                    raw
+                    if isinstance(raw, MemoryOperation)
+                    else MemoryOperation("set", "?", "?", None, "")
+                )
+                rejected.append((layer, bad, str(exc)))
         normalised_sections[layer] = normalised
 
-    # Both sections have now passed validation.  Only this second phase is
-    # allowed to touch the candidate dictionaries, so one bad section can
-    # never partially apply another one.
     for layer in ("working", "long_term"):
-        normalised = normalised_sections[layer]
-        for op in normalised:
+        for op in normalised_sections[layer]:
             canonical = op.canonical_key
+            if layer == "working" and op.field == "goal":
+                if any(key in pins[layer] for key in _goal_keys(result[layer])):
+                    blocked.append((layer, op, GOAL_PINNED_REASON))
+                    continue
+                if op.action == "set":
+                    for key in _goal_keys(result[layer]):
+                        if key != canonical:
+                            del result[layer][key]
+                            dropped = MemoryOperation("delete", "goal", key[5:], None, op.evidence)
+                            applied.append((layer, dropped))
+                    result[layer][canonical] = op.value or ""
+                    pins[layer].add(canonical)
+                else:
+                    result[layer].pop(canonical, None)
+                applied.append((layer, op))
+                continue
             if canonical in pins[layer]:
                 blocked.append((layer, op, "pinned"))
                 continue
@@ -261,6 +311,11 @@ def manual_set(
         raise ValueError("memory value cannot be empty")
     if layer == "working":
         entries, pins = dict(snapshot.working.entries), set(snapshot.working.pinned)
+        if field == "goal":  # one goal: a manual set replaces the others and their pins
+            for other in _goal_keys(entries):
+                if other != canonical:
+                    del entries[other]
+                    pins.discard(other)
         entries[canonical], _ = value.strip(), pins.add(canonical)
         return MemorySnapshot(
             snapshot.short_term, StructuredMemory(entries, frozenset(pins)), snapshot.long_term
@@ -270,6 +325,44 @@ def manual_set(
     return MemorySnapshot(
         snapshot.short_term, snapshot.working, StructuredMemory(entries, frozenset(pins))
     )
+
+
+_TASK_LABELS = {
+    "goal": "Цель",
+    "clarified": "Уточнено",
+    "constraints": "Ограничение",
+    "terms": "Термин",
+}
+
+
+def task_context(
+    snapshot: MemorySnapshot, fields: tuple[str, ...] = TASK_CONTEXT_FIELDS
+) -> str | None:
+    """The chosen working fields as compact retrieval context (default: all four).
+
+    At most TASK_CONTEXT_MAX_CHARS, cut by whole entry; None when there are none.
+    """
+    entries = snapshot.working.entries
+    lines: list[str] = []
+    for name in fields:
+        for key in sorted(k for k in entries if k.startswith(name + ".")):
+            value = " ".join(entries[key].split())
+            if value:
+                # Value only: a rendered entry key gets copied into the query as an identifier.
+                lines.append(f"{_TASK_LABELS[name]}: {value}")
+    if not lines:
+        return None
+    kept: list[str] = []
+    total = 0
+    for line in lines:
+        added = len(line) + (1 if kept else 0)
+        if total + added > TASK_CONTEXT_MAX_CHARS:
+            break
+        kept.append(line)
+        total += added
+    if not kept:  # one oversized entry: cut it rather than lose the task
+        return lines[0][: TASK_CONTEXT_MAX_CHARS - 1] + "…"
+    return "\n".join(kept)
 
 
 def render_memory(snapshot: MemorySnapshot, *, layer: str | None = None) -> str:
@@ -541,6 +634,7 @@ __all__ = [
     "MemoryUpdate",
     "ShortTermMemory",
     "StructuredMemory",
+    "TASK_CONTEXT_MAX_CHARS",
     "WORKING_FIELDS",
     "apply_delta",
     "fields_for",
@@ -550,5 +644,6 @@ __all__ = [
     "render_delta",
     "render_memory",
     "split_key",
+    "task_context",
     "validate_key",
 ]

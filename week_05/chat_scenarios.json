@@ -1,0 +1,481 @@
+{
+  "scenarios": [
+    {
+      "id": "obs",
+      "title": "Подготовка записи демо через OBS",
+      "messages": [
+        {
+          "text": "Хочу записать демо дня через advent record, чтобы дубль не пришлось переснимать. С чего начать проверки?",
+          "kind": "goal",
+          "facts": [
+            [
+              "verify_capture",
+              "чёрн",
+              "black",
+              "программн",
+              "program scene",
+              "заголов"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            ".agents/skills/day-delivery/SKILL.md"
+          ],
+          "expect_state": {
+            "goal": [
+              "демо",
+              "advent record"
+            ]
+          }
+        },
+        {
+          "text": "Я на Windows Terminal, OBS подключён через obs-websocket. Когда именно ловится чёрный кадр: до записи или после?",
+          "kind": "clarify",
+          "facts": [
+            [
+              "до начала записи",
+              "before recording",
+              "перед записью",
+              "до записи"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ],
+          "expect_state": {
+            "clarified": [
+              "windows terminal",
+              "obs-websocket"
+            ]
+          }
+        },
+        {
+          "text": "А если проверка один раз ошиблась, а картинка на деле нормальная? Из-за этого срывать дубль?",
+          "kind": "question",
+          "facts": [
+            [
+              "несколько попыт",
+              "several attempts",
+              "повтор",
+              "retries"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ]
+        },
+        {
+          "text": "Дубль = одна запись advent record. Запомни. Почему в начале дубля иногда виден хвост репетиции?",
+          "kind": "term",
+          "facts": [
+            [
+              "гонк",
+              "race"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ],
+          "expect_state": {
+            "terms": [
+              "дубль",
+              "advent record"
+            ]
+          }
+        },
+        {
+          "text": "А как это починили? И можно ли спасти уже снятый дубль без пересъёмки?",
+          "kind": "question",
+          "facts": [
+            [
+              "CLEAR_SETTLE_PAUSE"
+            ],
+            [
+              "ffmpeg -ss",
+              "-ss 0.75",
+              "0.75"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ]
+        },
+        {
+          "text": "Дальше отвечай коротко, по шагам. Как OBS-файл .mkv превращается в mp4 и как называется промежуточный файл?",
+          "kind": "constraint",
+          "facts": [
+            [
+              "0101.part.mp4",
+              ".part.mp4"
+            ],
+            [
+              "расширение .mp4",
+              "extension",
+              "keeping the .mp4"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ],
+          "expect_state": {
+            "constraints": [
+              "коротк",
+              "по шагам"
+            ]
+          }
+        },
+        {
+          "text": "Теперь про простой в дубле: чем вырезать мёртвое время?",
+          "kind": "question",
+          "facts": [
+            [
+              "tools/cut_static.py",
+              "cut_static"
+            ],
+            [
+              "trim",
+              "concat"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ]
+        },
+        {
+          "text": "А почему нельзя через select, он же проще?",
+          "kind": "question",
+          "facts": [
+            [
+              "аудио",
+              "audio",
+              "дорожк",
+              "stream"
+            ],
+            [
+              "длительн",
+              "duration",
+              "570"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ]
+        },
+        {
+          "text": "А какой --min-freeze тогда брать?",
+          "kind": "question",
+          "facts": [
+            [
+              "--min-freeze 2"
+            ],
+            [
+              "почти весь",
+              "almost end to end",
+              "каждая пауза",
+              "every pause",
+              "заморож",
+              "frozen"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ]
+        },
+        {
+          "text": "Кстати, а какая температура у Mistral максимальная?",
+          "kind": "switch",
+          "facts": [
+            [
+              "1.5",
+              "1,5"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_01/README.md",
+            "advent_core/params.py"
+          ]
+        },
+        {
+          "text": "Вернёмся к записи. Что нужно сделать с тегом, чтобы после advent submit ссылки не дали 404?",
+          "kind": "question",
+          "facts": [
+            [
+              "remote",
+              "удалённ",
+              "удаленн"
+            ],
+            [
+              "404"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ]
+        },
+        {
+          "text": "И последнее: как убедиться, что дубль полный — хватит лога record_last.log?",
+          "kind": "question",
+          "facts": [
+            [
+              "не доказательство",
+              "not proof",
+              "только последний шаг",
+              "last demo step",
+              "не гарантирует"
+            ],
+            [
+              "ffmpeg -ss",
+              "кадр",
+              "frame"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            ".agents/skills/day-delivery/SKILL.md"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "budget",
+      "title": "Бюджет контекста длинного диалога на ministral-14b",
+      "messages": [
+        {
+          "text": "Хочу настроить бюджет контекста для длинного диалога на ministral-14b-latest, чтобы он не падал по окну и не терял начало. Какое у модели окно в токенах?",
+          "kind": "goal",
+          "facts": [
+            [
+              "262144"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_02/README.md",
+            "advent_core/errors.py"
+          ],
+          "expect_state": {
+            "goal": [
+              "бюджет",
+              "ministral-14b"
+            ]
+          }
+        },
+        {
+          "text": "Я использую агента из week_02 с автосжатием (compact on). Сколько токенов резервируется под ответ при обрезке?",
+          "kind": "clarify",
+          "facts": [
+            [
+              "1024"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "advent_core/agent.py"
+          ],
+          "expect_state": {
+            "clarified": [
+              "week_02",
+              "compact",
+              "автосжат"
+            ]
+          }
+        },
+        {
+          "text": "А что это значит для окна поменьше, скажем 1500 токенов? Сколько останется под историю?",
+          "kind": "question",
+          "facts": [
+            [
+              "476"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md"
+          ]
+        },
+        {
+          "text": "Под сжатием я понимаю компакцию истории через summary. Сколько токенов стоит одно такое сжатие?",
+          "kind": "term",
+          "facts": [
+            [
+              "1450",
+              "1 450"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_02/README.md"
+          ],
+          "expect_state": {
+            "terms": [
+              "сжати",
+              "компакц",
+              "summary"
+            ]
+          }
+        },
+        {
+          "text": "А окупается ли оно на коротком диалоге в 12 ходов?",
+          "kind": "question",
+          "facts": [
+            [
+              "не окупа",
+              "never repay"
+            ],
+            [
+              "память",
+              "memory"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_02/README.md"
+          ]
+        },
+        {
+          "text": "Отвечай коротко, по шагам. Какие значения keep_last и compact_every по умолчанию?",
+          "kind": "constraint",
+          "facts": [
+            [
+              "keep_last (6)",
+              "keep_last 6",
+              "keep_last=6",
+              "по умолчанию 6",
+              "keep_last по умолчанию = 6",
+              "keep_last = 6"
+            ],
+            [
+              "compact_every (10)",
+              "compact_every 10",
+              "compact_every=10",
+              "`compact_every` (10)",
+              "compact_every по умолчанию = 10",
+              "compact_every = 10"
+            ]
+          ],
+          "sources": [
+            "week_02/README.md"
+          ],
+          "expect_state": {
+            "constraints": [
+              "коротк",
+              "по шагам"
+            ]
+          }
+        },
+        {
+          "text": "А если окно мелкое и trim срабатывает каждый ход? Сжатие вообще включится?",
+          "kind": "question",
+          "facts": [
+            [
+              "older"
+            ],
+            [
+              "не срабатывает",
+              "never fire",
+              "ни разу",
+              "cannot fire",
+              "не включится"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_02/README.md"
+          ]
+        },
+        {
+          "text": "Что тогда выставить для короткого прогона на 6 ходов?",
+          "kind": "question",
+          "facts": [
+            [
+              "--limit 1700",
+              "limit 1700"
+            ],
+            [
+              "--keep-last 2",
+              "keep_last 2"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_02/README.md"
+          ]
+        },
+        {
+          "text": "Пересказ переживает перезапуск? Что если summary_upto в файле сессии пропал?",
+          "kind": "question",
+          "facts": [
+            [
+              "summary_upto"
+            ],
+            [
+              "doubling",
+              "удвоен",
+              "дублир"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_02/README.md"
+          ]
+        },
+        {
+          "text": "Кстати, а как называется модель эмбеддингов Mistral и сколько у неё измерений?",
+          "kind": "switch",
+          "facts": [
+            [
+              "mistral-embed"
+            ],
+            [
+              "1024"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_05/README.md"
+          ]
+        },
+        {
+          "text": "Вернёмся к бюджету. Что ответит сервер, если запрос реально больше окна? Что будет в ошибке?",
+          "kind": "question",
+          "facts": [
+            [
+              "400"
+            ],
+            [
+              "invalid_request_prompt_too_long",
+              "267060 > 262144",
+              "prompt_too_long"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "advent_core/errors.py",
+            "week_02/README.md"
+          ]
+        },
+        {
+          "text": "И последнее: если подключить tools= из MCP, локальный счётчик токенов это учтёт?",
+          "kind": "question",
+          "facts": [
+            [
+              "невидим",
+              "invisible",
+              "не учит",
+              "не видит"
+            ],
+            [
+              "781",
+              "384"
+            ]
+          ],
+          "sources": [
+            "CLAUDE.md",
+            "week_04/README.md",
+            "advent_core/agent.py"
+          ]
+        }
+      ]
+    }
+  ]
+}

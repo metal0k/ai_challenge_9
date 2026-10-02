@@ -2801,3 +2801,200 @@ def test_without_cite_the_request_is_day_23s_and_format_is_untouched():
         True,
         None,
     )
+
+
+# --- Day 25: task state in retrieval, extractor on cite refusals ------------------------------
+
+from advent_core.memory import MemorySnapshot  # noqa: E402
+
+D25_GOAL = "подготовить запись демо через OBS"
+
+
+def _d25_delta(*sets: dict) -> CallResult:
+    raw = {"working": {"set": list(sets), "delete": []}, "long_term": {"set": [], "delete": []}}
+    return CallResult(text=json.dumps(raw, ensure_ascii=False), model_requested="m")
+
+
+def _d25_goal_op() -> dict:
+    return {"field": "goal", "key": "main", "value": D25_GOAL, "evidence": D25_GOAL}
+
+
+def _d25_agent(retriever, *replies, deltas=(), **params):
+    """Real Agent.ask with memory strategy; the extractor model call is the only fake."""
+    recorder = _Recorder(*(CallResult(text=r, model_requested="m") for r in replies))
+    params.setdefault("rag", True)
+    params.setdefault("context_strategy", "memory")
+    agent = build_agent(
+        recorder, make_config(**params), retrieve=retriever, memory_prompt="извлеки"
+    )
+    queue = list(deltas)
+    segments: list[list] = []
+
+    def memory_call(snapshot, segment):
+        segments.append(list(segment))
+        return queue.pop(0) if queue else _d25_delta()
+
+    agent._memory_call = memory_call  # type: ignore[method-assign]
+    agent.segments = segments  # type: ignore[attr-defined]
+    return agent, recorder
+
+
+def test_goal_in_a_refused_turn_reaches_working_memory_and_the_follow_up_gets_the_task():
+    seen: list[RagSettings] = []
+    contexts = [_empty_ctx(), _rag_ctx()]
+
+    def retriever(question, settings):
+        seen.append(settings)
+        return contexts[len(seen) - 1]
+
+    agent, recorder = _d25_agent(
+        retriever, _cite_json(), deltas=[_d25_delta(_d25_goal_op())], rag_cite=True
+    )
+
+    first = agent.ask(D25_GOAL, [], memory=MemorySnapshot())
+
+    assert first.model_called is False
+    assert recorder.calls == []
+    assert first.memory is not None
+    assert first.memory.working.entries == {"goal.main": D25_GOAL}
+    assert first.memory.working.pinned == frozenset({"goal.main"})
+    assert first.memory_update is not None
+    assert len(first.memory_update.applied) == 1
+    # Cursor in Session.turns space: the user turn plus the refusal text.
+    assert (first.memory_upto, first.memory_update.memory_upto) == (2, 2)
+    assert agent.pending_memory is None
+    assert seen[0].task is None and seen[0].last_question is None
+
+    second = agent.ask(
+        "а что с ним?", first.history, memory=first.memory, memory_upto=first.memory_upto
+    )
+
+    assert D25_GOAL in (seen[1].task or "")
+    # The refused question travels through `previous`, never through `last_question`.
+    assert (seen[1].previous, seen[1].last_question) == (D25_GOAL, None)
+    assert second.model_called is True
+    assert agent.segments[1] == [{"role": "user", "content": "а что с ним?"}]
+
+
+def test_answered_question_becomes_last_question_for_the_next_retrieval():
+    seen: list[RagSettings] = []
+
+    def retriever(question, settings):
+        seen.append(settings)
+        return _rag_ctx()
+
+    agent, _ = _d25_agent(retriever, _cite_json(), _cite_json(), rag_cite=True)
+    first = agent.ask("какой порог?", [], memory=MemorySnapshot())
+    agent.ask("а он меняется?", first.history, memory=first.memory)
+
+    assert (seen[0].task, seen[0].last_question) == (None, None)
+    assert (seen[1].task, seen[1].last_question, seen[1].previous) == (
+        None,
+        "какой порог?",
+        None,
+    )
+
+
+def test_last_answer_is_the_cited_answer_text_without_the_sources_block():
+    seen: list[RagSettings] = []
+
+    def retriever(question, settings):
+        seen.append(settings)
+        return _rag_ctx()
+
+    agent, _ = _d25_agent(retriever, _cite_json(), _cite_json(), rag_cite=True)
+    first = agent.ask("какой порог?", [], memory=MemorySnapshot())
+    agent.ask("а он меняется?", first.history, memory=first.memory)
+
+    assert "Источники:" in first.history[-1]["content"]
+    assert seen[0].last_answer is None
+    assert seen[1].last_answer == "Порог равен 4242."
+
+
+def test_refusal_extractor_failure_is_returned_not_parked_and_cursor_stays():
+    agent, _ = _d25_agent(lambda q, s: _empty_ctx(), deltas=[CallResult(text="не json")])
+
+    reply = agent.ask("привет", [], memory=MemorySnapshot(), memory_upto=0)
+
+    assert reply.memory_update is None
+    assert reply.memory_failed is not None and reply.memory_failed.reason == "invalid"
+    assert reply.memory_upto == 0
+    assert agent.pending_memory is None and agent.pending_memory_failed is None
+
+
+def test_refusal_without_memory_strategy_runs_no_extractor():
+    agent, _ = _d25_agent(lambda q, s: _empty_ctx(), context_strategy="window", rag_cite=True)
+
+    reply = agent.ask("q", [])
+
+    assert agent.segments == []
+    assert (reply.memory, reply.memory_update, reply.memory_upto) == (None, None, 0)
+
+
+def test_no_memory_strategy_means_no_task_and_no_last_question_in_cite_and_plain_rag():
+    seen: list[RagSettings] = []
+
+    def retriever(question, settings):
+        seen.append(settings)
+        return _rag_ctx()
+
+    for params in ({"rag_cite": True}, {}):
+        agent, _ = _d25_agent(
+            retriever, _cite_json(), _cite_json(), context_strategy="window", **params
+        )
+        first = agent.ask("q1", [])
+        agent.ask("q2", first.history)
+    assert [(s.task, s.last_question) for s in seen] == [(None, None)] * 4
+
+
+def test_memory_strategy_without_working_entries_leaves_task_none():
+    seen: list[RagSettings] = []
+
+    def retriever(question, settings):
+        seen.append(settings)
+        return _rag_ctx()
+
+    agent, _ = _d25_agent(retriever, _cite_json(), rag_cite=True)
+    agent.ask("q", [], memory=MemorySnapshot())
+    assert seen[0].task is None
+
+
+def test_plain_rag_gets_task_and_last_question_under_memory():
+    seen: list[RagSettings] = []
+
+    def retriever(question, settings):
+        seen.append(settings)
+        return _rag_ctx()
+
+    agent, _ = _d25_agent(retriever, "ответ 1", "ответ 2", deltas=[_d25_delta(_d25_goal_op())])
+    first = agent.ask(D25_GOAL, [], memory=MemorySnapshot())
+    agent.ask("и дальше?", first.history, memory=first.memory, memory_upto=first.memory_upto)
+
+    assert seen[0].task is None
+    assert D25_GOAL in (seen[1].task or "")
+    assert seen[1].last_question == D25_GOAL
+
+
+def test_retrieval_task_has_goal_and_terms_only_not_clarified_or_constraints():
+    from advent_core.memory import StructuredMemory
+
+    seen: list[RagSettings] = []
+
+    def retriever(question, settings):
+        seen.append(settings)
+        return _rag_ctx()
+
+    memory_state = MemorySnapshot(
+        working=StructuredMemory(
+            {
+                "goal.main": D25_GOAL,
+                "terms.дубль": "одна запись",
+                "clarified.env": "Windows Terminal",
+                "constraints.no": "без select",
+            }
+        )
+    )
+    agent, _ = _d25_agent(retriever, "ответ")
+    agent.ask("и дальше?", [], memory=memory_state)
+
+    assert seen[0].task == f"Цель: {D25_GOAL}\nТермин: одна запись"

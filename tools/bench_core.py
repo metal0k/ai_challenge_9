@@ -17,59 +17,14 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 from advent_core.agent import Agent, AgentReply
-from advent_core.chat import Message
 from advent_core.config import ConfigError
 from advent_core.params import GenerationParams, ParamError
+from advent_core.scenario import ScenarioState, run_turn, salvage_pending_memory
 
-
-@dataclass(slots=True)
-class ScenarioState:
-    """Everything week_02/cli.py._turn() holds OUTSIDE the agent between turns.
-
-    The agent keeps no memory of its own (advent_core/agent.py) — history,
-    summary and sticky facts travel in AgentReply and the caller must carry
-    them into the next ask(). A harness that skipped this (e.g. re-passing
-    `summary=None` every turn) would silently measure "window" under every
-    strategy label, no matter which one was actually selected.
-    """
-
-    history: list[Message] = field(default_factory=list)
-    summary: str | None = None
-    facts: dict[str, str] = field(default_factory=dict)
-    facts_pinned: list[str] = field(default_factory=list)
-    facts_upto: int = 0
-
-    def clone(self) -> ScenarioState:
-        """Independent copy: a fork test needs two continuations from one point
-        that cannot see each other's later edits (SPEC-w02d10.md §13.3)."""
-        return ScenarioState(
-            history=list(self.history),
-            summary=self.summary,
-            facts=dict(self.facts),
-            facts_pinned=list(self.facts_pinned),
-            facts_upto=self.facts_upto,
-        )
-
-
-def run_turn(agent: Agent, state: ScenarioState, question: str) -> AgentReply:
-    """One scenario turn: ask, then fold the reply back into `state` in place."""
-    reply = agent.ask(
-        question,
-        state.history,
-        summary=state.summary,
-        facts=state.facts,
-        facts_pinned=state.facts_pinned,
-        facts_upto=state.facts_upto,
-    )
-    state.history = reply.history
-    state.summary = reply.summary
-    if reply.facts is not None:
-        state.facts = reply.facts
-        state.facts_upto = reply.facts_upto
-    return reply
+__all__ = ["ScenarioState", "run_turn", "salvage_pending_memory"]
 
 
 def run_scenario(
@@ -283,6 +238,7 @@ __all__ = [
     "num",
     "run_scenario",
     "run_turn",
+    "salvage_pending_memory",
     "side_call_totals",
     "trim_totals",
 ]

@@ -7,9 +7,11 @@ from advent_core.rag import (
     RAG_REWRITE_PROMPT,
     RagContext,
     RagHit,
+    RagSettings,
     apply_rerank,
     build_rag_prompt,
     build_rerank_prompt,
+    build_rewrite_prompt,
     check_facts,
     cited_sources,
     clean_rewrite,
@@ -17,6 +19,7 @@ from advent_core.rag import (
     fit_hits,
     normalize,
     parse_rerank,
+    resolved_question,
     rrf_merge,
 )
 
@@ -714,3 +717,78 @@ def test_rag_settings_cite_defaults_to_false():
 
     assert RagSettings("structure", 5, 20, False, False, 5.0).cite is False
     assert RagSettings("structure", 5, 20, True, True, 5.0, cite=True).cite is True
+
+
+# --- Day 25: task context in rewrite / rerank prompts ------------------------------------
+
+
+def test_rag_settings_new_fields_default_to_none():
+    s = RagSettings("structure", 5, 20, False, False, 5.0)
+    assert (s.task, s.last_question) == (None, None)
+
+
+def test_last_question_is_capped_at_500_chars_and_blank_becomes_none():
+    long = RagSettings("s", 5, 20, True, True, 5.0, last_question="я" * 900)
+    assert long.last_question == "я" * 500
+    blank = RagSettings("s", 5, 20, True, True, 5.0, last_question="   ")
+    assert blank.last_question is None
+
+
+def test_rag_context_task_used_defaults_to_false():
+    assert RagContext((), "structure", 5, "m", None, "rev").task_used is False
+
+
+def test_rewrite_task_prompt_literal_text():
+    prompt = build_rewrite_prompt("А он?", task="Цель main: g", last_question="L", previous=None)
+    assert prompt == (
+        "Перепиши текущий вопрос пользователя в поисковый запрос по документации и коду "
+        "Python-проекта: раскрой подразумеваемые термины, добавь вероятные "
+        "идентификаторы и английские эквиваленты. Контекст задачи и предыдущий обмен "
+        "нужны ТОЛЬКО чтобы понять, к чему относится текущий вопрос: разреши "
+        "местоимения и отсылки («тогда», «это», «он») и поставь в запрос только предмет "
+        "текущего вопроса — раскрытые отсылки и идентификаторы. Не копируй в запрос "
+        "окружение, ограничения, термины и цель из контекста, если текущий вопрос не о "
+        "них; если он меняет тему — следуй ему, контекст не тащи. "
+        "Верни только запрос одной строкой."
+        "\n\nКонтекст задачи:\nЦель main: g"
+        "\n\nПредыдущий вопрос: L"
+        "\n\nТекущий вопрос: А он?"
+    )
+
+
+def test_resolved_question_without_any_context_is_the_question_itself():
+    assert resolved_question("q") == "q"
+    assert resolved_question("q", task="Термин: x\nОграничение: y") == "q"
+
+
+def test_resolved_question_uses_raw_user_text_last_question_and_goal():
+    assert resolved_question("q", task="Цель: g\nТермин: t", last_question="l") == (
+        "q\n(в контексте: предыдущий вопрос пользователя: l; цель диалога: g)"
+    )
+    assert resolved_question("q", task="Цель: a\nЦель: b") == "q\n(в контексте: цель диалога: a; b)"
+    assert resolved_question("q", last_question="l") == (
+        "q\n(в контексте: предыдущий вопрос пользователя: l)"
+    )
+    assert resolved_question("q", previous="p") == (
+        "q\n(в контексте: предыдущий вопрос пользователя: p)"
+    )
+    assert resolved_question("q", last_question="l", previous="p").count("пользователя: l") == 1
+
+
+def test_rerank_prompt_with_a_resolved_question_carries_it_at_both_ends():
+    prompt = build_rerank_prompt(resolved_question("q", task="Цель: g"), [_h("a")])
+    line = "Вопрос: q\n(в контексте: цель диалога: g)"
+    assert prompt.count(line) == 2
+    assert prompt.startswith("Оцени") and prompt.endswith(line)
+
+
+def test_rerank_prompt_without_context_is_byte_for_byte_the_day_23_one():
+    assert build_rerank_prompt("q", [_h("a", text="текст")]) == (
+        "Оцени, насколько каждый фрагмент помогает ответить на вопрос. "
+        "Шкала 0–10: 10 — фрагмент содержит прямой ответ, 0 — не относится. "
+        'Верни JSON {"scores": [{"id": <номер>, "score": <0-10>}, ...]} '
+        "для всех 1 фрагментов без пропусков."
+        "\n\nВопрос: q"
+        "\n\n[1] CLAUDE.md — Раздел\nтекст"
+        "\n\nВопрос: q"
+    )

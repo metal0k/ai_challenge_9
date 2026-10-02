@@ -28,7 +28,7 @@ from advent_core import console
 from advent_core.agent import INTERRUPT_NOTE
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError
-from advent_core.memory import MemoryStore, StructuredMemory
+from advent_core.memory import MemorySnapshot, MemoryStore, StructuredMemory
 from advent_core.params import AGENT_COMMAND, defaults_for
 from advent_core.rag import RagContext, RagHit
 from advent_core.session import Session
@@ -5546,3 +5546,170 @@ def test_the_repl_retriever_journals_embed_and_aux_rows_by_the_rag_mode(
         ("rag_rerank", 24),
         ("main", 24),
     ]
+
+
+# --- Day 25: /rag chat, task line --------------------------------------------------------
+
+GOAL_TEXT = "подготовить запись демо через OBS"
+
+
+def _delta_json(*sets: dict) -> str:
+    return json.dumps(
+        {
+            "working": {"set": list(sets), "delete": []},
+            "long_term": {"set": [], "delete": []},
+        },
+        ensure_ascii=False,
+    )
+
+
+def _goal_op() -> dict:
+    return {"field": "goal", "key": "main", "value": GOAL_TEXT, "evidence": GOAL_TEXT}
+
+
+def _chat_shell(monkeypatch, tmp_path, replies=None):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(replies))
+    cli._dispatch("/rag chat", shell)
+    return shell
+
+
+def test_rag_chat_sets_memory_strategy_and_cite_together(monkeypatch, tmp_path):
+    shell = _shell(monkeypatch, tmp_path)
+
+    cli._dispatch("/rag chat", shell)
+
+    assert shell.agent.context_strategy == "memory"
+    s = shell.agent.rag_settings
+    assert (shell.agent.rag_enabled, s.rewrite, s.rerank, s.cite) == (True, True, True, True)
+    state = _saved(tmp_path)
+    assert (state["context_strategy"], state["rag_cite"]) == ("memory", True)
+
+
+def test_rag_chat_refuses_with_mcp_on_and_leaves_the_strategy(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    shell.agent.mcp_enabled = True
+    capsys.readouterr()
+
+    cli._dispatch("/rag chat", shell)
+
+    assert _flat(capsys.readouterr().err).count("/rag chat не включён: несовместим с MCP") == 1
+    assert shell.agent.context_strategy != "memory"
+    assert shell.agent.rag_settings.cite is False
+
+
+def test_rag_status_shows_task_state_only_with_cite_and_memory(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    cli._dispatch("/rag cite", shell)
+    capsys.readouterr()
+    cli._dispatch("/rag", shell)
+    assert "task state" not in capsys.readouterr().err
+
+    cli._dispatch("/rag chat", shell)
+    capsys.readouterr()
+    cli._dispatch("/rag", shell)
+
+    assert _flat(capsys.readouterr().err).strip() == (
+        "rag: on · structure · k 20→5 · rewrite on · rerank on (порог 5) · cite on "
+        "· task state on · индекс 0123456789ab (469 чанков)"
+    )
+
+
+def _snapshot(entries: dict[str, str], pinned=()) -> MemorySnapshot:
+    return MemorySnapshot(working=StructuredMemory(entries, frozenset(pinned)))
+
+
+def test_task_line_shows_pinned_goal_and_counts():
+    memory = _snapshot(
+        {
+            "goal.main": "записать демо",
+            "clarified.os": "Windows Terminal",
+            "clarified.mode": "режим cite",
+            "constraints.len": "коротко",
+            "terms.take": "дубль = запись",
+            "terms.race": "гонка очистки",
+            "decisions.x": "не считается",
+        },
+        pinned=["goal.main"],
+    )
+    assert cli._task_line(memory, 80) == (
+        "задача: цель 📌 «записать демо» · уточнено 2 · ограничений 1 · терминов 2"
+    )
+
+
+def test_task_line_without_goal_and_unpinned_goal():
+    assert cli._task_line(MemorySnapshot(), 80) == (
+        "задача: цели нет · уточнено 0 · ограничений 0 · терминов 0"
+    )
+    unpinned = cli._task_line(_snapshot({"goal.main": "цель"}), 80)
+    assert unpinned == "задача: цель «цель» · уточнено 0 · ограничений 0 · терминов 0"
+
+
+@pytest.mark.parametrize("goal", ["очень длинная цель " * 20, "цель 検索 " * 30 + "😀" * 40])
+def test_task_line_is_cut_to_80_cells_and_keeps_the_counts(goal):
+    memory = _snapshot({"goal.main": goal, "terms.a": "t"}, pinned=["goal.main"])
+
+    line = cli._task_line(memory, 80)
+
+    assert cell_len(line) <= 80
+    assert "…»" in line
+    assert line.endswith(" · уточнено 0 · ограничений 0 · терминов 1")
+    assert line.count("задача:") == 1
+
+
+def test_task_line_printed_after_cite_reply_and_after_a_refusal(monkeypatch, tmp_path, capsys):
+    shell = _chat_shell(monkeypatch, tmp_path, replies=[_cite_raw()])
+    delta = _delta_json(_goal_op())
+    shell.agent._memory_call = lambda snapshot, segment: _reply(delta)
+    shell.agent.retrieve = lambda q, settings: _ctx([])
+    capsys.readouterr()
+
+    cli._turn(shell, f"Хочу {GOAL_TEXT}")
+
+    err = _flat(capsys.readouterr().err)
+    # The goal is cut to the console width, the counts after it are not.
+    assert err.count("задача: цель 📌 «подготов") == 1
+    assert err.count("· уточнено 0 · ограничений 0 · терминов 0") == 1
+    assert "не знаю · модель не вызывалась" in err
+    assert shell.memory.working.entries == {"goal.main": GOAL_TEXT}
+    assert shell.memory.working.pinned == frozenset({"goal.main"})
+
+
+def test_task_line_absent_without_memory_strategy(monkeypatch, tmp_path, capsys):
+    shell = _cite_shell(monkeypatch, tmp_path, replies=[_cite_raw()])
+    capsys.readouterr()
+
+    cli._turn(shell, "вопрос")
+
+    assert "задача:" not in capsys.readouterr().err
+
+
+def test_chat_journal_rows_over_a_refusal_then_an_answer(monkeypatch, tmp_path):
+    rows: list[tuple[int, int, str | None]] = []
+    monkeypatch.setattr(
+        cli,
+        "log_call",
+        lambda result, messages, **kw: rows.append(
+            (kw["week"], kw["day"], (kw.get("extra") or {}).get("kind"))
+        ),
+    )
+    shell = _chat_shell(monkeypatch, tmp_path, replies=[_cite_raw()])
+    deltas = [_delta_json(_goal_op()), _delta_json()]
+    shell.agent._memory_call = lambda snapshot, segment: _reply(deltas.pop(0))
+    contexts = [_ctx([]), _ctx([_hit("CLAUDE.md", text=CITE_TEXT)])]
+    seen = []
+
+    def retrieve(question, settings):
+        seen.append((question, settings.task, settings.last_question, settings.previous))
+        return contexts[len(seen) - 1]
+
+    shell.agent.retrieve = retrieve
+
+    cli._turn(shell, f"Хочу {GOAL_TEXT}")
+    cli._turn(shell, "какой порог?")
+
+    # Refusal turn: extractor only (3, 11); answered turn: extractor, then the chat row (5, 24).
+    assert rows == [(3, 11, "memory"), (3, 11, "memory"), (5, 24, None)]
+    assert seen[0] == (f"Хочу {GOAL_TEXT}", None, None, None)
+    assert seen[1][0] == "какой порог?"
+    assert GOAL_TEXT in seen[1][1]
+    assert seen[1][2:] == (None, f"Хочу {GOAL_TEXT}")

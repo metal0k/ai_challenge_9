@@ -19,27 +19,34 @@ def _user(text: str) -> tuple[dict[str, str], ...]:
     return ({"role": "user", "content": text},)
 
 
-def test_apply_delta_validates_both_sections_before_mutating() -> None:
+def test_bad_evidence_rejects_only_that_operation_and_moves_the_cursor() -> None:
     snapshot = MemorySnapshot()
     delta = MemoryDelta(
         working=(MemoryOperation("set", "goal", "primary", "ship", "ship"),),
         long_term=(MemoryOperation("set", "profile", "name", "Denis", "not said"),),
     )
 
-    with pytest.raises(ValueError, match="evidence"):
-        apply_delta(snapshot, delta, user_messages=_user("ship"), memory_upto=9)
+    update = apply_delta(snapshot, delta, user_messages=_user("ship"), memory_upto=9)
 
     assert snapshot == MemorySnapshot()
+    assert update.snapshot.working.entries == {"goal.primary": "ship"}
+    assert update.snapshot.long_term.entries == {}
+    assert update.memory_upto == 9
+    assert [(layer, op.canonical_key) for layer, op, _ in update.rejected] == [
+        ("long_term", "profile.name")
+    ]
+    assert "evidence" in update.rejected[0][2]
+    assert render_delta(update) == "memory: working +goal.primary; long-term ×profile.name"
 
 
 @pytest.mark.parametrize(
     "operation, message, pattern",
     [
-        (MemoryOperation("set", "goal", "primary", "x", "x"), "x", "duplicate"),
+        (MemoryOperation("set", "decisions", "x", "x", "x"), "x", "duplicate"),
         (MemoryOperation("set", "preferences", "token", "abc", "abc"), "abc", "credential"),
     ],
 )
-def test_apply_delta_invalid_delta_raises_and_keeps_cursor(
+def test_duplicate_and_credential_operations_are_rejected_not_fatal(
     operation: MemoryOperation, message: str, pattern: str
 ) -> None:
     if pattern == "duplicate":
@@ -47,8 +54,19 @@ def test_apply_delta_invalid_delta_raises_and_keeps_cursor(
     else:
         delta = MemoryDelta(long_term=(operation,))
 
-    with pytest.raises(ValueError, match=pattern):
-        apply_delta(MemorySnapshot(), delta, user_messages=_user(message), memory_upto=12)
+    update = apply_delta(MemorySnapshot(), delta, user_messages=_user(message), memory_upto=12)
+
+    assert update.memory_upto == 12
+    assert len(update.rejected) == 1
+    assert pattern in update.rejected[0][2]
+    assert update.snapshot.long_term.entries == {}
+
+
+def test_non_sequence_section_still_rejects_the_whole_delta() -> None:
+    delta = MemoryDelta(working="oops")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="working operations must be a sequence"):
+        apply_delta(MemorySnapshot(), delta, user_messages=_user("x"), memory_upto=1)
 
 
 def test_apply_delta_pinned_conflict_blocks_only_that_operation() -> None:

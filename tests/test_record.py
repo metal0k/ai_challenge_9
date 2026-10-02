@@ -1666,3 +1666,86 @@ def test_day_24_titles_are_short_numbered_and_eval_is_last():
 def test_day_24_is_not_day_23():
     assert record_mod.demo_steps(5, 24)[0].args[:2] == ["ask", "--cite"]
     assert record_mod.demo_steps(5, 23)[0].args == ["stages"]
+
+
+# --- Day 25: mini-chat demo ------------------------------------------------------------------
+
+
+def test_day_25_steps_pin_modules_args_lines_and_timeouts():
+    steps = record_mod.demo_steps(5, 25)
+    assert [s.module for s in steps] == ["week_02.cli", "week_05.cli"]
+    assert steps[0].args == ["--session", "w05d25-demo", "--max-tokens", "400"]
+    assert steps[0].stdin_lines == [
+        "/new",
+        "/rag chat",
+        "Хочу записать демо дня через advent record, чтобы дубль не пришлось переснимать. "
+        "С чего начать проверки?",
+        "Когда он ловит чёрный кадр: до записи или после?",
+        "Дальше отвечай коротко, по шагам. "
+        "Как OBS-файл .mkv превращается в mp4 и как называется промежуточный файл?",
+        "А если он упадёт на середине — старый файл пропадёт?",
+        "/memory working",
+        "/rag off",
+        "/set context_strategy default",
+        "/exit",
+    ]
+    assert steps[1].args == ["chat-eval", "--detail"]
+    assert [s.timeout for s in steps] == [600, 1500]
+    # The closing screen of the no-stdin step is held longer than the shared pause.
+    assert steps[1].line_pause == 15.0
+
+
+def test_day_25_eval_step_is_last_and_timeout_covers_fifteen_minutes():
+    steps = record_mod.demo_steps(5, 25)
+    assert [s.title[:2] for s in steps] == ["1.", "2."]
+    assert all(len(s.title) < 100 for s in steps)
+    assert steps[-1].args[0] == "chat-eval"
+    assert steps[-1].timeout >= 15 * 60
+
+
+def test_day_25_the_agent_step_follows_up_with_a_pronoun_after_the_goal():
+    lines = record_mod.demo_steps(5, 25)[0].stdin_lines
+    assert lines.index("/rag chat") < 2
+    assert "он" in lines[3].split()
+    assert lines[-3:] == ["/rag off", "/set context_strategy default", "/exit"]
+
+
+def test_day_25_two_consecutive_takes_start_from_the_same_clean_session(tmp_path):
+    sessions, memory_root = tmp_path / "sessions", tmp_path / "logs"
+    session_file = sessions / "w05d25-demo.json"
+    working_file = memory_root / "memory" / "working" / "w05d25-demo.json"
+    other_file = memory_root / "memory" / "working" / "w05d24-demo.json"
+    for path in (session_file, working_file, other_file):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+
+    for _ in range(2):
+        record_mod._prepare_w05d25(5, 25, sessions_dir=sessions, memory_root=memory_root)
+        assert not session_file.exists()
+        assert not working_file.exists()
+        # A neighbouring day's state is never touched.
+        assert other_file.exists()
+        session_file.write_text("{}", encoding="utf-8")
+        working_file.write_text("{}", encoding="utf-8")
+
+    first = record_mod.demo_steps(5, 25)
+    second = record_mod.demo_steps(5, 25)
+    assert first == second
+    assert first[0].stdin_lines[0] == "/new"
+    assert first[0].args is not second[0].args
+
+
+def test_day_25_preflight_ignores_other_days(tmp_path):
+    sessions, memory_root = tmp_path / "sessions", tmp_path / "logs"
+    stale = sessions / "w05d25-demo.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}", encoding="utf-8")
+
+    record_mod._prepare_w05d25(5, 24, sessions_dir=sessions, memory_root=memory_root)
+
+    assert stale.exists()
+
+
+def test_day_25_is_not_day_24():
+    assert record_mod.demo_steps(5, 25)[1].args == ["chat-eval", "--detail"]
+    assert record_mod.demo_steps(5, 24)[0].args[:2] == ["ask", "--cite"]
