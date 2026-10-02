@@ -1190,3 +1190,55 @@ removing those, verbatim matches were 0 on the first probe. Stripping every
 `_` and `*` would have gone too far: `rag_cite` and `ragcite` would match.
 `quote_norm` removes only `**`, `__`, backticks and edge quotes. The model
 also splices quotes with `[...]` — those stay ✗, correctly.
+
+**A ministral-14b judge cannot measure "the answer keeps the dialog's goal" —
+that metric is computed by code.** Day 25 shipped a goal judge and removed it:
+asked "when is the black frame caught?", answered "before recording, by
+`verify_capture()`", it returned «нет — не отвечает на вопрос», and that was
+after the prompt was reworded to say the user's questions are steps toward
+the goal. What replaced it is structural: the goal is auto-pinned and its
+stability is a fact in the state (pinned since turn N, automatic rewrites
+blocked and counted). Same rule as day 04: a judge is only defensible where
+its verdict is better than noise.
+
+**Structured state fed to a query rewriter leaks its key names into the
+query.** Rendered as `Цель demo_day_recording: …`, the task state produced
+queries like "… in `demo_day_recording` (Python)" and "`context_window_budget`
+with `compact=True`" — the model read the keys as code identifiers. Render
+values only (`Цель: …`), pass only what disambiguates the question (goal and
+terms, plus the previous exchange — not clarifications or constraints, which
+were copied into queries verbatim), and search the bare question and a
+context-free rewrite alongside the contextual one (RRF), so one polluted
+paraphrase cannot sink retrieval. The reranker's context comes from the
+user's raw words, never from the rewriter's paraphrase.
+
+**A question must never become a fact of the dialog state.** The extractor
+stored "чем вырезать мёртвое время?" as `clarified.dead_space_editing`; the
+next rewrites then searched for "Python's `select` module … dead_space_editing
+logic" and three turns in a row came back «не знаю». A code guard rejects any
+`clarified`/`constraints`/`terms`/`open_items` operation whose evidence ends
+in "?" (`goal` is exempt). And an all-or-nothing delta does not recover on a
+long dialog: one spliced evidence froze the cursor, the next segment grew, and
+the model spliced again — operations are rejected one by one now.
+
+**A user's format request overrides a JSON contract.** Under «отвечай
+коротко, по шагам» the cite answer came back with `"answer"` as a list, then
+as an object `{"keep_last": 6, "compact_every": 10}` — correct, verbatim-quoted,
+and refused as unparseable. The prompt now says `answer` is always one string
+and the parser accepts a list or a flat object. One residual case is not
+repaired on purpose: unescaped quotes copied from `CLAUDE.md` into a quote make
+the JSON invalid even in JSON mode, and passing a broken answer off as parsed
+is worse than an honest refusal.
+
+**A metric about "the turn after X" measures that turn's own difficulty
+unless that turn is checked out of context.** "After the off-topic question"
+was ✗ in both day-25 scenarios across three runs; both return questions also
+failed as standalone `adventrag ask --cite` (threshold 0/38; 0/2 verbatim
+quotes). The return turn is now a question that is answerable on its own, and
+a test pins that a `switch` message is followed by a `question`.
+
+**A demo step's `--max-tokens` must fit the cite JSON, not a plain answer.**
+`--max-tokens 400` was inherited from the day-22 steps; a cite answer over five
+chunks with quotes ran 388 tokens on the first take and was truncated on the
+second, so the opening answer on camera was «не знаю (обрыв)». Day 25's step
+uses 1200.
