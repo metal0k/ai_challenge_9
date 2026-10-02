@@ -1282,6 +1282,7 @@ def _render_invariant_refusal(assessment: InvariantAssessment) -> None:
 def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> AgentReply | None:
     """Вызов агента плюс весь вывод вокруг него. None — вызов не состоялся."""
     streaming = chat_core.should_stream(shell.config)
+    chunks = console.LabelledChunks()
     facts_before = dict(shell.facts)
     try:
         reply = shell.agent.ask(
@@ -1297,7 +1298,7 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             profile=shell.profile_values,
             task=shell.task,
             invariants=shell.invariants,
-            on_chunk=console.write_chunk if streaming else None,
+            on_chunk=chunks if streaming else None,
         )
     except AdventError as error:
         # Compaction/facts, if either happened, happened BEFORE the failure —
@@ -1334,12 +1335,15 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
     # дешёвый способ получить дубль в кадре.
     if reply.cited is not None:
         # Product to stdout, rendered by code (the raw JSON stays in `result`).
+        chunks.ensure_label()
         console.out.print(
             reply.display_text or reply.text, markup=False, highlight=False, emoji=False
         )
     elif reply.result.stream:
+        chunks.ensure_label()
         console.finish_answer()
     else:
+        chunks.ensure_label()
         console.print_answer(reply.result, shell.config.params.format or "text")
 
     # API возвращает то же имя модели, что мы прислали (-latest так и остаётся

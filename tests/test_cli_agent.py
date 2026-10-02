@@ -5713,3 +5713,126 @@ def test_chat_journal_rows_over_a_refusal_then_an_answer(monkeypatch, tmp_path):
     assert seen[1][0] == "какой порог?"
     assert GOAL_TEXT in seen[1][1]
     assert seen[1][2:] == (None, f"Хочу {GOAL_TEXT}")
+
+
+# --- Reply label: `агент ›` before every model answer ---------------------
+
+LABEL = "агент ›"
+
+
+def test_label_precedes_the_answer_and_stays_off_stdout(monkeypatch, tmp_path, capsys):
+    events: list[str] = []
+    monkeypatch.setattr(cli.console, "answer_label", lambda: events.append("label"))
+    monkeypatch.setattr(cli.console, "print_answer", lambda r, f: events.append("answer"))
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["Париж"]))
+    capsys.readouterr()
+
+    cli._turn(shell, "столица Франции?")
+
+    assert events == ["label", "answer"]
+
+
+def test_label_text_goes_to_stderr_with_a_blank_line_before_it(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["Париж"]))
+    capsys.readouterr()
+
+    cli._turn(shell, "столица Франции?")
+
+    written = capsys.readouterr()
+    assert LABEL not in written.out
+    assert _plain(written.out).strip() == "Париж"
+    assert _plain(written.err).count(LABEL) == 1
+    assert "\n\nагент ›\n" in "\n" + _plain(written.err)
+
+
+def test_streaming_prints_the_label_once_before_the_first_chunk(monkeypatch, tmp_path, capsys):
+    events: list[str] = []
+    monkeypatch.setattr(cli.console, "answer_label", lambda: events.append("label"))
+    monkeypatch.setattr(cli.console, "write_chunk", lambda t: events.append("chunk:" + t))
+    shell = _shell(monkeypatch, tmp_path)
+    shell.config.stream = True
+
+    def fake_stream(config, messages, on_chunk, capabilities=None):
+        for piece in ("Па", "ри", "ж"):
+            on_chunk(piece)
+        result = _reply("Париж", sent_messages=messages)
+        result.stream = True
+        return result
+
+    shell.agent._stream = fake_stream
+    capsys.readouterr()
+
+    cli._turn(shell, "столица Франции?")
+
+    assert events == ["label", "chunk:Па", "chunk:ри", "chunk:ж"]
+
+
+def test_stream_failing_before_any_chunk_leaves_no_label(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    shell.config.stream = True
+
+    def failing_stream(config, messages, on_chunk, capabilities=None):
+        raise AdventError("обрыв")
+
+    shell.agent._stream = failing_stream
+    capsys.readouterr()
+
+    cli._turn(shell, "вопрос")
+
+    written = capsys.readouterr()
+    assert LABEL not in written.err
+    assert "Ошибка" in written.err
+
+
+def test_error_turn_has_no_label(monkeypatch, tmp_path, capsys):
+    def failing(config, messages, capabilities=None):
+        raise AdventError("сервер упал")
+
+    shell = _shell(monkeypatch, tmp_path, complete=failing)
+    capsys.readouterr()
+
+    cli._turn(shell, "вопрос")
+
+    written = capsys.readouterr()
+    assert LABEL not in written.err
+    assert LABEL not in written.out
+
+
+def test_slash_commands_and_warnings_have_no_label(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path)
+    capsys.readouterr()
+
+    cli._dispatch("/help", shell)
+    cli._dispatch("/nonexistent", shell)
+
+    written = capsys.readouterr()
+    assert LABEL not in written.err
+    assert LABEL not in written.out
+
+
+def test_cite_answer_and_cite_refusal_both_get_the_label(monkeypatch, tmp_path, capsys):
+    shell = _cite_shell(monkeypatch, tmp_path, [_cite_raw()])
+    capsys.readouterr()
+    cli._turn(shell, "какой порог?")
+    answered = capsys.readouterr()
+    assert _plain(answered.err).count(LABEL) == 1
+    assert LABEL not in answered.out
+
+    empty = _ctx([], candidates=9, passed=0)
+    shell = _cite_shell(monkeypatch, tmp_path, ctx=empty)
+    capsys.readouterr()
+    cli._turn(shell, "как борщ?")
+    refused = capsys.readouterr()
+    assert refused.out.startswith("Не знаю")
+    assert _plain(refused.err).count(LABEL) == 1
+    assert LABEL not in refused.out
+
+
+def test_each_answered_turn_gets_exactly_one_label(monkeypatch, tmp_path, capsys):
+    shell = _shell(monkeypatch, tmp_path, complete=_complete(["раз", "два"]))
+    capsys.readouterr()
+
+    cli._turn(shell, "первый")
+    cli._turn(shell, "второй")
+
+    assert _plain(capsys.readouterr().err).count(LABEL) == 2

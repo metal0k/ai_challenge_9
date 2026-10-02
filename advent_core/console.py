@@ -239,6 +239,35 @@ def echo_input(text: str) -> None:
     err.print(text, markup=False, highlight=False)
 
 
+def answer_label() -> None:
+    """Blank line + `агент ›` line before a reply, so the answer's start is visible.
+
+    stderr, not stdout: the label is not the product, `> answer.txt` stays clean.
+    Bold cyan mirrors the plain `ты ›` prompt while staying distinguishable.
+    """
+    err.print("")
+    err.print("[bold cyan]агент ›[/bold cyan]")
+
+
+class LabelledChunks:
+    """Chunk writer that prints the label once, before the first chunk.
+
+    A stream that fails before any chunk leaves no dangling label.
+    """
+
+    def __init__(self) -> None:
+        self.label_printed = False
+
+    def __call__(self, text: str) -> None:
+        self.ensure_label()
+        write_chunk(text)
+
+    def ensure_label(self) -> None:
+        if not self.label_printed:
+            self.label_printed = True
+            answer_label()
+
+
 def note(message: str) -> None:
     err.print(f"[dim]{message}[/dim]")
 
