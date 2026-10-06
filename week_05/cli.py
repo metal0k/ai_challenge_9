@@ -582,6 +582,24 @@ def check_command(
     check_local_rag(db, strategy)
 
 
+def _warm_up_jit_model(run: index_module.RunInfo, base: str) -> None:
+    """LM Studio unloads an idle JIT embedding model after its TTL; one request reloads it."""
+    found = next((m for m in openai_compat.server_status(base) if m.id == run.model), None)
+    if found is None or found.state is None or found.loaded:
+        return  # unlisted / stateless server: ensure_ready reports it
+    t0 = time.monotonic()
+    result = embed_local(base, run.model, ["проверка"], kind="query", prefix=run.query_prefix)
+    if result.vectors.shape[1] != run.dim:
+        raise AdventError(
+            f"Прогрев {run.model}: размерность {result.vectors.shape[1]}, "
+            f"а индекс построен с {run.dim}."
+        )
+    console.err.print(
+        f"embedding-модель {run.model} не была загружена — прогрел одним запросом "
+        f"({time.monotonic() - t0:.1f} s)"
+    )
+
+
 def check_local_rag(
     db: str | None = None, strategy: str = DEFAULT_RAG_STRATEGY
 ) -> index_module.RunInfo:
@@ -593,7 +611,9 @@ def check_local_rag(
     config = Config.resolve(offline=True, base_url=openai_compat.default_url())
     db_path = Path(db) if db is not None else index_module.LOCAL_DB
     run = rag_module.check_index(db_path, strategy)  # offline: refuses a cloud-built index
-    openai_compat.ensure_ready(run.model, str(config.base_url), require_state=True)
+    base = str(config.base_url)
+    _warm_up_jit_model(run, base)
+    openai_compat.ensure_ready(run.model, base, require_state=True)
     console.out.print(
         f"локальный индекс готов: {_db_display(db_path)}, стратегия {strategy}, "
         f"{run.n_chunks} чанков, модель {run.model} загружена"

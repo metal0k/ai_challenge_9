@@ -867,13 +867,71 @@ def test_check_refuses_a_missing_strategy(monkeypatch, tmp_path):
         rag_cli_module.check_local_rag(str(db), "fixed")
 
 
-@pytest.mark.parametrize("state", ["not-loaded", None])
-def test_check_refuses_an_embedding_model_that_is_not_loaded(monkeypatch, tmp_path, state):
+def test_check_refuses_a_stateless_server(monkeypatch, tmp_path):
     db = _local_db(tmp_path)
-    _serve(monkeypatch, state)
+    _serve(monkeypatch, None)
     with pytest.raises(AdventError) as info:
         rag_cli_module.check_local_rag(str(db))
     assert info.value.exit_code == 2
+
+
+def _jit(monkeypatch, *, dim=None, fail=False):
+    """Model starts not-loaded; the warm-up embed flips it to loaded. Returns the call log."""
+    state = {"s": "not-loaded"}
+    calls: list = []
+    monkeypatch.setattr(
+        oc,
+        "server_status",
+        lambda url=None, **kw: [oc.LocalModel(NOMIC, "embeddings", state["s"], 2048)],
+    )
+
+    def fake_embed(url, model, texts, **kw):
+        calls.append((model, texts, kw))
+        if fail:
+            raise AdventError("сервер не ответил")
+        state["s"] = "loaded"
+        n = dim if dim is not None else 4
+        return SimpleNamespace(vectors=np.ones((1, n), dtype=np.float32))
+
+    monkeypatch.setattr(rag_cli_module, "embed_local", fake_embed)
+    return calls
+
+
+def test_check_warms_up_a_not_loaded_model_once(monkeypatch, tmp_path, capsys):
+    db = _local_db(tmp_path)
+    dim = ix.load_runs(db)["structure"].dim
+    calls = _jit(monkeypatch, dim=dim)
+
+    run = rag_cli_module.check_local_rag(str(db))
+
+    assert run.model == NOMIC and len(calls) == 1
+    cap = capsys.readouterr()
+    assert "прогрел одним запросом" in cap.err and "локальный индекс готов" in cap.out
+
+
+def test_check_fails_when_the_warm_up_fails(monkeypatch, tmp_path):
+    db = _local_db(tmp_path)
+    calls = _jit(monkeypatch, fail=True)
+    with pytest.raises(AdventError, match="сервер не ответил"):
+        rag_cli_module.check_local_rag(str(db))
+    assert len(calls) == 1
+
+
+def test_check_fails_on_a_warm_up_dimension_mismatch(monkeypatch, tmp_path):
+    db = _local_db(tmp_path)
+    dim = ix.load_runs(db)["structure"].dim
+    _jit(monkeypatch, dim=dim + 1)
+    with pytest.raises(AdventError, match="размерность"):
+        rag_cli_module.check_local_rag(str(db))
+
+
+def test_check_does_not_warm_up_a_loaded_model(monkeypatch, tmp_path):
+    db = _local_db(tmp_path)
+    _serve(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(rag_cli_module, "embed_local", lambda *a, **k: calls.append(a))
+    rag_cli_module.check_local_rag(str(db))
+    assert calls == []
 
 
 def test_check_command_exits_non_zero_on_a_miss(monkeypatch, tmp_path):
