@@ -1286,3 +1286,66 @@ banned call would then make a correct answer `unsafe`.
 `ast.Call` on them. The guard is in front of a child process that runs with
 `-I -S`, a minimal env without `.env` secrets, an empty temp cwd and a timeout.
 That is still not a sandbox, and the README says so.
+
+**"No cloud" is enforced on the transport, not at the client factory.** Day 27's
+first guard sat in `mistral_client()` and Codex found three ways around it:
+`list_models()` calls `httpx.get` directly; a pre-created client with
+`follow_redirects=True` sends `127.0.0.1 → api.mistral.ai` inside one `send()`;
+`trust_env=True` routes a loopback request through an external `HTTP_PROXY`.
+`advent_core/offline.py` now wraps `httpx.Client._send_single_request` (and the
+async twin), which every hop — redirects included — passes through; local
+clients use `trust_env=False, follow_redirects=False`; the allowlist is loopback
+only, with userinfo and bad ports rejected. In offline mode `MISTRAL_API_KEY` is
+not read at all, so `.env` cannot hand it back to a child process, and MCP
+children get `ADVENT_OFFLINE=1` explicitly. `tests/conftest.py` fails any test
+that attempts a cloud call unless it opts in.
+
+**A loopback `base_url` and a remote one are different backends.** The first
+day-27 build sent the stub key and the LM Studio payload rewrite to *any*
+`base_url`, so `--base-url https://api.mistral.ai` got 401. Only a loopback URL
+takes the `openai_compat` path; anything else keeps the SDK path and the real
+key.
+
+**The Mistral SDK and LM Studio disagree in three places.** Streaming: no
+`stream_options`, so no usage. Embeddings: the SDK's pydantic model requires
+`body.id`, which LM Studio omits. JSON mode: LM Studio rejects
+`response_format: json_object` with 400 «must be 'json_schema' or 'text'».
+`openai_compat._wire_payload` drops `json_object` and renames the Mistral key
+`schema_definition` to `schema`.
+
+**Without reasoning, ornith ignores "answer only in JSON"; a grammar does
+not.** Day 27's local rerank with reasoning on took ~170 s and 3 of 10 control
+questions died at `max_tokens`. With top-level `reasoning_effort: "none"` it was
+twice as fast, but on a 14k-token prompt it degenerated (a fake `<tool_call>`
+copying the fragments to 4096 tokens), and on two more questions it wrote a
+prose review and hit the cap before any JSON. Repeating the instruction at the
+end, a tighter cap and a retry did not cure it. `response_format: json_schema`
+(strict) did: LM Studio constrains decoding to the schema, and rerank went to
+10/10 at 5–6 s. The cite answer uses the same grammar on the local path —
+without it ornith wrapped valid JSON in a ```json fence and the footer showed a
+red «JSON ✗» on camera. Lesson: on a local model, put the output format into the
+grammar, not into the prompt.
+
+**Embedding models truncate silently, and only some of them handle Russian.**
+nomic-embed-text-v1.5 drops input past its 2048-token window with no error and
+`usage` = 0. Real Cyrillic chunks lost their tails from 2191 characters on, so
+its chunk cap is 1600. It is also English-centric: Russian questions over the
+English `CLAUDE.md` scored hit@5 17% against 67% for `mistral-embed`, while the
+same questions in English ranked 1–2. bge-m3 (`gpustack/bge-m3-GGUF` Q8_0)
+holds 4000-character chunks whole and scored hit@5 67%, MRR@5 0.556 against the
+cloud's 0.347. Detect truncation by comparing the vector of the whole text with
+that of a prefix — nothing in the response tells you. Index provenance
+(endpoint, model, prefixes) is stored per run, and mixed or mismatched indexes
+are refused.
+
+**LM Studio JIT models expire, and a loaded model can crash.** An embedding
+model loaded on demand has a 1-hour TTL. After an idle hour the rehearsal gate
+refused to record, though one embed request reloads it in ~5 s, so
+`adventrag check` now warms the model up before checking. Separately, ornith
+died mid-measurement (`[ERROR][ornith] Error: Channel Error` in
+`~/.lmstudio/server-logs`, then «No models loaded»). That happened right after a
+14.6k-token prefill, with bge-m3 sharing the 8 GB. Nobody had unloaded it: the
+server log lists every unload, and the day's two were deliberate reloads. Read
+that log before suspecting a neighbour. ornith runs at `-Context 40960` next to
+bge-m3, leaving 899 MiB free; at 57344 only 309 MiB were free and generation
+fell to 42 tok/s.
