@@ -409,7 +409,8 @@ STRATEGIES: dict[str, Callable[[Document], list[Chunk]]] = {
 }
 
 
-def chunk_corpus(docs: list[Document], strategy: str) -> list[Chunk]:
+def chunk_corpus(docs: list[Document], strategy: str, max_chars: int | None = None) -> list[Chunk]:
+    """Chunk every doc; `max_chars` caps a chunk (structure re-cuts, fixed shrinks its window)."""
     try:
         fn = STRATEGIES[strategy]
     except KeyError as exc:
@@ -418,5 +419,10 @@ def chunk_corpus(docs: list[Document], strategy: str) -> list[Chunk]:
         raise AdventError(message) from exc
     chunks: list[Chunk] = []
     for doc in docs:
-        chunks.extend(fn(doc))
+        if max_chars is None:
+            chunks.extend(fn(doc))
+        elif strategy == "structure":
+            chunks.extend(chunk_structure(doc, max_chars))
+        else:
+            chunks.extend(chunk_fixed(doc, size=min(FIXED_SIZE, max_chars)))
     return chunks

@@ -1137,6 +1137,10 @@ def test_defaults_come_from_the_registry_not_from_the_typer_signature():
         "rag_k_before": 20,
         "rag_threshold": 5.0,
         "rag_cite": False,
+        # Day 27: local rewrite/rerank run without reasoning (measured, SPEC-w06d27 §9a).
+        "rag_aux_reasoning": False,
+        # Day 27: reasoning of the main answer on a local server.
+        "show_thinking": True,
     }
 
     signature = inspect.signature(cli.agent)

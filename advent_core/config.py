@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -37,6 +38,58 @@ class ConfigError(Exception):
 
 def load_env() -> None:
     load_dotenv(PROJECT_ROOT / ".env")
+
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+LOCAL_API_KEY = "lm-studio-local"
+
+
+def url_host(url: str) -> str | None:
+    """Lower-cased host of `url` without brackets/port; None when unparsable."""
+    try:
+        host = urlsplit(url if "//" in url else f"//{url}").hostname
+    except ValueError:
+        return None
+    return host.lower() if host else None
+
+
+def _strict_parts(url: str | None):
+    """urlsplit result for a well-formed http(s) URL (scheme optional), else None.
+
+    Rejects a bad port, userinfo and a foreign scheme: `http://127.0.0.1:bad` is
+    not a URL, and `http://127.0.0.1@evil.com` is not loopback.
+    """
+    if not url:
+        return None
+    try:
+        parts = urlsplit(url if "//" in url else f"//{url}")
+        parts.port  # noqa: B018 - raises ValueError on a malformed/out-of-range port
+    except ValueError:
+        return None
+    if parts.scheme not in ("", "http", "https") or "@" in parts.netloc:
+        return None
+    return parts
+
+
+def is_loopback_url(url: str | None) -> bool:
+    """True only for a well-formed http(s) URL on 127.0.0.1 / localhost / ::1."""
+    parts = _strict_parts(url)
+    return parts is not None and (parts.hostname or "").lower() in LOOPBACK_HOSTS
+
+
+def validate_loopback_url(url: str, what: str = "локальный сервер") -> str:
+    """Return `url` or raise ConfigError (exit 2): offline talks to loopback only."""
+    if _strict_parts(url) is None:
+        raise ConfigError(f"{what}: {url!r} — некорректный URL (нужен http(s)://host:порт).")
+    if not is_loopback_url(url):
+        raise ConfigError(
+            f"{what}: {url!r} не loopback — разрешены только 127.0.0.1, localhost, ::1."
+        )
+    return url
+
+
+def offline_env() -> bool:
+    return (os.getenv("ADVENT_OFFLINE") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _env(name: str) -> str | None:
@@ -104,6 +157,8 @@ class Config:
     # Базовый URL OpenAI-совместимого endpoint (LM Studio и т.п.). None —
     # облачный Mistral API, поведение не меняется ни в чём.
     base_url: str | None = None
+    # Process-wide offline mode (advent_core.offline): no cloud, no real key.
+    offline: bool = False
 
     @classmethod
     def resolve(
@@ -120,21 +175,30 @@ class Config:
         stream: bool = True,
         verbose: bool = False,
         base_url: str | None = None,
+        offline: bool | None = None,
     ) -> Config:
         """Собирает конфиг по приоритету: аргумент CLI > переменная .env > дефолт."""
         load_env()
 
         base_url = normalize_base_url(base_url or _env("ADVENT_BASE_URL"))
 
-        api_key = _env("MISTRAL_API_KEY")
-        if not api_key:
+        offline = bool(offline) or offline_env()
+        if offline:
+            from advent_core import offline as offline_guard
+
             if base_url:
-                # Локальный OpenAI-совместимый сервер (LM Studio) не проверяет
-                # Authorization вовсе, но SDK требует непустую строку в
-                # api_key — заглушка, а не настоящий секрет. Облачный режим
-                # (base_url не задан) по-прежнему требует настоящий ключ ниже.
-                api_key = "lm-studio-local"
-            else:
+                validate_loopback_url(base_url, "offline-режим")
+            offline_guard.enable()
+
+        if offline or is_loopback_url(base_url):
+            # A local OpenAI-compatible server ignores Authorization, but the SDK
+            # wants a non-empty string: a stub. The real key never goes to a loopback
+            # base_url, and offline does not even read it. A non-loopback base_url
+            # (e.g. https://api.mistral.ai) keeps the real key and the SDK path.
+            api_key = LOCAL_API_KEY
+        else:
+            api_key = _env("MISTRAL_API_KEY")
+            if not api_key:
                 raise ConfigError(
                     "Не найден MISTRAL_API_KEY.\n"
                     "Скопируй .env.example в .env и вставь ключ из https://console.mistral.ai/api-keys"
@@ -167,7 +231,13 @@ class Config:
             stream=stream,
             verbose=verbose,
             base_url=base_url,
+            offline=offline,
         )
+
+    @property
+    def is_local(self) -> bool:
+        """A loopback base_url: stub key, openai_compat routing, LM Studio payload rewrite."""
+        return is_loopback_url(self.base_url)
 
     def system_prompt(self) -> str | None:
         if self.system_prompt_path is None:

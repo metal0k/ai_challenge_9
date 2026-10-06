@@ -44,6 +44,20 @@ class ServerSpec:
     ensure_dirs: tuple[Path, ...] = ()
 
 
+NPX_COLD_CACHE_HINT = "npx-пакет не в кэше: прогрей онлайн `npx -y <пакет>`, затем повтори"
+
+
+def _is_npx(command: str) -> bool:
+    return Path(command).stem.lower() == "npx"
+
+
+def offline_command(command: list[str]) -> list[str]:
+    """npx gets `--offline` (fail on a cold cache instead of downloading); others as is."""
+    if command and _is_npx(command[0]) and "--offline" not in command:
+        return [command[0], "--offline", *command[1:]]
+    return list(command)
+
+
 @dataclass(slots=True, frozen=True)
 class Route:
     exposed: str
@@ -171,8 +185,14 @@ class Router:
         trace: Callable[[str], None] | None = None,
         journal: Callable[[RouteRecord], None] | None = None,
         current_round: Callable[[], int] | None = None,
+        env: dict[str, str] | None = None,
+        offline: bool = False,
     ) -> None:
         self.specs = {spec.name: spec for spec in specs}
+        # Explicit child env (offline: ADVENT_OFFLINE / ADVENT_BASE_URL / ...,
+        # MISTRAL_API_KEY=""); None keeps the SDK default.
+        self._env = env
+        self._offline = offline
         self._trace = trace
         self._journal = journal
         self._current_round = current_round
@@ -191,21 +211,35 @@ class Router:
 
     # --- connect ------------------------------------------------------------
 
+    def _env_kwargs(self) -> dict[str, Any]:
+        # Only when set: callers that fake mcp_client keep their old signature.
+        return {"env": self._env} if self._env is not None else {}
+
+    def _command(self, spec: ServerSpec) -> list[str]:
+        return offline_command(spec.command) if self._offline else list(spec.command)
+
+    def _cold_cache(self, spec: ServerSpec, error: MCPError) -> MCPError:
+        """Offline npx that failed: say why (the cache is the usual cause)."""
+        if self._offline and spec.command and _is_npx(spec.command[0]):
+            return MCPError(f"{error.message} ({NPX_COLD_CACHE_HINT})", hint=error.hint)
+        return error
+
     def _list_one(self, spec: ServerSpec) -> tuple[ServerSpec, Any]:
         try:
             for directory in spec.ensure_dirs:
                 directory.mkdir(parents=True, exist_ok=True)
             listing = mcp_client.connect_and_list(
-                spec.command,
+                self._command(spec),
                 timeout=spec.timeout,
                 raw=False,
                 sink=lambda _line: None,
                 cwd=spec.cwd,
                 quiet=True,
+                **self._env_kwargs(),
             )
             return spec, listing
         except MCPError as error:
-            return spec, error
+            return spec, self._cold_cache(spec, error)
         except Exception as error:  # one broken server must not take the others down
             return spec, MCPError(str(error) or repr(error))
 
@@ -262,15 +296,16 @@ class Router:
         started = time.perf_counter()
         try:
             outcome = mcp_client.call_tool_once(
-                spec.command,
+                self._command(spec),
                 route.tool,
                 arguments,
                 timeout=spec.timeout,
                 cwd=spec.cwd,
                 quiet=True,
+                **self._env_kwargs(),
             )
         except MCPError as error:
-            outcome = ToolCallOutcome(text=error.message, is_error=True)
+            outcome = ToolCallOutcome(text=self._cold_cache(spec, error).message, is_error=True)
         except Exception as error:
             outcome = ToolCallOutcome(text=str(error) or repr(error), is_error=True)
         elapsed = time.perf_counter() - started

@@ -12,7 +12,7 @@ import ast
 import json
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,12 +20,19 @@ from pathlib import Path
 
 import numpy as np
 
+from advent_core import offline
 from advent_core.config import PROJECT_ROOT
-from advent_core.embeddings import EmbedResult, embed_cost_usd
+from advent_core.embeddings import EMBED_MODELS, EmbedResult, embed_cost_usd, embed_local
 from advent_core.errors import AdventError
 from week_05.chunking import Chunk, Document
 
 DEFAULT_DB = PROJECT_ROOT / "data" / "rag" / "index.sqlite3"
+LOCAL_DB = PROJECT_ROOT / "data" / "rag" / "index.local.sqlite3"
+ENDPOINT_CLOUD = "cloud"
+ENDPOINT_LOCAL = "local"
+# Vector-probe: chunks at least this long get the whole-vs-without-last-10% check.
+PROBE_MIN_CHARS = 1200
+PROBE_SAME_COS = 0.99999
 SCHEMA_VERSION = 1
 SMALL_CHUNK_CHARS = 200
 
@@ -67,9 +74,19 @@ CREATE TABLE IF NOT EXISTS runs (
     corpus_rev TEXT NOT NULL,
     corpus_files INTEGER NOT NULL,
     corpus_chars INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    endpoint TEXT NOT NULL DEFAULT 'cloud',
+    doc_prefix TEXT NOT NULL DEFAULT '',
+    query_prefix TEXT NOT NULL DEFAULT ''
 );
 """
+
+# Provenance columns added on day 27; an old DB lacks them and reads as cloud, no prefixes.
+_RUN_MIGRATIONS = (
+    ("endpoint", "TEXT NOT NULL DEFAULT 'cloud'"),
+    ("doc_prefix", "TEXT NOT NULL DEFAULT ''"),
+    ("query_prefix", "TEXT NOT NULL DEFAULT ''"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +110,9 @@ class RunInfo:
     corpus_files: int
     corpus_chars: int
     created_at: str
+    endpoint: str = ENDPOINT_CLOUD
+    doc_prefix: str = ""
+    query_prefix: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +258,10 @@ def chunk_stats(chunks: list[Chunk], docs: list[Document]) -> Stats:
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_SQL)
+    have = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    for column, decl in _RUN_MIGRATIONS:
+        if column not in have:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {decl}")
     conn.execute(
         "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -306,7 +330,11 @@ def _chunk_from_row(row: sqlite3.Row) -> Chunk:
 
 
 def _run_info_from_row(row: sqlite3.Row) -> RunInfo:
+    cols = set(row.keys())
     return RunInfo(
+        endpoint=row["endpoint"] if "endpoint" in cols else ENDPOINT_CLOUD,
+        doc_prefix=row["doc_prefix"] if "doc_prefix" in cols else "",
+        query_prefix=row["query_prefix"] if "query_prefix" in cols else "",
         strategy=row["strategy"],
         model=row["model"],
         dim=row["dim"],
@@ -329,8 +357,15 @@ def write_index(
     corpus_rev: str,
     corpus_files: int,
     corpus_chars: int,
+    endpoint: str = ENDPOINT_CLOUD,
+    doc_prefix: str = "",
+    query_prefix: str = "",
+    meta: dict[str, str] | None = None,
 ) -> None:
     """Replace ALL given strategies' rows in one transaction (SPEC §5).
+
+    `endpoint`/prefixes are run provenance; a DB holding a run of the other
+    endpoint is refused — two vector spaces must not share one file.
 
     A failure partway through (a bad batch, a disk error) rolls back the
     whole write: strategies untouched by this call, and the previous rows of
@@ -343,6 +378,13 @@ def write_index(
         conn = sqlite3.connect(path)
         try:
             _ensure_schema(conn)
+            _refuse_mixed_endpoint(conn, endpoint, path)
+            for key, value in (meta or {}).items():
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
             created_at = datetime.now().astimezone().isoformat(timespec="seconds")
             for strategy, (chunks, embed_result) in results.items():
                 conn.execute("DELETE FROM chunks WHERE strategy = ?", (strategy,))
@@ -373,8 +415,9 @@ def write_index(
                 )
                 conn.execute(
                     "INSERT INTO runs (strategy, model, dim, n_chunks, prompt_tokens, requests, "
-                    "latency_ms, cost_usd, corpus_rev, corpus_files, corpus_chars, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "latency_ms, cost_usd, corpus_rev, corpus_files, corpus_chars, created_at, "
+                    "endpoint, doc_prefix, query_prefix) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         strategy,
                         embed_result.model,
@@ -388,12 +431,67 @@ def write_index(
                         corpus_files,
                         corpus_chars,
                         created_at,
+                        endpoint,
+                        doc_prefix,
+                        query_prefix,
                     ),
                 )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+
+def _mixed_message(found: str, wanted: str, path: Path) -> str:
+    return (
+        f"В индексе {display_path(path)} уже есть run с endpoint={found}, а записывается "
+        f"{wanted}: векторные пространства разные, смешивать их в одном файле нельзя."
+    )
+
+
+def _refuse_mixed_endpoint(conn: sqlite3.Connection, endpoint: str, path: Path) -> None:
+    found = {row[0] for row in conn.execute("SELECT DISTINCT endpoint FROM runs")}
+    other = sorted(found - {endpoint})
+    if other:
+        raise AdventError(
+            _mixed_message(other[0], endpoint, path),
+            hint="Укажи другой --db или удали файл индекса.",
+        )
+
+
+def check_endpoint_free(db_path: Path | None, endpoint: str) -> None:
+    """Before any embedding: refuse to write `endpoint` runs into a DB holding the other kind."""
+    path = db_path or DEFAULT_DB
+    if not path.exists():
+        return
+    with _sqlite_errors(path):
+        conn = sqlite3.connect(path)
+        try:
+            have = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+            if not have:
+                return
+            if "endpoint" not in have:
+                found = {ENDPOINT_CLOUD}
+            else:
+                found = {row[0] for row in conn.execute("SELECT DISTINCT endpoint FROM runs")}
+        finally:
+            conn.close()
+    other = sorted(found - {endpoint})
+    if other:
+        raise AdventError(
+            _mixed_message(other[0], endpoint, path),
+            hint="Укажи другой --db или удали файл индекса.",
+        )
+
+
+def load_meta(db_path: Path | None = None) -> dict[str, str]:
+    path = db_path or DEFAULT_DB
+    with _sqlite_errors(path):
+        conn = _connect_ro(path)
+        try:
+            return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
         finally:
             conn.close()
 
@@ -428,6 +526,23 @@ def check_comparable(runs: dict[str, RunInfo], strategies: list[str]) -> None:
             "было бы нечестным (разные векторные пространства). Переиндексируй "
             "одной моделью: `adventrag index --strategy all --model <модель>`."
         )
+
+    # One query embedding serves every strategy, so the whole vector space must match:
+    # endpoint, dimension and the instruction prefixes (nomic-style) as well as the model.
+    for label, attr in (
+        ("endpoint", "endpoint"),
+        ("размерностью", "dim"),
+        ("doc_prefix", "doc_prefix"),
+        ("query_prefix", "query_prefix"),
+    ):
+        values = {getattr(info, attr) for info in infos}
+        if len(values) > 1:
+            detail = ", ".join(f"{s}={getattr(runs[s], attr)!r}" for s in strategies)
+            raise AdventError(
+                f"Стратегии проиндексированы с разным {label} ({detail}) — сравнение "
+                "было бы нечестным (запрос эмбеддится один раз). Переиндексируй "
+                "обе стратегии одинаково: `adventrag index --strategy all`."
+            )
 
     revs = {info.corpus_rev for info in infos}
     if len(revs) > 1:
@@ -624,3 +739,65 @@ def leader(values: dict[str, float]) -> str | None:
     best = max(values.values())
     winners = [k for k, v in values.items() if v == best]
     return winners[0] if len(winners) == 1 else None
+
+
+# ---------------------------------------------------------------------------
+# Day 27: query embedding by the run's endpoint, vector-probe diagnostic.
+# ---------------------------------------------------------------------------
+
+
+def index_endpoint_mode() -> str:
+    """Endpoint an index must have in this process: offline means local only."""
+    return ENDPOINT_LOCAL if offline.is_enabled() else ENDPOINT_CLOUD
+
+
+def embed_queries_local(
+    run: RunInfo,
+    texts: list[str],
+    *,
+    base_url: str | None = None,
+    week: int,
+    day: int | None,
+    journal_extra: dict | None = None,
+) -> EmbedResult:
+    """Embed query `texts` for a local `run`: its model and stored query prefix."""
+    return embed_local(
+        base_url,
+        run.model,
+        texts,
+        kind="query",
+        prefix=run.query_prefix,
+        week=week,
+        day=day,
+        journal_extra=journal_extra,
+    )
+
+
+def local_prefixes(model: str) -> tuple[str, str]:
+    """(doc_prefix, query_prefix) of an embedding model from the table; empty when unknown."""
+    spec = EMBED_MODELS.get(model)
+    return (spec.doc_prefix, spec.query_prefix) if spec else ("", "")
+
+
+def truncation_probe(
+    chunks: list[Chunk],
+    vectors: np.ndarray,
+    embed_fn: Callable[[list[str]], np.ndarray],
+    *,
+    min_chars: int = PROBE_MIN_CHARS,
+) -> tuple[int, int, list[str]]:
+    """(truncated, probed, ids): a vector that survives cutting the last 10% was cut by the model.
+
+    Diagnostic only, never a gate: text past the model window is dropped
+    silently, so removing the final tenth changes nothing in the vector.
+    """
+    picked = [i for i, c in enumerate(chunks) if c.n_chars >= min_chars]
+    if not picked:
+        return 0, 0, []
+    cut = embed_fn([chunks[i].text[: int(chunks[i].n_chars * 0.9)] for i in picked])
+    truncated = [
+        chunks[i].chunk_id
+        for pos, i in enumerate(picked)
+        if float(np.dot(cut[pos], vectors[i])) >= PROBE_SAME_COS
+    ]
+    return len(truncated), len(picked), truncated

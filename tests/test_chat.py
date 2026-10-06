@@ -644,18 +644,11 @@ def test_list_models_uses_base_url_when_set(monkeypatch):
     """С заданным base_url список моделей идёт на локальный сервер, не в облако."""
     calls = []
 
-    class _FakeResponse:
-        def raise_for_status(self):
-            return None
+    def _handle(self, request):
+        calls.append(str(request.url))
+        return httpx.Response(200, json={"data": [{"id": "ornith"}]}, request=request)
 
-        def json(self):
-            return {"data": [{"id": "ornith"}]}
-
-    def _fake_get(url, **kwargs):
-        calls.append(url)
-        return _FakeResponse()
-
-    monkeypatch.setattr(client_mod.httpx, "get", _fake_get)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _handle)
 
     config = Config(api_key="lm-studio-local", base_url="http://127.0.0.1:1234")
     models = client_mod.list_models(config)
@@ -683,3 +676,311 @@ def test_list_models_uses_cloud_url_without_base_url(monkeypatch):
     client_mod.list_models(Config(api_key="k" * 32))
 
     assert calls == [client_mod.MODELS_URL]
+
+
+# --- base_url: complete()/stream() идут через advent_core.openai_compat ---------
+
+import httpx  # noqa: E402
+
+from advent_core import openai_compat as oc_mod  # noqa: E402
+from advent_core.errors import StreamTruncated  # noqa: E402
+
+
+def _local_config(**parm_kwargs) -> Config:
+    return Config(
+        api_key="lm-studio-local",
+        model="ornith",
+        params=GenerationParams.build(**parm_kwargs),
+        base_url="http://127.0.0.1:1234",
+    )
+
+
+def _local_server(monkeypatch, handler) -> list[httpx.Request]:
+    seen: list[httpx.Request] = []
+
+    def factory(timeout, transport=None):
+        def wrapped(request):
+            seen.append(request)
+            return handler(request)
+
+        return httpx.Client(transport=httpx.MockTransport(wrapped))
+
+    monkeypatch.setattr(oc_mod, "_make_client", factory)
+
+    @contextmanager
+    def _no_sdk(config):
+        raise AssertionError("с base_url SDK Mistral не используется")
+        yield
+
+    monkeypatch.setattr(chat_core, "mistral_client", _no_sdk)
+    return seen
+
+
+def _sse(*events, done=True) -> bytes:
+    body = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
+    if done:
+        body += "data: [DONE]\n\n"
+    return body.encode()
+
+
+_LOCAL_USAGE = {
+    "choices": [],
+    "usage": {
+        "prompt_tokens": 12,
+        "completion_tokens": 30,
+        "total_tokens": 42,
+        "completion_tokens_details": {"reasoning_tokens": 25},
+    },
+}
+
+
+def _completion_json(content="ответ", reasoning=None, finish="stop", tool_calls=None):
+    message = {"content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {
+        "model": "ornith",
+        "choices": [{"message": message, "finish_reason": finish}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11},
+    }
+
+
+def test_local_stream_returns_exact_usage_reasoning_and_finish(monkeypatch):
+    events = [
+        {"choices": [{"delta": {"reasoning_content": "дума"}}]},
+        {"choices": [{"delta": {"reasoning_content": "ю"}}]},
+        {"choices": [{"delta": {"content": "при"}}]},
+        {"choices": [{"delta": {"content": "вет"}, "finish_reason": "stop"}]},
+        _LOCAL_USAGE,
+    ]
+    seen = _local_server(monkeypatch, lambda r: httpx.Response(200, content=_sse(*events)))
+    chunks, thoughts = [], []
+
+    result = chat_core.stream(
+        _local_config(),
+        [{"role": "user", "content": "q"}],
+        chunks.append,
+        on_reasoning=thoughts.append,
+    )
+
+    assert "".join(chunks) == "привет" and result.text == "привет"
+    assert thoughts == ["дума", "ю"] and result.reasoning_text == "думаю"
+    assert (result.usage.prompt_tokens, result.usage.completion_tokens) == (12, 30)
+    assert result.usage.reasoning_tokens == 25
+    assert result.finish_reason == "stop" and result.truncated is False
+    assert result.stream is True and result.model_requested == "ornith"
+    assert seen[0].url.path == "/v1/chat/completions"
+
+
+def test_local_request_body_is_exactly_this_literal(monkeypatch):
+    """A literal expected body, not _payload(): the test must not share code with the SUT."""
+    ok = {"choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]}
+    seen = _local_server(monkeypatch, lambda r: httpx.Response(200, content=_sse(ok, _LOCAL_USAGE)))
+    config = _local_config(temperature=0.3, max_tokens=77, random_seed=5, format="json")
+
+    chat_core.stream(config, [{"role": "user", "content": "q"}], lambda c: None)
+
+    # LM Studio refuses json_object, so the wire body has no response_format; the JSON
+    # demand travels as the system message the format preset adds.
+    assert json.loads(seen[0].content) == {
+        "model": "ornith",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Верни ответ строго в виде одного валидного JSON-объекта — "
+                "без пояснений и без обёртки в ```.",
+            },
+            {"role": "user", "content": "q"},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 77,
+        "random_seed": 5,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+
+def test_cloud_sdk_payload_keeps_response_format_literal(monkeypatch):
+    fake = _FakeMistral(complete_response=_complete_response("{}", "stop"))
+    _patch_client(monkeypatch, fake)
+
+    chat_core.complete(_config(temperature=0.3, format="json"), [{"role": "user", "content": "q"}])
+
+    assert fake.chat.complete_kwargs == {
+        "model": "mistral-small-latest",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Верни ответ строго в виде одного валидного JSON-объекта — "
+                "без пояснений и без обёртки в ```.",
+            },
+            {"role": "user", "content": "q"},
+        ],
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _cloud_base_url_config(**parm_kwargs) -> Config:
+    # An explicit non-loopback base_url: previous SDK path, real key, no LM Studio rewrite.
+    return Config(
+        api_key="k" * 32,
+        model="mistral-small-latest",
+        params=GenerationParams.build(**parm_kwargs),
+        base_url="https://api.mistral.ai",
+    )
+
+
+def test_non_loopback_base_url_goes_through_the_sdk_with_the_real_key(monkeypatch):
+    fake = _FakeMistral(complete_response=_complete_response("привет", "stop"))
+    configs = []
+
+    @contextmanager
+    def _client(config):
+        configs.append(config)
+        yield fake
+
+    monkeypatch.setattr(chat_core, "mistral_client", _client)
+
+    def _no_local(*a, **k):
+        raise AssertionError("non-loopback base_url must not use openai_compat")
+
+    monkeypatch.setattr(oc_mod, "chat_complete", _no_local)
+    monkeypatch.setattr(oc_mod, "chat_stream", _no_local)
+
+    config = _cloud_base_url_config(format="json")
+    chat_core.complete(config, [{"role": "user", "content": "q"}])
+
+    assert configs[0].api_key == "k" * 32
+    # json_object stays: the LM Studio wire rewrite is for a loopback server only
+    assert fake.chat.complete_kwargs["response_format"] == {"type": "json_object"}
+
+
+def test_loopback_base_url_still_drops_json_object_on_the_wire(monkeypatch):
+    seen = _local_server(monkeypatch, lambda r: httpx.Response(200, json=_completion_json()))
+    chat_core.complete(_local_config(format="json"), [{"role": "user", "content": "q"}])
+    body = json.loads(seen[0].content)
+    assert "response_format" not in body
+    assert body["model"] == "ornith" and body["stream"] is False
+
+
+def test_local_unset_params_are_not_sent(monkeypatch):
+    seen = _local_server(monkeypatch, lambda r: httpx.Response(200, json=_completion_json()))
+    chat_core.complete(_local_config(), [{"role": "user", "content": "q"}])
+    assert set(json.loads(seen[0].content)) == {"model", "messages", "stream"}
+
+
+def test_local_skipped_params_are_reported_like_the_sdk_path(monkeypatch):
+    _local_server(monkeypatch, lambda r: httpx.Response(200, json=_completion_json()))
+    config = _local_config(reasoning_effort="high")
+    result = chat_core.complete(
+        config, [{"role": "user", "content": "q"}], capabilities={"reasoning": False}
+    )
+    assert result.skipped_params == ["reasoning_effort"]
+
+
+def test_local_complete_returns_usage_reasoning_tool_calls_and_snapshot(monkeypatch):
+    tool_calls = [{"id": "t1", "function": {"name": "git_log", "arguments": '{"n": 2}'}}]
+    answer = _completion_json(
+        "", reasoning="надо вызвать", finish="tool_calls", tool_calls=tool_calls
+    )
+    seen = _local_server(monkeypatch, lambda r: httpx.Response(200, json=answer))
+    tools = [{"type": "function", "function": {"name": "git_log"}}]
+    messages = [{"role": "user", "content": "q"}]
+
+    result = chat_core.complete(_local_config(), messages, tools=tools, tool_choice="auto")
+    messages.append({"role": "assistant", "content": "позже"})  # the agent's tool loop does this
+
+    body = json.loads(seen[0].content)
+    assert body["tools"] == tools and body["tool_choice"] == "auto" and body["stream"] is False
+    assert result.finish_reason == "tool_calls" and result.stream is False
+    assert result.tool_calls == (RawToolCall(id="t1", name="git_log", arguments='{"n": 2}'),)
+    assert result.reasoning_text == "надо вызвать"
+    assert (result.usage.prompt_tokens, result.usage.total_tokens) == (5, 11)
+    assert result.sent_messages == [{"role": "user", "content": "q"}]  # a snapshot, not the list
+
+
+def test_local_complete_without_usage_gives_an_empty_usage(monkeypatch):
+    body = _completion_json()
+    del body["usage"]
+    _local_server(monkeypatch, lambda r: httpx.Response(200, json=body))
+    result = chat_core.complete(_local_config(), [{"role": "user", "content": "q"}])
+    assert result.usage.is_empty()
+
+
+def test_local_format_verdict_is_filled(monkeypatch):
+    _local_server(monkeypatch, lambda r: httpx.Response(200, json=_completion_json('{"a": 1}')))
+    result = chat_core.complete(_local_config(format="json"), [{"role": "user", "content": "q"}])
+    assert result.format_ok is True
+
+
+def test_local_stream_works_without_an_on_reasoning_callback(monkeypatch):
+    events = [
+        {"choices": [{"delta": {"reasoning_content": "x"}}]},
+        {"choices": [{"delta": {"content": "y"}, "finish_reason": "stop"}]},
+    ]
+    _local_server(monkeypatch, lambda r: httpx.Response(200, content=_sse(*events)))
+    result = chat_core.stream(_local_config(), [{"role": "user", "content": "q"}], lambda c: None)
+    assert result.text == "y" and result.reasoning_text == "x"
+
+
+def test_local_stream_reasoning_only_with_length_is_an_error(monkeypatch):
+    events = [
+        {"choices": [{"delta": {"reasoning_content": "думаю и думаю"}, "finish_reason": "length"}]},
+        _LOCAL_USAGE,
+    ]
+    _local_server(monkeypatch, lambda r: httpx.Response(200, content=_sse(*events)))
+    with pytest.raises(StreamTruncated) as info:
+        chat_core.stream(_local_config(), [{"role": "user", "content": "q"}], lambda c: None)
+    assert "reasoning съел max_tokens" in info.value.message
+
+
+def test_local_complete_reasoning_only_with_length_is_an_error(monkeypatch):
+    answer = _completion_json("", reasoning="долго", finish="length")
+    _local_server(monkeypatch, lambda r: httpx.Response(200, json=answer))
+    with pytest.raises(StreamTruncated):
+        chat_core.complete(_local_config(), [{"role": "user", "content": "q"}])
+
+
+def test_local_length_with_an_answer_is_not_an_error(monkeypatch):
+    answer = _completion_json("обрезано", reasoning="r", finish="length")
+    _local_server(monkeypatch, lambda r: httpx.Response(200, json=answer))
+    result = chat_core.complete(_local_config(), [{"role": "user", "content": "q"}])
+    assert result.text == "обрезано" and result.finish_reason == "length"
+
+
+def test_local_ctrl_c_keeps_partial_output(monkeypatch):
+    events = [{"choices": [{"delta": {"content": "часть"}}]}]
+    _local_server(monkeypatch, lambda r: httpx.Response(200, content=_sse(*events, done=False)))
+
+    def interrupt(_chunk):
+        raise KeyboardInterrupt
+
+    result = chat_core.stream(_local_config(), [{"role": "user", "content": "q"}], interrupt)
+    assert result.text == "часть" and result.truncated is True
+
+
+def test_sdk_stream_on_reasoning_is_called_only_when_given(monkeypatch):
+    events = [_chunk("", reasoning_content="думаю"), _chunk("ответ", finish_reason="stop")]
+    _patch_client(monkeypatch, _FakeMistral(stream_events=events))
+    thoughts: list[str] = []
+    result = chat_core.stream(
+        _config(), [{"role": "user", "content": "q"}], lambda c: None, on_reasoning=thoughts.append
+    )
+    assert thoughts == ["думаю"] and result.reasoning_text == "думаю"
+    # Without the callback nothing changes.
+    result = chat_core.stream(_config(), [{"role": "user", "content": "q"}], lambda c: None)
+    assert result.reasoning_text == "думаю"
+
+
+def test_without_base_url_the_sdk_path_is_still_used(monkeypatch):
+    fake = _FakeMistral(complete_response=_complete_response("sdk", "stop"))
+    _patch_client(monkeypatch, fake)
+
+    def _no_http(*a, **k):
+        raise AssertionError("без base_url openai_compat не используется")
+
+    monkeypatch.setattr(oc_mod, "chat_complete", _no_http)
+    assert chat_core.complete(_config(), [{"role": "user", "content": "q"}]).text == "sdk"

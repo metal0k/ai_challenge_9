@@ -35,6 +35,8 @@ DEFAULT_RAG_STRATEGY = "structure"
 DEFAULT_RAG_K = 5
 # Day 23: second stage (candidates before filtering, reranker score cut-off).
 DEFAULT_RAG_K_BEFORE = 20
+# Local reasoning model on rewrite/rerank: see SPEC-w06d27 §9a (measured 2026-10-06).
+DEFAULT_RAG_AUX_REASONING = False
 DEFAULT_RAG_THRESHOLD = 5.0
 
 # Команды CLI, у которых есть собственные значения по умолчанию (Spec.defaults).
@@ -90,6 +92,9 @@ AGENT_PARAMS: tuple[str, ...] = (
     "rag_k_before",
     "rag_threshold",
     "rag_cite",
+    "rag_aux_reasoning",
+    # Local-server UX (day 27): reasoning of the main answer, dim on stderr.
+    "show_thinking",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -337,6 +342,20 @@ SPECS: tuple[Spec, ...] = (
         defaults={AGENT_COMMAND: False},
     ),
     Spec(
+        "rag_aux_reasoning",
+        "bool",
+        "RAG --local: reasoning модели в rewrite/rerank (off — reasoning_effort=none, быстрее).",
+        local=True,
+        defaults={AGENT_COMMAND: DEFAULT_RAG_AUX_REASONING},
+    ),
+    Spec(
+        "show_thinking",
+        "bool",
+        "Показывать reasoning основного ответа (dim, stderr); в историю и stdout не идёт.",
+        local=True,
+        defaults={AGENT_COMMAND: True},
+    ),
+    Spec(
         "rag_k_before",
         "int",
         "RAG: сколько кандидатов брать на каждый запрос до фильтрации.",
@@ -580,6 +599,10 @@ class GenerationParams:
     rag_threshold: float | None = None
     # Day 24: cited answers; same None-means-command-default rule.
     rag_cite: bool | None = None
+    # Day 27: reasoning of local rewrite/rerank calls; None means command default.
+    rag_aux_reasoning: bool | None = None
+    # Day 27: show the local model's reasoning; None means command default (on).
+    show_thinking: bool | None = None
 
     # Override лимита окна (день 08, SPEC-w02d08.md §4). None — «из карточки
     # модели»: у агента свой контракт на None, чем у max_turns выше — там
@@ -629,6 +652,10 @@ class GenerationParams:
     # список имён, а не Config.model, потому что bench перебирает несколько
     # моделей за один прогон, а не работает с одной.
     models: list[str] | None = None
+
+    # Programmatic only (not a registry param): a ready OpenAI-style response_format
+    # for one side call, sent as-is when `format` yields none.
+    response_format: dict[str, Any] | None = None
 
     @classmethod
     def build(cls, **raw: Any) -> GenerationParams:

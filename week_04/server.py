@@ -6,6 +6,7 @@ so diagnostics go to stderr only. Run: `python -m week_04.server`.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -16,10 +17,14 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from advent_core import chat as chat_core
-from advent_core import journal, tokens
+from advent_core import journal, offline, tokens
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError
 from week_04 import scheduler
+
+# A child spawned with ADVENT_OFFLINE=1 guards its own process: a forgotten cloud
+# path fails loudly instead of leaking (the parent's guard is not inherited).
+offline.init_from_env()
 
 SERVER_NAME = "advent-repo"
 # The client's default `--expect` list; tests assert the literal names.
@@ -46,6 +51,8 @@ DIGEST_DEFAULT_N = GIT_LOG_MAX
 
 SUMMARIZE_MODEL = DEFAULT_MODEL
 SUMMARIZE_MAX_TOKENS = 300
+# A reasoning model spends the budget on thinking first: 300 would end empty.
+LOCAL_SUMMARIZE_MAX_TOKENS = 2048
 SUMMARIZE_SYSTEM_PROMPT = (
     "Сделай краткую сводку текста ниже на русском языке: 3-5 предложений, "
     "по существу, без вступлений и оценок от себя. Отвечай только текстом "
@@ -235,10 +242,16 @@ def repo_activity_summary(minutes: int | None = None) -> str:
 def summarize_text(text: str) -> str:
     if not text.strip():
         raise ToolError("text пустой — нечего сжимать")
+    # The agent passes ADVENT_SUMMARIZE_MODEL / ADVENT_BASE_URL (read by
+    # Config.resolve) to the child in --local mode; unset means the cloud default.
     try:
         config = Config.resolve(
-            model=SUMMARIZE_MODEL, max_tokens=SUMMARIZE_MAX_TOKENS, stream=False
+            model=os.environ.get("ADVENT_SUMMARIZE_MODEL") or SUMMARIZE_MODEL,
+            max_tokens=SUMMARIZE_MAX_TOKENS,
+            stream=False,
         )
+        if config.is_local:
+            config.params.max_tokens = LOCAL_SUMMARIZE_MAX_TOKENS
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
     messages = chat_core.build_messages(text, system=SUMMARIZE_SYSTEM_PROMPT)

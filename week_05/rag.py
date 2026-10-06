@@ -52,31 +52,110 @@ JUDGE_MAX_TOKENS = 300
 RAG_AUX_MODEL = "ministral-14b-latest"
 REWRITE_MAX_TOKENS = 200
 RERANK_MAX_TOKENS = 2000
+# A reasoning local model spends max_tokens on its chain of thought first: at 200 the
+# rewrite returned nothing ("reasoning съел max_tokens"), so a local aux call gets a floor.
+LOCAL_AUX_MAX_TOKENS = 4096
+
+
+LOCAL_RERANK_RESPONSE_FORMAT: dict = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "rerank",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "scores": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "score": {"type": "integer", "minimum": 0, "maximum": 10},
+                        },
+                        "required": ["id", "score"],
+                    },
+                }
+            },
+            "required": ["scores"],
+        },
+    },
+}
+
+
+def local_rerank_cap(n: int) -> int:
+    """Output budget for a reasoning-off local rerank: the JSON only, so a runaway stops early."""
+    return max(512, 64 + 24 * n)
 
 
 def check_index(db_path: Path | None, strategy: str) -> index_module.RunInfo:
-    """Check that the requested strategy exists in the index."""
+    """Check that the strategy exists and that the index endpoint fits the mode.
+
+    Offline (`--local`) accepts only a local index: a cloud one has another
+    dimension and would die on search with a 1024-vs-768 error.
+    """
     runs = index_module.load_runs(db_path)
     if strategy not in runs:
         raise AdventError(
             f"В индексе нет стратегии {strategy!r}.",
             hint=f"Сначала `adventrag index --strategy {strategy}`.",
         )
-    return runs[strategy]
+    run = runs[strategy]
+    if index_module.index_endpoint_mode() == index_module.ENDPOINT_LOCAL and (
+        getattr(run, "endpoint", index_module.ENDPOINT_CLOUD) != index_module.ENDPOINT_LOCAL
+    ):
+        raise AdventError(
+            f"Индекс {index_module.display_path(db_path)} собран через облако "
+            f"(endpoint={run.endpoint}, модель {run.model}), а режим локальный.",
+            hint="Собери локальный индекс: `adventrag index --local` "
+            "(по умолчанию data/rag/index.local.sqlite3).",
+        )
+    return run
 
 
 def _aux_call(
-    prompt: str, *, command: str, max_tokens: int, json_mode: bool, day: int
+    prompt: str,
+    *,
+    command: str,
+    max_tokens: int,
+    json_mode: bool,
+    day: int,
+    aux_config: Config | None = None,
+    reasoning: bool = True,
+    local_cap: int | None = None,
+    rerank_schema: bool = False,
 ) -> CallResult:
     """One isolated helper call: nothing from .env params, no system persona.
 
     Journaled here, before the caller parses the reply, so a paid call is on record
     even when parsing then fails.
     """
+    base = (
+        dataclasses.replace(aux_config, stream=False)
+        if aux_config is not None
+        else Config.resolve(model=RAG_AUX_MODEL, stream=False)
+    )
+    # LM Studio rejects response_format json_object (accepts only json_schema/text):
+    # on a local server the prompt alone asks for JSON and parse_rerank copes with fences.
+    use_json = json_mode and not base.is_local
+    # Local rerank: grammar-enforced json_schema (LM Studio) stops the prose-before-JSON runaway.
+    wire_format = LOCAL_RERANK_RESPONSE_FORMAT if base.is_local and rerank_schema else None
+    if base.is_local:
+        if local_cap is not None and not reasoning:
+            max_tokens = local_cap  # no chain of thought to pay for: cap at what the JSON needs
+        else:
+            max_tokens = max(max_tokens, LOCAL_AUX_MAX_TOKENS)
+    # Top-level reasoning_effort="none" is what switches a local reasoning model off
+    # ("low" does not); a cloud aux call never gets it.
+    effort = "none" if base.is_local and not reasoning else None
     config = dataclasses.replace(
-        Config.resolve(model=RAG_AUX_MODEL, stream=False),
+        base,
         params=GenerationParams(
-            temperature=0, max_tokens=max_tokens, format="json" if json_mode else None
+            temperature=0,
+            max_tokens=max_tokens,
+            format="json" if use_json else None,
+            reasoning_effort=effort,
+            response_format=wire_format,
         ),
     )
     messages: list[Message] = [{"role": "user", "content": prompt}]
@@ -139,10 +218,14 @@ def make_retriever(
     week: int = RAG_WEEK,
     day: int = RAG_DAY,
     aux_day: int = RAG_AUX_DAY,
+    aux_config: Config | None = None,
 ) -> RetrieveFn:
     """Create a retriever bound to a database path and journal coordinates.
 
     `day` is the embedding row's day, `aux_day` the rewrite/rerank rows' day.
+    `aux_config` replaces the cloud `RAG_AUX_MODEL` config for rewrite/rerank
+    (the agent's own model/base_url in `--local`); the query embedding follows
+    the index run's endpoint, model and prefix, not the config.
     """
 
     def retrieve(question: str, settings: RagSettings) -> RagContext:
@@ -167,6 +250,8 @@ def make_retriever(
                     max_tokens=REWRITE_MAX_TOKENS,
                     json_mode=False,
                     day=rewrite_day,
+                    aux_config=aux_config,
+                    reasoning=settings.aux_reasoning,
                 )
             except AdventError as exc:
                 if not contextual:
@@ -206,16 +291,26 @@ def make_retriever(
                 rewritten = rewrite_once(rewrite_prompt(question, None), aux_day, "")
                 if rewritten is not None:
                     texts.append(rewritten)
-        config = Config.resolve()
-        with mistral_client(config) as client:
-            embedded = embed_texts(
-                client,
-                run.model,
+        journal_extra = {"strategy": strategy, "command": "rag"}
+        if getattr(run, "endpoint", index_module.ENDPOINT_CLOUD) == index_module.ENDPOINT_LOCAL:
+            embedded = index_module.embed_queries_local(
+                run,
                 texts,
+                base_url=aux_config.base_url if aux_config is not None else None,
                 week=week,
                 day=day,
-                journal_extra={"strategy": strategy, "command": "rag"},
+                journal_extra=journal_extra,
             )
+        else:
+            with mistral_client(Config.resolve()) as client:
+                embedded = embed_texts(
+                    client,
+                    run.model,
+                    texts,
+                    week=week,
+                    day=day,
+                    journal_extra=journal_extra,
+                )
         lists = [
             _to_hits(index_module.search(db_path, strategy, embedded.vectors[i], k=n))
             for i in range(len(texts))
@@ -233,15 +328,27 @@ def make_retriever(
                 last_question=settings.last_question,
                 previous=settings.previous,
             )
-            result = _aux_call(
-                build_rerank_prompt(resolved, fused),
-                command="rag_rerank",
-                max_tokens=RERANK_MAX_TOKENS,
-                json_mode=True,
-                day=stage_day,
-            )
-            aux_calls.append(result)
-            scores = parse_rerank(result.text, len(fused))
+            local = aux_config is not None and aux_config.is_local
+            # Local path: one retry on a non-JSON/ambiguous answer, same settings; cloud: none.
+            for attempt in range(2 if local else 1):
+                result = _aux_call(
+                    build_rerank_prompt(resolved, fused, local=local),
+                    command="rag_rerank",
+                    max_tokens=RERANK_MAX_TOKENS,
+                    json_mode=True,
+                    day=stage_day,
+                    aux_config=aux_config,
+                    reasoning=settings.aux_reasoning,
+                    local_cap=local_rerank_cap(len(fused)) if local else None,
+                    rerank_schema=True,
+                )
+                aux_calls.append(result)
+                try:
+                    scores = parse_rerank(result.text, len(fused), tolerant=local)
+                    break
+                except AdventError:
+                    if attempt == 1 or not local:
+                        raise
             unrated = len(fused) - len(scores)
             if unrated:
                 warnings.append(f"reranker не оценил {unrated} из {len(fused)} чанков")

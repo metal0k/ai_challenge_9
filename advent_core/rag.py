@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from advent_core.errors import AdventError
+from advent_core.params import DEFAULT_RAG_AUX_REASONING
 
 RAG_MAX_CONTEXT_CHARS = 24_000
 RAG_INSTRUCTION = (
@@ -67,6 +68,12 @@ RAG_RERANK_INSTRUCTION = (
     'Верни JSON {"scores": [{"id": <номер>, "score": <0-10>}, ...]} '
     "для всех {n} фрагментов без пропусков."
 )
+# Local path only: after ~14k tokens of fragments a model without reasoning loses the
+# format instruction from the head of the prompt, so the shape is repeated at the very end.
+RAG_RERANK_LOCAL_TAIL = (
+    'Ответь ТОЛЬКО JSON-объектом вида {"scores": [{"id": 1, "score": 0}, ...]} '
+    "— по одной записи на каждый из {n} фрагментов, без пояснений и без текста вокруг."
+)
 RRF_K0 = 60
 _REWRITE_STRIP = ' \t*`"«»'
 _DIGIT_GAP_RE = re.compile(r"(?<=\d)\s+(?=\d)")
@@ -99,6 +106,8 @@ class RagSettings:
     rewrite: bool
     rerank: bool
     threshold: float
+    # Local aux calls only: False sends reasoning_effort="none" (cloud ignores it).
+    aux_reasoning: bool = DEFAULT_RAG_AUX_REASONING
     cite: bool = False  # day 24: JSON answer with verbatim quotes, "don't know" refusal
     # Day 24: question a cite refusal answered; only the rewrite step reads it.
     previous: str | None = None
@@ -248,7 +257,7 @@ def resolved_question(
     return f"{question}\n{RAG_CONTEXT_LABEL} {'; '.join(parts)})"
 
 
-def build_rerank_prompt(question: str, hits: Sequence[RagHit]) -> str:
+def build_rerank_prompt(question: str, hits: Sequence[RagHit], *, local: bool = False) -> str:
     """Rerank request: instruction, question, numbered whole chunks, question again.
 
     The question before the fragments is measured: with it only at the end the reranker
@@ -262,11 +271,47 @@ def build_rerank_prompt(question: str, hits: Sequence[RagHit]) -> str:
         blocks.append(header + "\n" + hit.text.strip())
     instruction = RAG_RERANK_INSTRUCTION.replace("{n}", str(len(hits)))
     line = f"{RAG_QUESTION_LABEL} {question}"
-    return "\n\n".join([instruction, line, *blocks, line])
+    parts = [instruction, line, *blocks, line]
+    if local:
+        parts.append(RAG_RERANK_LOCAL_TAIL.replace("{n}", str(len(hits))))
+    return "\n\n".join(parts)
 
 
-def parse_rerank(raw: str, n: int) -> dict[int, float]:
-    """Scores by 1-based id for the chunks the reranker rated; AdventError if unusable."""
+def _find_scores_object(raw: str) -> dict | None:
+    """The single JSON object in `raw` with a "scores" key; None if none, error if several differ.
+
+    Several different candidates (an example then a final answer) are ambiguous:
+    taking the first would score chunks from the example.
+    """
+    decoder = json.JSONDecoder()
+    found: list[dict] = []
+    start = raw.find("{")
+    while start != -1:
+        try:
+            obj, end = decoder.raw_decode(raw, start)
+        except ValueError:
+            start = raw.find("{", start + 1)
+            continue
+        if isinstance(obj, dict) and "scores" in obj:
+            if obj not in found:
+                found.append(obj)
+            start = raw.find("{", end)
+        else:
+            start = raw.find("{", start + 1)
+    if len(found) > 1:
+        raise AdventError(
+            "Reranker вернул несколько разных объектов scores — какой из них ответ, неясно.",
+            hint="Повторите вопрос или выключите rag_rerank.",
+        )
+    return found[0] if found else None
+
+
+def parse_rerank(raw: str, n: int, *, tolerant: bool = False) -> dict[int, float]:
+    """Scores by 1-based id for the chunks the reranker rated; AdventError if unusable.
+
+    tolerant (local aux model only): pull one JSON object out of surrounding prose/fences;
+    the cloud path keeps the strict contract.
+    """
     hint = "Повторите вопрос или выключите rag_rerank."
     text = raw.strip()
     if text.startswith("```"):
@@ -274,7 +319,10 @@ def parse_rerank(raw: str, n: int) -> dict[int, float]:
     try:
         data = json.loads(text)
     except ValueError as exc:
-        raise AdventError("Reranker вернул не JSON.", hint=hint) from exc
+        # A local model without reasoning narrates around the JSON (preamble, fence, notes).
+        data = _find_scores_object(raw) if tolerant else None
+        if data is None:
+            raise AdventError("Reranker вернул не JSON.", hint=hint) from exc
     entries = data.get("scores") if isinstance(data, dict) else None
     if not isinstance(entries, list):
         raise AdventError("В ответе reranker'а нет списка scores.", hint=hint)

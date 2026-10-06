@@ -6,10 +6,10 @@ import json
 import time
 from collections.abc import Callable, Iterable
 
-from advent_core import formats
+from advent_core import formats, openai_compat
 from advent_core.client import mistral_client, requests_per_minute
 from advent_core.config import Config, ConfigError
-from advent_core.errors import AdventError, ConfigurationError, translate
+from advent_core.errors import AdventError, ConfigurationError, StreamTruncated, translate
 from advent_core.telemetry import CallResult, RawToolCall, Usage
 
 Message = dict[str, str]
@@ -171,6 +171,76 @@ def _tool_call_arguments(tool_call: object) -> str:
     return arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
 
 
+def _reject_reasoning_only(res: openai_compat.LocalResult) -> None:
+    """finish_reason=length with reasoning but no answer: an error, never a silent empty reply."""
+    if (
+        res.finish_reason == "length"
+        and res.reasoning_text
+        and not res.text.strip()
+        and not res.tool_calls
+    ):
+        raise StreamTruncated(
+            "обрыв: reasoning съел max_tokens — ответа нет",
+            hint="подними лимит: /set max_tokens 16384 (или --max-tokens)",
+        )
+
+
+def _complete_local(
+    config: Config, payload: dict, skipped: list[str], format_name: str, schema: dict | None
+) -> CallResult:
+    """complete() through the OpenAI-compatible HTTP client (config.base_url is set)."""
+    res = openai_compat.chat_complete(config.base_url, payload)
+    _reject_reasoning_only(res)
+    verdict = formats.verify(format_name, res.text, schema)
+    return CallResult(
+        text=res.text,
+        model_requested=config.model,
+        model_actual=res.model,
+        usage=res.usage or Usage(),
+        latency_ms=int(res.latency_ms),
+        stream=False,
+        skipped_params=skipped,
+        finish_reason=res.finish_reason,
+        format_ok=verdict.ok,
+        format_detail=verdict.detail,
+        sent_messages=list(payload["messages"]),
+        reasoning_text=res.reasoning_text or None,
+        tool_calls=res.tool_calls,
+    )
+
+
+def _stream_local(
+    config: Config,
+    payload: dict,
+    skipped: list[str],
+    format_name: str,
+    schema: dict | None,
+    on_chunk: Callable[[str], None],
+    on_reasoning: Callable[[str], None] | None,
+) -> CallResult:
+    """stream() through the OpenAI-compatible HTTP client: exact usage, reasoning deltas."""
+    res = openai_compat.chat_stream(
+        config.base_url, payload, on_reasoning=on_reasoning, on_content=on_chunk
+    )
+    _reject_reasoning_only(res)
+    verdict = formats.verify(format_name, res.text, schema)
+    return CallResult(
+        text=res.text,
+        model_requested=config.model,
+        model_actual=res.model,
+        usage=res.usage or Usage(),
+        latency_ms=int(res.latency_ms),
+        stream=True,
+        truncated=res.truncated,
+        skipped_params=skipped,
+        finish_reason=res.finish_reason,
+        format_ok=verdict.ok,
+        format_detail=verdict.detail,
+        sent_messages=list(payload["messages"]),
+        reasoning_text=res.reasoning_text or None,
+    )
+
+
 def complete(
     config: Config,
     messages: list[Message],
@@ -191,6 +261,8 @@ def complete(
         payload["tools"] = tools
     if tool_choice is not None:
         payload["tool_choice"] = tool_choice
+    if config.is_local:
+        return _complete_local(config, payload, skipped, format_name, schema)
     started = time.perf_counter()
 
     with mistral_client(config) as mistral:
@@ -262,6 +334,8 @@ def stream(
     messages: list[Message],
     on_chunk: Callable[[str], None],
     capabilities: dict | None = None,
+    *,
+    on_reasoning: Callable[[str], None] | None = None,
 ) -> CallResult:
     """Стрим ответа. Каждый кусок отдаётся в on_chunk по мере прихода.
 
@@ -272,6 +346,8 @@ def stream(
     No tools/tool_choice params here on purpose — see complete()'s docstring.
     """
     payload, skipped, format_name, schema = _payload(config, messages, capabilities)
+    if config.is_local:
+        return _stream_local(config, payload, skipped, format_name, schema, on_chunk, on_reasoning)
     started = time.perf_counter()
 
     result = CallResult(
@@ -305,6 +381,8 @@ def stream(
                         result.finish_reason = finish_reason
                     if reasoning_chunk := _extract_reasoning_delta(event):
                         reasoning_parts.append(reasoning_chunk)
+                        if on_reasoning is not None:
+                            on_reasoning(reasoning_chunk)
                     if chunk:
                         parts.append(chunk)
                         on_chunk(chunk)
@@ -369,6 +447,9 @@ def _payload(
         # AdventError, значит REPL по-прежнему не падает, и exit_code=2, как у
         # исходной ConfigError.
         raise ConfigurationError(str(exc)) from exc
+
+    if response_format is None and config.params.response_format is not None:
+        response_format = config.params.response_format
 
     if response_format is not None:
         # Уходит всегда, без гейтинга по capabilities: такого флага не

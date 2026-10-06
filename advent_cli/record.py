@@ -134,6 +134,18 @@ class Step:
     # lines and scrolls it off. The day's headline needs a longer hold; None
     # keeps the shared pause, so earlier days are untouched.
     line_pause: float | None = None
+    # Sessions whose files are deleted before the step runs. `/new` inside the REPL keeps
+    # the rag/strategy flags saved in the session state, so a take must start from no file.
+    fresh_sessions: list[str] = field(default_factory=list)
+
+
+def _reset_sessions(names: list[str]) -> None:
+    """Delete the session file (and its .bak quarantine copies) of every name; missing is fine."""
+    for name in names:
+        path = Session.path_for(name)
+        for victim in (path, *path.parent.glob(f"{path.name}.*.bak")):
+            with suppress(FileNotFoundError):
+                victim.unlink()
 
 
 def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
@@ -170,6 +182,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 6 and day == 27:
+        return _demo_steps_w06d27()
     if week == 6 and day == 26:
         return _demo_steps_w06d26()
     if week == 5 and day == 25:
@@ -2158,6 +2172,80 @@ def _demo_steps_w06d26() -> list[Step]:
     ]
 
 
+_W06D27_SESSION = "w06d27-take"
+# The cloud key is blanked in the child: a forgotten cloud call fails loudly, not silently.
+_W06D27_ENV = {"MISTRAL_API_KEY": ""}
+_W06D27_ARGS = ["--local", "--session", _W06D27_SESSION, "--max-tokens", "4096"]
+_W06D27_QUESTION = "Объясни в двух предложениях, чем окно контекста отличается от истории диалога."
+_W06D27_NAME = "Меня зовут Денис, запомни это."
+_W06D27_RECALL = "Как меня зовут?"
+_W06D27_REPO_QUESTION = "Какой максимум у temperature в Mistral API?"
+# Draft: fixed after the dry-run measurement (>= 2x the measured scenario, SPEC-w06d27 §9a-17).
+_W06D27_TIMEOUT = 900
+
+
+def _demo_steps_w06d27() -> list[Step]:
+    """Day 27 — the whole agent on a local LLM, cloud key blanked.
+
+    The first line `/new` wipes the take's session (same in rehearsal and take); RAG and
+    the strategy are switched on by commands in frame and back off at the end, so the saved
+    session state does not leak into the next take.
+    """
+    return [
+        Step(
+            title="1. Агент целиком на локальной LLM: reasoning, facts, RAG cite, /local",
+            module="week_02.cli",
+            args=list(_W06D27_ARGS),
+            env=dict(_W06D27_ENV),
+            stdin_lines=[
+                f"/new {_W06D27_SESSION}",
+                _W06D27_QUESTION,
+                _W06D27_NAME,
+                "/strategy facts",
+                _W06D27_RECALL,
+                "/rag cite",
+                _W06D27_REPO_QUESTION,
+                "/local",
+                "/rag off",
+                "/set context_strategy default",
+                "/exit",
+            ],
+            timeout=_W06D27_TIMEOUT,
+            line_pause=8.0,
+            fresh_sessions=[_W06D27_SESSION],
+        ),
+    ]
+
+
+def _rehearsal_steps_w06d27() -> list[Step]:
+    """Readiness gate (HTTP only), then a short local turn through the agent with Cyrillic stdin."""
+    return [
+        Step(title="репетиция: status", module="week_06.cli", args=["status"], timeout=60),
+        # The scene shows `/rag cite`: a missing local index only warns inside the REPL and
+        # the take would go on without RAG, so the index and its embedding model are gated here.
+        Step(
+            title="репетиция: локальный RAG-индекс и embedding-модель",
+            module="week_05.cli",
+            args=["check"],
+            timeout=60,
+        ),
+        Step(
+            title="репетиция: агент --local, короткий ход и /local",
+            module="week_02.cli",
+            args=["--local", "--session", "w06d27-rehearsal"],
+            env=dict(_W06D27_ENV),
+            stdin_lines=[
+                "/new w06d27-rehearsal",
+                _W06D26_QUESTION,
+                "/local",
+                "/exit",
+            ],
+            timeout=300,
+            fresh_sessions=["w06d27-rehearsal"],
+        ),
+    ]
+
+
 def _demo_steps_w05d25() -> list[Step]:
     """Day 25 — mini-chat with RAG, sources and task state: the agent's REPL, then chat-eval.
 
@@ -2479,6 +2567,8 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w03d14(session="w03d14-rehearsal")
     if (week, day) == (3, 15):
         return _demo_steps_w03d15(session="w03d15-rehearsal")
+    if (week, day) == (6, 27):
+        return _rehearsal_steps_w06d27()
     if (week, day) == (6, 26):
         return [
             # Readiness gate first: fails before recording if the model is not loaded.
@@ -2633,6 +2723,7 @@ def _run_step(step: Step, pause: float | None = None) -> None:
         "ADVENT_RECORD_COLOR": "1",
     }
     command = [sys.executable, "-m", step.module, *step.args]
+    _reset_sessions(step.fresh_sessions)
 
     if not step.stdin_lines and not step.stdin_file:
         # This branch carried no timeout at all until day 09: a step without

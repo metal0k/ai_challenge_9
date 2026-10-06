@@ -17,15 +17,28 @@ from rich.cells import cell_len
 from rich.markup import escape as rich_escape
 from rich.table import Table
 
-from advent_core import console
+from advent_core import console, openai_compat
 from advent_core.client import mistral_client
-from advent_core.config import PROJECT_ROOT, Config
-from advent_core.embeddings import DEFAULT_EMBED_MODEL, embed_texts
+from advent_core.config import PROJECT_ROOT, Config, ConfigError
+from advent_core.embeddings import (
+    DEFAULT_EMBED_MODEL,
+    EMBED_MODELS,
+    LOCAL_EMBED_MODEL,
+    embed_local,
+    embed_texts,
+)
 from advent_core.errors import AdventError
+from advent_core.params import DEFAULT_RAG_STRATEGY
 from week_05 import chat_eval, rag_cli
 from week_05 import corpus as corpus_module
 from week_05 import index as index_module
-from week_05.chunking import MAX_CHUNK_CHARS, STRATEGIES, Chunk, chunk_corpus
+from week_05 import rag as rag_module
+from week_05.chunking import (
+    MAX_CHUNK_CHARS,
+    STRATEGIES,
+    Chunk,
+    chunk_corpus,
+)
 
 DAY = 21
 WEEK = 5
@@ -115,6 +128,13 @@ def _chunks_table(stats: dict[str, index_module.Stats], strategies: list[str]) -
     return table
 
 
+def _tokens_cell(run: index_module.RunInfo) -> str:
+    # LM Studio embeddings report prompt_tokens 0: unknown, not zero tokens.
+    if run.endpoint == index_module.ENDPOINT_LOCAL and not run.prompt_tokens:
+        return "—"
+    return str(run.prompt_tokens) if run.prompt_tokens is not None else "?"
+
+
 def _cost_table(runs: dict[str, index_module.RunInfo], strategies: list[str]) -> Table:
     table = Table(title="Стоимость индексации", title_justify="left")
     table.add_column("стратегия", style="bold")
@@ -126,7 +146,7 @@ def _cost_table(runs: dict[str, index_module.RunInfo], strategies: list[str]) ->
         run = runs[strat]
         table.add_row(
             strat,
-            str(run.prompt_tokens) if run.prompt_tokens is not None else "?",
+            _tokens_cell(run),
             str(run.requests),
             f"{run.latency_ms / 1000:.1f} с",
             f"${run.cost_usd:.4f}" if run.cost_usd is not None else "$?",
@@ -225,7 +245,9 @@ def _summary_line(
     )
 
 
-def _check_chunk_sizes(chunks_by_strategy: dict[str, list[Chunk]]) -> None:
+def _check_chunk_sizes(
+    chunks_by_strategy: dict[str, list[Chunk]], cap: int = MAX_CHUNK_CHARS
+) -> None:
     """Preflight before any embed_texts call (SPEC §2 invariant, finding 11).
 
     chunk_structure asserts this internally, but chunk_fixed does not, and an
@@ -235,10 +257,10 @@ def _check_chunk_sizes(chunks_by_strategy: dict[str, list[Chunk]]) -> None:
     """
     for chunks in chunks_by_strategy.values():
         for chunk in chunks:
-            if chunk.n_chars > MAX_CHUNK_CHARS:
+            if chunk.n_chars > cap:
                 raise AdventError(
                     f"Чанк {chunk.chunk_id!r} длиннее MAX_CHUNK_CHARS "
-                    f"({chunk.n_chars} > {MAX_CHUNK_CHARS} символов) — эмбеддинг не отправлен."
+                    f"({chunk.n_chars} > {cap} символов) — эмбеддинг не отправлен."
                 )
 
 
@@ -263,20 +285,119 @@ def _progress_reporter(strat: str):
     return on_batch
 
 
+def _local_setup(model: str) -> str:
+    """Offline guard on, loopback URL validated, embedding model loaded; returns the URL."""
+    config = Config.resolve(offline=True, base_url=openai_compat.default_url())
+    url = str(config.base_url)  # canonical: no /v1, no trailing slash
+    openai_compat.ensure_ready(model, url, require_state=True)
+    return url
+
+
+def _local_mode_check(db_path: Path | None, strategies: list[str]) -> None:
+    """Offline mode accepts a local index only (`check_index` carries the rule)."""
+    for strat in strategies:
+        rag_module.check_index(db_path, strat)
+
+
+def _embed_queries(
+    run: index_module.RunInfo,
+    texts: list[str],
+    ids: list[str] | None,
+    strategy: str,
+    command: str,
+):
+    """Query vectors in the run's own vector space: a local run never touches the cloud client."""
+    extra = {"strategy": strategy, "command": command}
+    if run.endpoint == index_module.ENDPOINT_LOCAL:
+        return index_module.embed_queries_local(
+            run, texts, base_url=None, week=WEEK, day=DAY, journal_extra=extra
+        )
+    with mistral_client(Config.resolve()) as client:
+        return embed_texts(
+            client, run.model, texts, ids=ids, week=WEEK, day=DAY, journal_extra=extra
+        )
+
+
+def _index_local(
+    strategies: list[str],
+    chunks_by_strategy: dict[str, list[Chunk]],
+    model: str,
+) -> tuple[dict[str, tuple[list[Chunk], object]], dict[str, str]]:
+    url = _local_setup(model)
+    results: dict[str, tuple[list[Chunk], object]] = {}
+    meta: dict[str, str] = {}
+    for strat in strategies:
+        chunks = chunks_by_strategy[strat]
+        texts = [c.text for c in chunks]
+        console.note(f"эмбеддинг {strat}: {len(texts)} чанков, модель {model} (локально)")
+        t0 = time.monotonic()
+        embed_result = embed_local(
+            url,
+            model,
+            texts,
+            kind="doc",
+            on_batch=_progress_reporter(strat),
+            week=WEEK,
+            day=DAY,
+            journal_extra={"strategy": strat, "command": "index"},
+        )
+        elapsed = time.monotonic() - t0
+        results[strat] = (chunks, embed_result)
+        console.out.print(_summary_line(strat, chunks, embed_result, elapsed, 0.0))
+
+        def probe_embed(batch: list[str], _strat: str = strat):
+            return embed_local(
+                url,
+                model,
+                batch,
+                kind="doc",
+                week=WEEK,
+                day=DAY,
+                journal_extra={"strategy": _strat, "command": "index_probe"},
+            ).vectors
+
+        truncated, probed, ids = index_module.truncation_probe(
+            chunks, embed_result.vectors, probe_embed
+        )
+        meta[f"truncated_by_model.{strat}"] = f"{truncated}/{probed}"
+        console.out.print(
+            f"  обрезано моделью: {truncated} из {probed} проверенных "
+            f"(чанки ≥{index_module.PROBE_MIN_CHARS} симв., всего {len(chunks)})"
+        )
+        for chunk_id in ids[:5]:
+            console.warn(f"  обрезан моделью: {chunk_id}")
+    return results, meta
+
+
 @app.command("index")
 def index_command(
     strategy: str = typer.Option("all", "--strategy", help="fixed | structure | all."),
-    model: str = typer.Option(DEFAULT_EMBED_MODEL, "--model", help="Модель эмбеддинга."),
+    model: str | None = typer.Option(
+        None, "--model", help="Модель эмбеддинга (mistral-embed; с --local — nomic-embed)."
+    ),
     rev: str = typer.Option("HEAD", "--rev", help="Git-ревизия корпуса."),
     db: str | None = typer.Option(
-        None, "--db", help="Путь к индексу (по умолчанию data/rag/index.sqlite3)."
+        None,
+        "--db",
+        help="Путь к индексу (data/rag/index.sqlite3; с --local — data/rag/index.local.sqlite3).",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Только chunking и статистика — без API и без записи."
     ),
+    local: bool = typer.Option(
+        False, "--local", help="Эмбеддинги локальной моделью (LM Studio), облако отключено."
+    ),
 ) -> None:
     """Собрать корпус, разбить на чанки, посчитать эмбеддинги и записать индекс."""
+    local = local is True  # direct calls leave typer's OptionInfo default here
     strategies = _strategy_list(strategy)
+    model = (model if isinstance(model, str) else None) or (
+        LOCAL_EMBED_MODEL if local else DEFAULT_EMBED_MODEL
+    )
+    spec = EMBED_MODELS.get(model)
+    cap = (spec.chunk_cap if local and spec else 0) or MAX_CHUNK_CHARS
+    if local and db is None:
+        db = str(index_module.LOCAL_DB)
     console.note(f"собираю корпус на ревизии {rev}…")
     corpus_rev, docs = corpus_module.collect_corpus(PROJECT_ROOT, rev=rev)
     corpus_chars = sum(len(d.text) for d in docs)
@@ -287,7 +408,9 @@ def index_command(
     chunks_by_strategy: dict[str, list[Chunk]] = {}
     for strat in strategies:
         console.note(f"chunking {strat}…")
-        chunks_by_strategy[strat] = chunk_corpus(docs, strat)
+        chunks_by_strategy[strat] = (
+            chunk_corpus(docs, strat, max_chars=cap) if local else chunk_corpus(docs, strat)
+        )
 
     if dry_run:
         table = _new_stats_table("Статистика чанков (dry-run, без API и без записи)")
@@ -298,8 +421,36 @@ def index_command(
         console.note("dry-run: без API и без записи индекса")
         return
 
-    _check_chunk_sizes(chunks_by_strategy)
+    _check_chunk_sizes(chunks_by_strategy, cap)
+    db_path = _db_path(db)
+    endpoint = index_module.ENDPOINT_LOCAL if local else index_module.ENDPOINT_CLOUD
+    index_module.check_endpoint_free(db_path, endpoint)  # before any embedding is paid for
 
+    meta: dict[str, str] = {}
+    if local:
+        results, meta = _index_local(strategies, chunks_by_strategy, model)
+        meta["chunk_cap"] = str(cap)
+    else:
+        results = _index_cloud(strategies, chunks_by_strategy, model)
+
+    doc_prefix, query_prefix = index_module.local_prefixes(model) if local else ("", "")
+    index_module.write_index(
+        db_path,
+        results,
+        corpus_rev=corpus_rev,
+        corpus_files=len(docs),
+        corpus_chars=corpus_chars,
+        endpoint=endpoint,
+        doc_prefix=doc_prefix,
+        query_prefix=query_prefix,
+        meta=meta or None,
+    )
+    console.note(f"индекс записан: {_db_display(db_path)}")
+
+
+def _index_cloud(
+    strategies: list[str], chunks_by_strategy: dict[str, list[Chunk]], model: str
+) -> dict[str, tuple[list[Chunk], object]]:
     config = Config.resolve()
     results: dict[str, tuple[list[Chunk], object]] = {}
     with mistral_client(config) as client:
@@ -324,16 +475,7 @@ def index_command(
             results[strat] = (chunks, embed_result)
             cost = index_module.embed_cost_usd(embed_result.model, embed_result.prompt_tokens)
             console.out.print(_summary_line(strat, chunks, embed_result, elapsed, cost))
-
-    db_path = _db_path(db)
-    index_module.write_index(
-        db_path,
-        results,
-        corpus_rev=corpus_rev,
-        corpus_files=len(docs),
-        corpus_chars=corpus_chars,
-    )
-    console.note(f"индекс записан: {_db_display(db_path)}")
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +486,17 @@ def index_command(
 @app.command("compare")
 def compare_command(
     db: str | None = typer.Option(None, "--db", help="Путь к индексу."),
+    local: bool = typer.Option(
+        False, "--local", help="Локальный индекс и локальный embedding запросов, облако отключено."
+    ),
 ) -> None:
     """Сравнить стратегии: статистика чанков + качество поиска на eval-вопросах."""
+    local = local is True
+    if local and db is None:
+        db = str(index_module.LOCAL_DB)
     db_path = _db_path(db)
+    if local:
+        Config.resolve(offline=True, base_url=openai_compat.default_url())
     runs = index_module.load_runs(db_path)
     strategies = [s for s in ALL_STRATEGIES if s in runs]
     if len(strategies) < 2:
@@ -354,7 +504,8 @@ def compare_command(
             "Для сравнения нужны обе стратегии в индексе. Сначала `adventrag index --strategy all`."
         )
     index_module.check_comparable(runs, strategies)
-    model = runs[strategies[0]].model
+    if local:
+        _local_mode_check(db_path, strategies)
     corpus_rev = runs[strategies[0]].corpus_rev
 
     console.note(
@@ -372,17 +523,13 @@ def compare_command(
     console.out.print(_cost_table(runs, strategies))
 
     questions = index_module.load_eval(EVAL_QUESTIONS_PATH)
-    config = Config.resolve()
-    with mistral_client(config) as client:
-        embed_result = embed_texts(
-            client,
-            model,
-            [q.question for q in questions],
-            ids=[str(q.id) for q in questions],
-            week=WEEK,
-            day=DAY,
-            journal_extra={"strategy": "eval", "command": "compare"},
-        )
+    embed_result = _embed_queries(
+        runs[strategies[0]],
+        [q.question for q in questions],
+        [str(q.id) for q in questions],
+        "eval",
+        "compare",
+    )
 
     hits_by_question: dict[str, dict[int, list[index_module.Hit]]] = {s: {} for s in strategies}
     for i, question in enumerate(questions):
@@ -422,6 +569,39 @@ def compare_command(
 
 
 # ---------------------------------------------------------------------------
+# check (local RAG prerequisites; the rehearsal runs it before StartRecord)
+# ---------------------------------------------------------------------------
+
+
+@app.command("check")
+def check_command(
+    db: str | None = typer.Option(None, "--db", help="Путь к индексу (по умолчанию локальный)."),
+    strategy: str = typer.Option(DEFAULT_RAG_STRATEGY, "--strategy", help="fixed | structure."),
+) -> None:
+    """Проверить локальный RAG: индекс с локальным provenance и загруженная embedding-модель."""
+    check_local_rag(db, strategy)
+
+
+def check_local_rag(
+    db: str | None = None, strategy: str = DEFAULT_RAG_STRATEGY
+) -> index_module.RunInfo:
+    """Offline mode, a local-endpoint index with the strategy, its embedding model loaded.
+
+    Non-zero exit (AdventError) on any miss: a missing index must stop a take before
+    recording instead of surfacing as a warning inside the video.
+    """
+    config = Config.resolve(offline=True, base_url=openai_compat.default_url())
+    db_path = Path(db) if db is not None else index_module.LOCAL_DB
+    run = rag_module.check_index(db_path, strategy)  # offline: refuses a cloud-built index
+    openai_compat.ensure_ready(run.model, str(config.base_url), require_state=True)
+    console.out.print(
+        f"локальный индекс готов: {_db_display(db_path)}, стратегия {strategy}, "
+        f"{run.n_chunks} чанков, модель {run.model} загружена"
+    )
+    return run
+
+
+# ---------------------------------------------------------------------------
 # search
 # ---------------------------------------------------------------------------
 
@@ -445,18 +625,9 @@ def search_hits(query: str, strategy: str = "all", k: int = 5, db: str | None = 
     strategies = _strategy_list(strategy)
     runs = index_module.load_runs(db_path)
     index_module.check_comparable(runs, strategies)
-    model = runs[strategies[0]].model
-
-    config = Config.resolve()
-    with mistral_client(config) as client:
-        embed_result = embed_texts(
-            client,
-            model,
-            [query],
-            week=WEEK,
-            day=DAY,
-            journal_extra={"strategy": ",".join(strategies), "command": "search"},
-        )
+    embed_result = _embed_queries(
+        runs[strategies[0]], [query], None, ",".join(strategies), "search"
+    )
     query_vec = embed_result.vectors[0]
 
     for strat in strategies:
@@ -534,6 +705,9 @@ def main() -> None:
         app()
     except AdventError as error:
         console.fail(error)
+        raise SystemExit(error.exit_code) from None
+    except ConfigError as error:  # not an AdventError: offline/loopback refusals land here
+        console.fail(AdventError(str(error)))
         raise SystemExit(error.exit_code) from None
     except KeyboardInterrupt:
         console.note("\nпрервано")

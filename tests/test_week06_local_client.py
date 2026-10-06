@@ -8,6 +8,7 @@ import time
 import httpx
 import pytest
 
+from advent_core import openai_compat as oc
 from advent_core.errors import (
     AdventError,
     AuthError,
@@ -62,7 +63,7 @@ def server(monkeypatch):
 
         return httpx.Client(transport=httpx.MockTransport(handler))
 
-    monkeypatch.setattr(lc, "_make_client", factory)
+    monkeypatch.setattr(oc, "_make_client", factory)
 
     def install(handler):
         state["handler"] = handler
@@ -115,7 +116,7 @@ def test_ttft_is_first_reasoning_not_content(server, monkeypatch):
         state["calls"] += 1
         return 0.0 if state["calls"] == 1 else state["t"]
 
-    monkeypatch.setattr(lc, "_clock", clock)
+    monkeypatch.setattr(oc, "_clock", clock)
 
     def on_reasoning(_):
         state["t"] = 5.0

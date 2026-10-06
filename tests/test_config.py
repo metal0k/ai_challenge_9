@@ -205,3 +205,135 @@ def test_resolve_normalizes_base_url_from_flag():
 def test_resolve_normalizes_base_url_from_env(monkeypatch):
     monkeypatch.setenv("ADVENT_BASE_URL", "http://127.0.0.1:1234/v1/")
     assert Config.resolve().base_url == "http://127.0.0.1:1234"
+
+
+# --- offline: заглушка вместо ключа, loopback-проверка ---------------------------
+
+
+def test_real_key_never_goes_with_a_base_url(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "k" * 32)
+    config = Config.resolve(base_url="http://127.0.0.1:1234")
+    assert config.api_key == "lm-studio-local"
+    assert config.offline is False
+
+
+def test_offline_does_not_read_the_key_at_all(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "k" * 32)
+    config = Config.resolve(base_url="http://127.0.0.1:1234", offline=True)
+    assert config.api_key == "lm-studio-local" and config.offline is True
+    assert "k" * 32 not in repr(config)
+
+
+def test_offline_without_any_key_or_base_url_resolves(monkeypatch):
+    config = Config.resolve(offline=True)
+    assert config.api_key == "lm-studio-local" and config.base_url is None
+
+
+def test_offline_resolve_turns_the_guard_on_and_exports_the_flag():
+    import os
+
+    from advent_core import offline
+
+    assert offline.is_enabled() is False
+    Config.resolve(base_url="http://127.0.0.1:1234", offline=True)
+    assert offline.is_enabled() is True and os.environ["ADVENT_OFFLINE"] == "1"
+
+
+def test_offline_from_the_environment(monkeypatch):
+    monkeypatch.setenv("ADVENT_OFFLINE", "1")
+    config = Config.resolve()
+    assert config.offline is True and config.api_key == "lm-studio-local"
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "no"])
+def test_offline_env_falsy_values_do_not_enable(monkeypatch, value):
+    monkeypatch.setenv("ADVENT_OFFLINE", value)
+    monkeypatch.setenv("MISTRAL_API_KEY", "k" * 32)
+    config = Config.resolve()
+    assert config.offline is False and config.api_key == "k" * 32
+
+
+@pytest.mark.parametrize(
+    "url", ["https://api.mistral.ai", "http://10.0.0.5:1234", "http://example.com:1234/v1"]
+)
+def test_offline_with_a_non_loopback_base_url_is_a_config_error(url):
+    with pytest.raises(ConfigError) as exc:
+        Config.resolve(base_url=url, offline=True)
+    assert "loopback" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "url", ["http://127.0.0.1:1234", "http://localhost:1234", "http://[::1]:1234", "localhost:1234"]
+)
+def test_loopback_urls_are_accepted(url):
+    from advent_core.config import is_loopback_url, validate_loopback_url
+
+    assert is_loopback_url(url) is True
+    assert validate_loopback_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1.evil.example",
+        "http://localhost.evil.example",
+        "http://evil.example/127.0.0.1",
+        "http://user@evil.example:80/@127.0.0.1",
+        "",
+        None,
+    ],
+)
+def test_lookalike_hosts_are_not_loopback(url):
+    from advent_core.config import is_loopback_url
+
+    assert is_loopback_url(url) is False
+
+
+# --- day 27 review: a non-loopback base_url keeps the real key and the SDK path ----
+
+
+def test_non_loopback_base_url_keeps_the_real_key(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "k" * 32)
+    config = Config.resolve(base_url="https://api.mistral.ai")
+    assert config.api_key == "k" * 32 and config.is_local is False
+
+
+def test_non_loopback_base_url_without_a_key_still_asks_for_it():
+    with pytest.raises(ConfigError) as exc:
+        Config.resolve(base_url="https://api.mistral.ai")
+    assert "MISTRAL_API_KEY" in str(exc.value)
+
+
+def test_loopback_base_url_gets_the_stub_key_and_is_local(monkeypatch):
+    monkeypatch.setenv("MISTRAL_API_KEY", "k" * 32)
+    config = Config.resolve(base_url="http://127.0.0.1:1234")
+    assert config.api_key == "lm-studio-local" and config.is_local is True
+
+
+# --- day 27 review: full URL validation, no traceback -------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:bad",
+        "http://127.0.0.1:99999",
+        "http://127.0.0.1@evil.com",
+        "http://user:pw@127.0.0.1:1234",
+        "ftp://127.0.0.1:1234",
+        "file://127.0.0.1/x",
+    ],
+)
+def test_offline_rejects_malformed_or_tricky_urls_with_exit_2(url):
+    with pytest.raises(ConfigError) as exc:
+        Config.resolve(base_url=url, offline=True)
+    assert exc.value.exit_code == 2
+
+
+@pytest.mark.parametrize(
+    "url", ["http://127.0.0.1:bad", "http://127.0.0.1@evil.com", "ftp://127.0.0.1"]
+)
+def test_malformed_urls_are_not_loopback(url):
+    from advent_core.config import is_loopback_url
+
+    assert is_loopback_url(url) is False

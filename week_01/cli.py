@@ -116,6 +116,9 @@ NON_CHAT_PARAMS = {
     "rag_k_before": "adventagent и adventrag (неделя 05)",
     "rag_threshold": "adventagent и adventrag (неделя 05)",
     "rag_cite": "adventagent и adventrag (неделя 05)",
+    "rag_aux_reasoning": "adventagent (неделя 06)",
+    # Local-server reasoning display (day 27): the agent REPL only.
+    "show_thinking": "adventagent (неделя 06)",
 }
 
 REPL_COMMANDS = [

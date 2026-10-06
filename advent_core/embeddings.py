@@ -17,12 +17,43 @@ from pathlib import Path
 
 import numpy as np
 
+from advent_core import openai_compat
 from advent_core.config import redact
 from advent_core.errors import AdventError, translate
 from advent_core.journal import log_internal_call
 from advent_core.telemetry import CallResult, Usage
 
 DEFAULT_EMBED_MODEL = "mistral-embed"
+NOMIC_EMBED_MODEL = "text-embedding-nomic-embed-text-v1.5"
+BGE_M3_EMBED_MODEL = "text-embedding-bge-m3"
+LOCAL_EMBED_MODEL = BGE_M3_EMBED_MODEL
+
+
+@dataclass(frozen=True, slots=True)
+class EmbedModelSpec:
+    dim: int
+    max_tokens: int
+    local: bool
+    doc_prefix: str = ""
+    query_prefix: str = ""
+    chunk_cap: int = 0  # local only: max chunk chars the model embeds whole (0 = no cap)
+
+
+# Prefixes from the nomic-embed-text-v1.5 model card (checked 2026-10-06):
+# `search_document: <text>` for corpus texts, `search_query: <text>` for queries.
+EMBED_MODELS: dict[str, EmbedModelSpec] = {
+    "mistral-embed": EmbedModelSpec(dim=1024, max_tokens=8192, local=False),
+    NOMIC_EMBED_MODEL: EmbedModelSpec(
+        dim=768,
+        max_tokens=2048,
+        local=True,
+        doc_prefix="search_document: ",
+        query_prefix="search_query: ",
+        chunk_cap=1600,
+    ),
+    # bge-m3: dense retrieval takes no prefixes (model card); cap measured 2026-10-06.
+    BGE_M3_EMBED_MODEL: EmbedModelSpec(dim=1024, max_tokens=2048, local=True, chunk_cap=4000),
+}
 
 # Verified 2026-09-28 on docs.mistral.ai/models/mistral-embed-23-12.
 PRICE_PER_M_TOKENS: dict[str, float] = {"mistral-embed": 0.10}
@@ -45,6 +76,9 @@ _INPUT_ID_RE = re.compile(r"Input id (\d+) has (\d+) tokens")
 
 def embed_cost_usd(model: str, tokens: int | None) -> float | None:
     """USD cost for `tokens` prompt tokens on `model`; None when either is unknown."""
+    spec = EMBED_MODELS.get(model)
+    if spec is not None and spec.local:
+        return 0.0
     price = PRICE_PER_M_TOKENS.get(model)
     if price is None or tokens is None:
         return None
@@ -422,3 +456,67 @@ def embed_texts(
         requests=total_requests,
         latency_ms=total_latency_ms,
     )
+
+
+def embed_local(
+    url: str | None,
+    model: str,
+    texts: list[str],
+    *,
+    kind: str = "doc",
+    prefix: str | None = None,
+    on_batch: Callable[[int, int], None] | None = None,
+    week: int = 5,
+    day: int | None = 21,
+    journal_path: Path | None = None,
+    journal_extra: dict | None = None,
+) -> EmbedResult:
+    """Embed `texts` on a local OpenAI-compatible server, adding the model's prefix.
+
+    `kind` is "doc" or "query" and picks the table prefix; an explicit `prefix`
+    (e.g. the one stored in an index run) wins. Dimension is checked against
+    the table. Row i of the result is texts[i].
+    """
+    if kind not in ("doc", "query"):
+        raise ValueError(f"kind must be 'doc' or 'query', got {kind!r}")
+    spec = EMBED_MODELS.get(model)
+    if prefix is None:
+        prefix = (spec.doc_prefix if kind == "doc" else spec.query_prefix) if spec else ""
+    t0 = time.monotonic()
+    try:
+        result = openai_compat.embed(
+            url,
+            model,
+            [prefix + t for t in texts],
+            expected_dim=spec.dim if spec else None,
+            on_batch=on_batch,
+        )
+    except AdventError:
+        _journal(
+            model=model,
+            model_actual=None,
+            usage=Usage(),
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            status="error",
+            n_inputs=len(texts),
+            chars=sum(len(t) for t in texts),
+            week=week,
+            day=day,
+            journal_path=journal_path,
+            journal_extra={"endpoint": "local", **(journal_extra or {})},
+        )
+        raise
+    _journal(
+        model=model,
+        model_actual=result.model,
+        usage=Usage(prompt_tokens=result.prompt_tokens),
+        latency_ms=result.latency_ms,
+        status="ok",
+        n_inputs=len(texts),
+        chars=sum(len(t) for t in texts),
+        week=week,
+        day=day,
+        journal_path=journal_path,
+        journal_extra={"endpoint": "local", **(journal_extra or {})},
+    )
+    return result

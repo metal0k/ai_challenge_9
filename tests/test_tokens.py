@@ -303,3 +303,56 @@ def test_unknown_context_limit_is_none_not_a_number():
     assert context_limit({}) is None
     assert context_limit({"max_context_length": 0}) is None
     assert context_limit({"max_context_length": True}) is None
+
+
+# --- offline: cache-only до любой загрузки ---------------------------------------
+
+
+def test_offline_counter_for_never_downloads_and_degrades_to_estimate(tmp_path, monkeypatch):
+    from advent_core import offline
+
+    offline.enable()
+
+    def _never(repo_id, target):
+        raise AssertionError("в offline скачивание не должно даже начинаться")
+
+    monkeypatch.setattr(tokens_mod, "download_tokenizer", _never)
+    said: list[str] = []
+    counter, warning = counter_for(
+        "ministral-14b-latest", cache_dir=tmp_path, on_notice=said.append
+    )
+    assert counter.exact is False and warning is not None
+    assert said == []  # no "качаю токенизатор" announcement either
+
+
+def test_offline_counter_for_still_uses_a_warm_cache(tmp_path):
+    from advent_core import offline
+
+    repo = repo_for_model("ministral-14b-latest")
+    cached = tokens_mod._cache_path(repo, tmp_path)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(_bundled_tekken().read_bytes())
+    offline.enable()
+    counter, warning = counter_for("ministral-14b-latest", cache_dir=tmp_path)
+    assert warning is None and counter.exact is True
+
+
+@pytest.mark.allow_cloud_attempts
+def test_offline_direct_download_raises_cloud_blocked_not_tokenizer_unavailable(tmp_path):
+    from advent_core import offline
+    from advent_core.errors import CloudBlockedError
+
+    offline.enable()
+    with pytest.raises(CloudBlockedError) as info:
+        tokens_mod.download_tokenizer("mistralai/x", tmp_path / "t.json")
+    assert "mistralai/x" in info.value.message
+    assert not (tmp_path / "t.json").exists()
+
+
+def test_offline_flag_from_env_alone_is_enough(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADVENT_OFFLINE", "1")
+    monkeypatch.setattr(
+        tokens_mod, "download_tokenizer", lambda *a: (_ for _ in ()).throw(AssertionError("net"))
+    )
+    counter, _warning = counter_for("ministral-14b-latest", cache_dir=tmp_path)
+    assert counter.exact is False

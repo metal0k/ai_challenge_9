@@ -22,8 +22,9 @@ from typing import Any, Protocol
 
 import httpx
 
+from advent_core import offline
 from advent_core.chat import Message
-from advent_core.config import LOG_DIR
+from advent_core.config import LOG_DIR, offline_env
 
 # Таблица «имя модели в API → repo id на HuggingFace». ВТОРОЙ ИСТОЧНИК ИСТИНЫ
 # и известный риск (SPEC-w02d06.md §21.1): имена в API и на HF живут своей
@@ -212,6 +213,10 @@ def download_tokenizer(repo: str, target: Path) -> Path:
     середине, а недокачанный файл в кэше — это точный счётчик, который молча
     не открывается при каждом следующем запуске.
     """
+    # Outside the broad except below: a blocked download must stay loud, not
+    # degrade to "tokenizer unavailable".
+    if offline.is_enabled() or offline_env():
+        offline.assert_cloud_allowed(f"загрузка токенизатора {repo} с huggingface.co")
     url = HF_FILE_URL.format(repo=repo)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f"{target.name}.{os.getpid()}.part")
@@ -276,6 +281,9 @@ def counter_for(
     print: он зовётся ДО скачки, потому что скачка идёт минуты, а молчащий
     процесс между «сессия default» и приглашением выглядит как зависший.
     """
+    if offline.is_enabled() or offline_env():
+        # Cache-only before any download is even considered.
+        download = False
     repo = repo_for_model(model)
     if repo is None:
         return (

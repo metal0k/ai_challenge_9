@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from contextlib import suppress
 
 import typer
@@ -257,15 +259,57 @@ class LabelledChunks:
 
     def __init__(self) -> None:
         self.label_printed = False
+        self.reasoning_open = False
 
     def __call__(self, text: str) -> None:
         self.ensure_label()
+        self.close_reasoning()
         write_chunk(text)
+
+    def reasoning(self, text: str) -> None:
+        """Dim reasoning delta on stderr, between the label and the answer."""
+        self.ensure_label()
+        self.reasoning_open = True
+        err.print(text, style="dim", end="", markup=False, highlight=False, soft_wrap=True)
+
+    def close_reasoning(self) -> None:
+        if self.reasoning_open:
+            self.reasoning_open = False
+            err.print("")
 
     def ensure_label(self) -> None:
         if not self.label_printed:
             self.label_printed = True
             answer_label()
+
+
+class ticker:  # noqa: N801 - used as a context manager, like a function
+    """stderr pulse `  … N s (label)` every `interval` s while the block runs.
+
+    For calls that show no streamed text: no static screen longer than the
+    interval. The thread stops in __exit__, errors included.
+    """
+
+    def __init__(self, label: str, *, interval: float = 3.0) -> None:
+        self.label = label
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._start = 0.0
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            seconds = int(time.monotonic() - self._start)
+            err.print(f"  … {seconds} s ({self.label})", style="dim", markup=False)
+
+    def __enter__(self) -> ticker:
+        self._start = time.monotonic()
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
 
 
 def note(message: str) -> None:

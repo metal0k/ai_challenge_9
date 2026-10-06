@@ -299,6 +299,25 @@ def test_check_comparable_rejects_different_corpus_rev():
         check_comparable(runs, ["fixed", "structure"])
 
 
+@pytest.mark.parametrize(
+    ("field", "left", "right"),
+    [
+        ("endpoint", "cloud", "local"),
+        ("dim", 4, 8),
+        ("doc_prefix", "search_document: ", ""),
+        ("query_prefix", "search_query: ", "query: "),
+    ],
+)
+def test_check_comparable_rejects_a_different_vector_space_field(field, left, right):
+    runs = {
+        "fixed": _run_info(strategy="fixed", **{field: left}),
+        "structure": _run_info(strategy="structure", **{field: right}),
+    }
+    with pytest.raises(AdventError) as info:
+        check_comparable(runs, ["fixed", "structure"])
+    assert "нечестным" in info.value.message
+
+
 def test_check_comparable_rejects_missing_strategy():
     runs = {"fixed": _run_info(strategy="fixed")}
     with pytest.raises(AdventError):

@@ -53,6 +53,16 @@ class MCPError(AdventError):
     exit_code = 8
 
 
+class CloudBlockedError(AdventError):
+    """Offline mode refused a request to a non-loopback host (advent_core.offline).
+
+    Lives here, not in offline.py: offline imports config, config is imported by
+    errors, and the class has to be an AdventError at import time.
+    """
+
+    exit_code = 2
+
+
 class ConfigurationError(AdventError):
     """Ошибка конфигурации, долетевшая до слоя chat.py (обычно из formats.py).
 

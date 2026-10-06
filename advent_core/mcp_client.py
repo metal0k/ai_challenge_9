@@ -253,11 +253,14 @@ async def aconnect_and_list(
     sink: Callable[[str], None],
     cwd: Path | None = None,
     quiet: bool = False,
+    env: dict[str, str] | None = None,
 ) -> ListResult:
     if not server_cmd:
         raise MCPError("команда сервера пустая", hint='Передайте --server "<команда>".')
+    # env=None keeps the SDK default (safe subset of the parent env); a dict is
+    # merged over it, so e.g. MISTRAL_API_KEY="" is passed explicitly.
     params = StdioServerParameters(
-        command=server_cmd[0], args=server_cmd[1:], cwd=cwd, encoding="utf-8"
+        command=server_cmd[0], args=server_cmd[1:], cwd=cwd, env=env, encoding="utf-8"
     )
     # The tap is always on so non-JSON output is detected; frames are mirrored
     # to the sink only with --raw.
@@ -355,13 +358,14 @@ def connect_and_list(
     sink: Callable[[str], None],
     cwd: Path | None = None,
     quiet: bool = False,
+    env: dict[str, str] | None = None,
 ) -> ListResult:
     # The SDK logs a rich traceback for every unparsable stdout line; we report
     # the cause ourselves (as advent_cli/obs.py does for obsws_python).
     with _quiet_sdk_logger():
         return anyio.run(
             lambda: aconnect_and_list(
-                server_cmd, timeout=timeout, raw=raw, sink=sink, cwd=cwd, quiet=quiet
+                server_cmd, timeout=timeout, raw=raw, sink=sink, cwd=cwd, quiet=quiet, env=env
             )
         )
 
@@ -380,12 +384,13 @@ async def acall_tool(
     timeout: float,
     cwd: Path | None = None,
     quiet: bool = False,
+    env: dict[str, str] | None = None,
 ) -> ToolCallOutcome:
     """One short-lived subprocess: spawn, handshake, call, close. No long-lived connection."""
     if not server_cmd:
         raise MCPError("команда сервера пустая", hint='Передайте --server "<команда>".')
     params = StdioServerParameters(
-        command=server_cmd[0], args=server_cmd[1:], cwd=cwd, encoding="utf-8"
+        command=server_cmd[0], args=server_cmd[1:], cwd=cwd, env=env, encoding="utf-8"
     )
     non_frames: list[Exception] = []
     stdio = _stdio(params, quiet)
@@ -418,8 +423,11 @@ def call_tool_once(
     timeout: float,
     cwd: Path | None = None,
     quiet: bool = False,
+    env: dict[str, str] | None = None,
 ) -> ToolCallOutcome:
     with _quiet_sdk_logger():
         return anyio.run(
-            lambda: acall_tool(server_cmd, name, arguments, timeout=timeout, cwd=cwd, quiet=quiet)
+            lambda: acall_tool(
+                server_cmd, name, arguments, timeout=timeout, cwd=cwd, quiet=quiet, env=env
+            )
         )

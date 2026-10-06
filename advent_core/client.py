@@ -12,6 +12,7 @@ from contextlib import contextmanager
 import httpx
 from mistralai.client import Mistral
 
+from advent_core import offline
 from advent_core.config import Config
 from advent_core.errors import translate
 
@@ -120,6 +121,7 @@ def mistral_client(config: Config) -> Iterator[Mistral]:
     общий бюджет 60s. Этого хватает, чтобы пережить всплеск лимита, и не
     настолько много, чтобы демо зависло перед камерой.
     """
+    offline.init_from_env()  # a child process inherits ADVENT_OFFLINE=1
     # Локальный сервер (LM Studio) держит один запрос за раз и отвечает
     # секундами, особенно на reasoning-моделях — дефолтный таймаут SDK этого
     # не переживёт. 600000 мс — тот же бюджет, что и у общего retry ниже, с
@@ -161,12 +163,17 @@ def list_models(config: Config) -> list[dict]:
     заглушка (см. Config.resolve), лишний заголовок ничего не портит.
     """
     url = f"{config.base_url}/v1/models" if config.base_url else MODELS_URL
+    offline.init_from_env()
+    # A local/offline call must not be re-routed: no env proxy (HTTP_PROXY would
+    # send even a loopback request to an external host) and no redirects.
+    isolated = config.is_local or config.offline or offline.is_enabled()
     try:
-        response = httpx.get(
-            url,
-            headers={"Authorization": f"Bearer {config.api_key}"},
-            timeout=30.0,
-        )
+        headers = {"Authorization": f"Bearer {config.api_key}"}
+        if isolated:
+            with httpx.Client(timeout=30.0, trust_env=False, follow_redirects=False) as http:
+                response = http.get(url, headers=headers)
+        else:
+            response = httpx.get(url, headers=headers, timeout=30.0)
         response.raise_for_status()
     except Exception as exc:
         raise translate(exc) from exc

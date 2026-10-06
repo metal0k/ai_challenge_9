@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import sys
+import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import typer
@@ -31,7 +33,7 @@ from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from advent_core import chat as chat_core
-from advent_core import console, formats, mcp_router, profiles, tokens
+from advent_core import console, formats, mcp_router, offline, openai_compat, profiles, tokens
 from advent_core.agent import (
     MAX_TOOL_ROUNDS,
     Agent,
@@ -56,7 +58,7 @@ from advent_core.config import (
     configured_secrets,
     redact,
 )
-from advent_core.errors import AdventError, MCPError
+from advent_core.errors import AdventError, CloudBlockedError, MCPError
 from advent_core.facts import format_facts, render_note, validate_key
 from advent_core.invariants import (
     INVARIANTS_STATE_KEY,
@@ -147,6 +149,11 @@ RAG_WEEK = 5
 RAG_DAY_PLAIN = 22
 RAG_DAY_FULL = 23
 RAG_DAY_CITE = 24
+
+# `--local`: the model and the index of the all-local mode (day 27).
+LOCAL_MODEL = "ornith"
+LOCAL_RAG_DB = Path(__file__).resolve().parent.parent / "data" / "rag" / "index.local.sqlite3"
+LOCAL_NO_KEY = "облако отключено"
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 # Персона агента — своя, а не общекурсовая «лаконичный ассистент, без воды»:
@@ -250,6 +257,11 @@ class AgentShell:
     # пользователя не наш, чтобы его игнорировать — то же правило, по которому
     # --system перекрывает персону проекта.
     explicit: frozenset[str] = frozenset()
+    # Index file override (`--rag-db`); None = the mode's default.
+    rag_db: Path | None = None
+    # Card of the model on a local server (state, loaded window); None for the cloud.
+    local_model: openai_compat.LocalModel | None = None
+    started_at: float = field(default_factory=time.monotonic)
 
     models: list[dict] = field(default_factory=list)
     card: dict | None = None
@@ -429,7 +441,10 @@ class AgentShell:
             on_warning=console.warn,
         )
         # No I/O here: the index is touched only when `rag` is on.
-        self.agent.retrieve = _rag_retriever()
+        self.agent.retrieve = _rag_retriever(**self.rag_target())
+        if self.config.is_local:
+            # A local call can think for minutes with nothing to print: pulse on stderr.
+            self.agent.progress = console.ticker
         # The session's own `mcp_enabled` was parsed before the agent existed.
         self._restore_mcp()
         if self.config.params.context_limit is not None:
@@ -456,10 +471,62 @@ class AgentShell:
 
     # --- модель ------------------------------------------------------------
 
+    @property
+    def is_local(self) -> bool:
+        """`--local`: a loopback server and the cloud shut off (offline guard)."""
+        return bool(self.config.offline and self.config.base_url)
+
+    def rag_target(self) -> dict:
+        """Index path and aux config for the retriever; empty for the cloud default."""
+        target: dict = {}
+        if self.rag_db is not None:
+            target["db_path"] = self.rag_db
+        elif self.is_local:
+            target["db_path"] = LOCAL_RAG_DB
+        if self.is_local:
+            # The live config: /model changes reach rewrite/rerank too.
+            target["aux_config"] = self.config
+        return target
+
+    def _rag_check_kwargs(self) -> dict:
+        db = self.rag_target().get("db_path")
+        return {"db_path": db} if db is not None else {}
+
+    def _refresh_local_model(self) -> None:
+        """State and loaded window of the model on a local server.
+
+        `--local` is strict (a model that is not loaded, or a server without
+        `state`, refuses before the first turn); a bare `--base-url` only uses
+        the numbers when they are there.
+        """
+        base = self.config.base_url
+        if not base or not self.config.is_local:
+            self.local_model = None
+            return
+        strict = self.is_local
+        try:
+            listed = openai_compat.server_status(base)
+            if strict:
+                self.local_model = openai_compat.check_ready(
+                    listed, self.config.model, base, require_state=True
+                )
+            else:
+                self.local_model = next((m for m in listed if m.id == self.config.model), None)
+        except CloudBlockedError:
+            raise
+        except AdventError:
+            self.local_model = None
+            if strict:
+                raise
+
     def refresh(self) -> None:
         """Перечитывает список моделей и проверяет, что текущая существует."""
+        self._refresh_local_model()
         try:
             self.models = list_models(self.config)
+        except CloudBlockedError:
+            # Not a convenience failure: the guard fired, say so.
+            raise
         except AdventError:
             # Список — удобство (отсев параметров, окно контекста, /model
             # info), а не условие работы: ошибка всплывёт на самом запросе и
@@ -489,7 +556,13 @@ class AgentShell:
         `or` безопасен: нулевое значение сюда не доходит, а None означает
         «карточка».
         """
-        return self.config.params.context_limit or tokens.context_limit(self.card)
+        override = self.config.params.context_limit
+        if override:
+            return override
+        # Server's loaded window beats the card: LM Studio's /v1/models has none.
+        if self.local_model is not None and self.local_model.loaded_context_length:
+            return self.local_model.loaded_context_length
+        return tokens.context_limit(self.card)
 
     @property
     def resolved(self) -> str | None:
@@ -790,6 +863,7 @@ class AgentShell:
                     f"context_strategy={raw_strategy!r} — игнор"
                 )
         self._apply_session_rag(session, check_explicit=check_explicit)
+        self._apply_session_thinking(session, check_explicit=check_explicit)
         self._apply_session_mcp(session)
         self._apply_session_summary(session)
         self._apply_session_facts(session)
@@ -813,6 +887,7 @@ class AgentShell:
             "rag_rewrite": lambda v: isinstance(v, bool),
             "rag_rerank": lambda v: isinstance(v, bool),
             "rag_cite": lambda v: isinstance(v, bool),
+            "rag_aux_reasoning": lambda v: isinstance(v, bool),
             "rag_k_before": lambda v: isinstance(v, int) and not isinstance(v, bool),
             "rag_threshold": lambda v: (
                 isinstance(v, int | float)
@@ -838,7 +913,7 @@ class AgentShell:
                 self.config.params.apply_defaults(AGENT_COMMAND)
         if self.config.params.rag:
             try:
-                _rag_check_index(self.config.params.rag_strategy)
+                _rag_check_index(self.config.params.rag_strategy, **self._rag_check_kwargs())
             except AdventError as error:
                 self.config.params.set("rag", False)
                 console.warn(f"rag не включён: {_with_hint(error)}")
@@ -846,6 +921,23 @@ class AgentShell:
         if self.config.params.rag_cite and not self.config.params.rag:
             self.config.params.set("rag_cite", False)
             console.warn("rag_cite не включён: rag выключен")
+
+    def _apply_session_thinking(self, session: Session, *, check_explicit: bool) -> None:
+        """`show_thinking`: absent keeps, null resets to the default, a bool applies.
+
+        `--no-thinking` (explicit) beats the file at startup; anything else warns.
+        """
+        if (check_explicit and "show_thinking" in self.explicit) or (
+            "show_thinking" not in session.state
+        ):
+            return
+        raw = session.state["show_thinking"]
+        if raw is not None and not isinstance(raw, bool):
+            console.warn(f"в файле сессии {session.name} негодное show_thinking={raw!r} — игнор")
+            return
+        self.config.params.set("show_thinking", raw)
+        if raw is None:
+            self.config.params.apply_defaults(AGENT_COMMAND)
 
     def _apply_session_mcp(self, session: Session) -> None:
         """Reads the `mcp_enabled` key — three cases, like `context_limit` above.
@@ -1284,6 +1376,11 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
     streaming = chat_core.should_stream(shell.config)
     chunks = console.LabelledChunks()
     facts_before = dict(shell.facts)
+    # Reasoning is shown only for the main streamed answer on a local server;
+    # the kwarg goes only when set, so cloud turns call ask() as before.
+    ask_extra: dict = {}
+    if streaming and shell.config.is_local and shell.config.params.show_thinking is not False:
+        ask_extra["on_reasoning"] = chunks.reasoning
     try:
         reply = shell.agent.ask(
             question,
@@ -1299,8 +1396,10 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
             task=shell.task,
             invariants=shell.invariants,
             on_chunk=chunks if streaming else None,
+            **ask_extra,
         )
     except AdventError as error:
+        chunks.close_reasoning()
         # Compaction/facts, if either happened, happened BEFORE the failure —
         # so both are salvaged and reported first, in the order things
         # actually occurred.
@@ -1324,6 +1423,7 @@ def _ask(shell: AgentShell, question: str, history: list[chat_core.Message]) -> 
         )
         return None
 
+    chunks.close_reasoning()
     if reply.invariant_assessment is not None and reply.invariant_result is not None:
         _report_invariant_assessment(shell, reply.invariant_assessment, reply.invariant_result)
         if reply.invariant_assessment.blocked:
@@ -1857,6 +1957,9 @@ def _save_state(shell: AgentShell) -> None:
     shell.session.state["rag_threshold"] = rag_settings.threshold
     # Day 24, additive (no SESSION_VERSION bump): absent in older files.
     shell.session.state["rag_cite"] = rag_settings.cite
+    shell.session.state["rag_aux_reasoning"] = rag_settings.aux_reasoning
+    # Day 27 review: a UX setting, additive like the rag keys; None = command default.
+    shell.session.state["show_thinking"] = shell.config.params.show_thinking
     shell.session.state["facts"] = shell.facts
     shell.session.state["facts_pinned"] = list(shell.facts_pinned)
     shell.session.state["facts_upto"] = shell.facts_upto
@@ -2335,7 +2438,7 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
     # BEFORE the confirmation, and the value goes back to what it was.
     if (name == "rag" and value) or (name == "rag_strategy" and shell.agent.rag_enabled):
         try:
-            _rag_check_index(shell.agent.rag_strategy)
+            _rag_check_index(shell.agent.rag_strategy, **shell._rag_check_kwargs())
         except AdventError as error:
             if name == "rag":
                 shell.config.params.set("rag", False)
@@ -2380,7 +2483,15 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
         # Негодный или съедаемый stop'ом маркер надо поймать сейчас, а не
         # тогда, когда диалог не закончится ни разу.
         _warn_text(shell.agent.check_done())
-    if name in ("mode", "done", "context_limit", "context_strategy", "compact", *RAG_PARAMS):
+    if name in (
+        "mode",
+        "done",
+        "context_limit",
+        "context_strategy",
+        "compact",
+        "show_thinking",
+        *RAG_PARAMS,
+    ):
         # Значение применилось — сразу в файл: `/mode dialog` → `/exit` без
         # хода иначе терял бы режим (save после хода тут не случится). Точка
         # записи context_limit — та же (SPEC-w02d08.md §4).
@@ -2477,6 +2588,7 @@ RAG_PARAMS = (
     "rag_k_before",
     "rag_threshold",
     "rag_cite",
+    "rag_aux_reasoning",
 )
 
 
@@ -2489,7 +2601,7 @@ def _cite_conflict(shell: AgentShell) -> str | None:
     return None
 
 
-def _rag_retriever():
+def _rag_retriever(db_path: Path | None = None, aux_config: Config | None = None):
     # The repo's second deliberate cross-week import (the first is week_04's
     # server command in _mcp_enable): the agent's REPL retrieves from the index
     # that week_05 builds, and the search is week_05's own business. Inlining
@@ -2507,16 +2619,22 @@ def _rag_retriever():
             day = RAG_DAY_FULL
         else:
             day = RAG_DAY_PLAIN
-        return make_retriever(day=day, aux_day=day)(question, settings)
+        # Only what is set: the cloud call stays exactly as it was.
+        extra: dict = {}
+        if db_path is not None:
+            extra["db_path"] = db_path
+        if aux_config is not None:
+            extra["aux_config"] = aux_config
+        return make_retriever(day=day, aux_day=day, **extra)(question, settings)
 
     return retrieve
 
 
-def _rag_check_index(strategy: str):
+def _rag_check_index(strategy: str, *, db_path: Path | None = None):
     """RunInfo of the index for `strategy`; raises AdventError when it is missing."""
     from week_05.rag import check_index  # see _rag_retriever for why it is local
 
-    return check_index(None, strategy)
+    return check_index(db_path, strategy)
 
 
 def _with_hint(error: AdventError) -> str:
@@ -2568,7 +2686,7 @@ def _cmd_rag(shell: AgentShell, args: list[str]) -> bool:
         return False
     strategy = shell.agent.rag_strategy
     try:
-        info = _rag_check_index(strategy)
+        info = _rag_check_index(strategy, **shell._rag_check_kwargs())
     except AdventError as error:
         console.note(f"rag: on · индекс недоступен ({error.message})")
         return False
@@ -2706,7 +2824,37 @@ def _mcp_function_tools(tools: list) -> list[dict]:
     ]
 
 
-def _mcp_bridge(command: list[str]) -> Callable[[str, dict], object]:
+def _mcp_env(shell: AgentShell) -> dict[str, str] | None:
+    """Explicit env of an MCP child. `--local`: offline guard on, summarizer on the
+    local model, and no cloud key even if the child's .env has one (empty wins)."""
+    if not shell.is_local:
+        return None
+    env = {
+        "ADVENT_OFFLINE": "1",
+        "ADVENT_BASE_URL": str(shell.config.base_url),
+        "ADVENT_SUMMARIZE_MODEL": shell.config.model,
+        "MISTRAL_API_KEY": "",
+    }
+    if timeout := os.environ.get("ADVENT_MCP_TIMEOUT"):
+        env["ADVENT_MCP_TIMEOUT"] = timeout
+    return env
+
+
+def _mcp_timeout(shell: AgentShell, default: float) -> float:
+    """`ADVENT_MCP_TIMEOUT` (seconds) overrides the budget in `--local` only."""
+    if shell.is_local:
+        try:
+            value = float(os.environ.get("ADVENT_MCP_TIMEOUT", ""))
+        except ValueError:
+            return default
+        if value > 0:
+            return value
+    return default
+
+
+def _mcp_bridge(
+    command: list[str], env: dict[str, str] | None = None, timeout: float = MCP_TIMEOUT
+) -> Callable[[str, dict], object]:
     """The "call a tool" closure for Agent.call_tool.
 
     Per Agent's contract (advent_core/agent.py) this callback NEVER raises —
@@ -2721,7 +2869,8 @@ def _mcp_bridge(command: list[str]) -> Callable[[str, dict], object]:
 
     def call(name: str, arguments: dict) -> object:
         try:
-            return mcp_client.call_tool_once(command, name, arguments, timeout=MCP_TIMEOUT)
+            extra = {"env": env} if env is not None else {}
+            return mcp_client.call_tool_once(command, name, arguments, timeout=timeout, **extra)
         except MCPError as error:
             return mcp_client.ToolCallOutcome(text=error.message, is_error=True)
         except Exception as error:
@@ -2784,12 +2933,18 @@ def _mcp_enable_registry(shell: AgentShell) -> bool:
         console.warn(f"инструменты не подключены: {error.message}")
         _warn_text(error.hint)
         return False
+    if shell.is_local:
+        override = _mcp_timeout(shell, 0.0)
+        if override:
+            specs = [replace(spec, timeout=override) for spec in specs]
     console.note(f"подключаю серверов: {len(specs)} (первый запуск npx может занять до минуты)")
     router = mcp_router.Router(
         specs,
         trace=console.note,
         journal=_mcp_route_journal(shell),
         current_round=lambda: shell.agent.tool_round,
+        env=_mcp_env(shell),
+        offline=shell.is_local,
     )
     report = router.connect()
     for warning in report.warnings:
@@ -2864,14 +3019,19 @@ def _mcp_enable(shell: AgentShell) -> bool:
     from week_04.client import default_server_command
 
     command = default_server_command()
+    env = _mcp_env(shell)
+    timeout = _mcp_timeout(shell, MCP_TIMEOUT)
+    # Only when set: the cloud call keeps its old shape.
+    env_kwargs = {"env": env} if env is not None else {}
     try:
         listing = mcp_client.connect_and_list(
             command,
-            timeout=MCP_TIMEOUT,
+            timeout=timeout,
             raw=False,
             # The protocol mirror is only for `adventmcp tools --raw`; here it
             # would be noise in the middle of a conversation.
             sink=lambda _line: None,
+            **env_kwargs,
         )
     except MCPError as error:
         console.warn(f"инструменты не подключены: {error.message}")
@@ -2879,7 +3039,7 @@ def _mcp_enable(shell: AgentShell) -> bool:
         return False
 
     shell.agent.tools = _mcp_function_tools(listing.tools)
-    shell.agent.call_tool = _mcp_bridge(command)
+    shell.agent.call_tool = _mcp_bridge(command, env, timeout)
     shell.agent.mcp_enabled = True
     shell.mcp_router = None
     _mcp_apply_rounds(shell)
@@ -3489,6 +3649,47 @@ def _profile_pairs(pairs: list[str]) -> dict[str, str]:
         profiles.validate_value(value)
         values[key] = value
     return values
+
+
+def _host_port(url: str | None) -> str:
+    return (url or "").split("://", 1)[-1].rstrip("/")
+
+
+@command(
+    "/local",
+    "локальный режим: сервер, модели, окно, счётчики вызовов (локальных и облачных)",
+)
+def _cmd_local(shell: AgentShell, args: list[str]) -> bool:
+    """The proof screen: product to stdout, like /tokens."""
+    if not shell.is_local:
+        console.out.print("локальный режим выключен — запусти `adventagent --local`", markup=False)
+        return False
+    base = str(shell.config.base_url)
+    lines = [f"сервер: {_host_port(base)}"]
+    try:
+        listed = openai_compat.server_status(base)
+    except AdventError as error:
+        listed = []
+        lines.append(f"список моделей недоступен: {error.message}")
+    chat_id = shell.config.model
+    found = next((m for m in listed if m.id == chat_id), shell.local_model)
+    state = f", {found.state}" if found is not None and found.state else ""
+    lines.append(f"чат-модель: {chat_id}{state}")
+    embeds = [m for m in listed if m.type == "embeddings"]
+    if embeds:
+        lines.append("embed-модели: " + ", ".join(f"{m.id} ({m.state or '?'})" for m in embeds))
+    lines.append(f"окно: {_num(shell.agent.context_limit)} токенов")
+    counts = offline.counters()
+    lines.append(
+        f"вызовов: локальных {counts.completed['local']}, "
+        f"облачных {counts.attempted['cloud']} "
+        f"(заблокировано {counts.blocked['cloud']})"
+    )
+    lines.append(f"токены сессии: {_session_tokens_label(shell)}")
+    lines.append(f"время сессии: {int(time.monotonic() - shell.started_at)} с")
+    for line in lines:
+        console.out.print(line, markup=False, highlight=False)
+    return False
 
 
 @command("/tokens", "разбивка по токенам: сессия, окно контекста, сверка с сервером")
@@ -4907,7 +5108,7 @@ def _check_local_param(name: str, value: object) -> None:
 
 
 def _explicit_local_flags(
-    *, mode: str | None, done: str | None, context_limit: int | None
+    *, mode: str | None, done: str | None, context_limit: int | None, no_thinking: bool = False
 ) -> frozenset[str]:
     """Имена local-параметров, заданных флагом запуска явно, а не файлом сессии.
 
@@ -4925,6 +5126,7 @@ def _explicit_local_flags(
             ("mode", mode),
             ("done", done),
             ("context_limit", context_limit),
+            ("show_thinking", False if no_thinking else None),
         )
         if value is not None
     )
@@ -4962,6 +5164,18 @@ def agent(
         "--base-url",
         help="Базовый URL OpenAI-совместимого endpoint "
         "(например http://127.0.0.1:1234 для LM Studio).",
+    ),
+    local: bool = typer.Option(
+        False,
+        "--local",
+        help="Всё локально: LM Studio (ADVENT_LOCAL_URL или http://127.0.0.1:1234), "
+        f"модель {LOCAL_MODEL}, облако отключено, локальный RAG-индекс.",
+    ),
+    no_thinking: bool = typer.Option(
+        False, "--no-thinking", help="Не показывать reasoning локальной модели."
+    ),
+    rag_db: Path | None = typer.Option(
+        None, "--rag-db", help="Файл индекса RAG (в --local: data/rag/index.local.sqlite3)."
     ),
     mode: str | None = typer.Option(
         None, "--mode", help=f"Режим: {', '.join(MODE_CHOICES)} {_default_hint('mode')}."
@@ -5004,6 +5218,11 @@ def agent(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Детали запуска в stderr."),
 ) -> None:
     """Разговор с агентом: память сессии, учёт токенов, режимы chat и dialog."""
+    if local:
+        # --base-url > ADVENT_LOCAL_URL > default. A non-loopback URL is refused by
+        # Config.resolve (offline) with exit 2, before any readiness probe.
+        base_url = base_url or openai_compat.default_url()
+        model = model or LOCAL_MODEL
     config = Config.resolve(
         model=model,
         system=system,
@@ -5016,6 +5235,7 @@ def agent(
         stream=stream,
         verbose=verbose,
         base_url=base_url,
+        offline=True if local else None,
     )
     # Config.resolve() не знает про локальные параметры — кладём их той же
     # машинерией, что и /set, с той же валидацией и теми же ParamError.
@@ -5032,11 +5252,19 @@ def agent(
     # Умолчания приходят из реестра, а не литералами в сигнатуре typer: иначе
     # одно правило записано в двух местах и разъедется при первой правке.
     config.params.apply_defaults(AGENT_COMMAND)
+    if no_thinking:
+        config.params.set("show_thinking", False)
 
     # Какие local-параметры заданы флагами явно — они бьют файл сессии при
     # подхвате state (приоритет «флаг > файл > дефолт реестра»).
-    explicit = _explicit_local_flags(mode=mode, done=done, context_limit=context_limit)
-    shell = AgentShell(config, explicit=explicit)
+    explicit = _explicit_local_flags(
+        mode=mode, done=done, context_limit=context_limit, no_thinking=no_thinking
+    )
+    shell = AgentShell(config, explicit=explicit, rag_db=rag_db)
+    if shell.is_local:
+        console.note(
+            f"локальный режим: {config.model} @ {_host_port(config.base_url)}, {LOCAL_NO_KEY}"
+        )
     if config.verbose:
         counter_name = shell.counter.name if shell.counter else "нет"
         console.note(

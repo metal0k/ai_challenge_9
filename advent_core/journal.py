@@ -10,6 +10,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from advent_core import offline
 from advent_core.chat import Message
 from advent_core.config import LOG_DIR, redact
 from advent_core.telemetry import CallResult
@@ -56,6 +57,9 @@ def log_call(
     }
     for key, value in (extra or {}).items():
         record.setdefault(key, value)
+    if offline.is_enabled():
+        # Offline: every call that got through went to loopback.
+        record.setdefault("endpoint", "local")
 
     target = path or (LOG_DIR / "calls.jsonl")
     try:
@@ -110,6 +114,9 @@ def log_internal_call(
     }
     for key, value in (extra or {}).items():
         record.setdefault(key, value)
+    if offline.is_enabled():
+        # Offline: every call that got through went to loopback.
+        record.setdefault("endpoint", "local")
     target = path or (LOG_DIR / "calls.jsonl")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

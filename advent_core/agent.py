@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -63,6 +64,7 @@ from advent_core.memory import (
     apply_delta as apply_memory_delta,
 )
 from advent_core.params import (
+    DEFAULT_RAG_AUX_REASONING,
     DEFAULT_RAG_K,
     DEFAULT_RAG_K_BEFORE,
     DEFAULT_RAG_STRATEGY,
@@ -562,10 +564,17 @@ class Agent:
         # (day 09's rule, same shape as pending_compaction above).
         self.pending_tool_rounds: list[CallResult] = []
         self._on_warning = on_warning
+        # label -> context manager that prints a timer on stderr while a call is
+        # in flight (aux calls show no reasoning, so silence >5 s needs a pulse).
+        # None = no ticker; the CLI sets it for local servers only.
+        self.progress: Callable[[str], AbstractContextManager[Any]] | None = None
         # Одинаковые предупреждения не повторяются каждый ход: в разговоре на
         # двадцать реплик «лимит окна неизвестен» двадцать раз — это шум, в
         # котором тонет то, что случилось только что.
         self._said: set[str] = set()
+
+    def _ticking(self, label: str) -> AbstractContextManager[Any]:
+        return self.progress(label) if self.progress is not None else nullcontext()
 
     @property
     def call_tool(self) -> Callable[[str, dict[str, Any]], ToolCallOutcome] | None:
@@ -620,6 +629,9 @@ class Agent:
             rerank=bool(p.rag_rerank) or cite,
             threshold=DEFAULT_RAG_THRESHOLD if p.rag_threshold is None else p.rag_threshold,
             cite=cite,
+            aux_reasoning=(
+                DEFAULT_RAG_AUX_REASONING if p.rag_aux_reasoning is None else p.rag_aux_reasoning
+            ),
         )
 
     # --- предупреждения наверх -------------------------------------------
@@ -921,7 +933,10 @@ class Agent:
             stop=None,
         )
         try:
-            return self._complete(replace(self.config, params=params), messages, self.capabilities)
+            with self._ticking("summary"):
+                return self._complete(
+                    replace(self.config, params=params), messages, self.capabilities
+                )
         except AdventError as error:
             self._warn(f"сжатие истории не удалось ({error.message}) — история будет обрезана")
             return None
@@ -993,13 +1008,14 @@ class Agent:
         result: CallResult | None = None
         for _round in range(self.max_tool_rounds):
             self.tool_round = _round + 1
-            result = self._complete(
-                self.config,
-                local_messages,
-                self.capabilities,
-                tools=self.tools,
-                tool_choice="auto",
-            )
+            with self._ticking("tools"):
+                result = self._complete(
+                    self.config,
+                    local_messages,
+                    self.capabilities,
+                    tools=self.tools,
+                    tool_choice="auto",
+                )
             if not result.tool_calls:
                 # Final answer: the turn's one ordinary paid call, nothing parked.
                 self.tool_round = 0
@@ -1205,7 +1221,10 @@ class Agent:
             temperature=0,
         )
         try:
-            return self._complete(replace(self.config, params=params), messages, self.capabilities)
+            with self._ticking("facts"):
+                return self._complete(
+                    replace(self.config, params=params), messages, self.capabilities
+                )
         except AdventError as error:
             self._warn(f"извлечение фактов не удалось ({error.message}) — факты прежние")
             return None
@@ -1354,14 +1373,15 @@ class Agent:
             temperature=0,
         )
         try:
-            return self._complete(
-                replace(self.config, params=params),
-                [
-                    {"role": "system", "content": self.memory_prompt},
-                    {"role": "user", "content": "\n\n".join(body)},
-                ],
-                self.capabilities,
-            )
+            with self._ticking("memory"):
+                return self._complete(
+                    replace(self.config, params=params),
+                    [
+                        {"role": "system", "content": self.memory_prompt},
+                        {"role": "user", "content": "\n\n".join(body)},
+                    ],
+                    self.capabilities,
+                )
         except AdventError as error:
             self._warn(f"извлечение memory не удалось ({error.message}) — memory прежняя")
             # The request reached the provider but did not produce a response.
@@ -1551,7 +1571,8 @@ class Agent:
         assessment_config.params.schema_file = None
         assessment_config.params.stop = None
         try:
-            result = self._complete(assessment_config, messages, self.capabilities)
+            with self._ticking("invariants"):
+                result = self._complete(assessment_config, messages, self.capabilities)
         except AdventError as error:
             result = CallResult(
                 model_requested=self.config.model,
@@ -1662,6 +1683,7 @@ class Agent:
         task: TaskState | None = None,
         invariants: InvariantSet | None = None,
         on_chunk: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
     ) -> AgentReply:
         """Один ход: собрать, обрезать, спросить, разобрать.
 
@@ -1716,7 +1738,8 @@ class Agent:
                 if prior is not None:
                     settings = replace(settings, previous=prior)
                     rag_previous = prior
-                rag_ctx = self._retrieve(user_input, settings)
+                with self._ticking("rag"):
+                    rag_ctx = self._retrieve(user_input, settings)
                 for warning in rag_ctx.warnings:
                     self._warn(warning)
                 if not rag_ctx.hits:
@@ -1744,7 +1767,8 @@ class Agent:
                 self._warn("rag включён, но индекс не подключён — ход идёт без RAG", once=True)
             else:
                 settings = self._dialog_settings(self.rag_settings, history, memory)
-                rag_ctx = self._retrieve(user_input, settings)
+                with self._ticking("rag"):
+                    rag_ctx = self._retrieve(user_input, settings)
                 for warning in rag_ctx.warnings:
                     self._warn(warning)
                 request_input = build_rag_prompt(
@@ -2007,7 +2031,8 @@ class Agent:
         if cite_hits is not None:
             # Cite: JSON for THIS request only, never streamed (the answer is
             # rendered by code from the parsed fields).
-            result = self._complete(self._cite_config(), messages, self.capabilities)
+            with self._ticking("cite"):
+                result = self._complete(self._cite_config(), messages, self.capabilities)
         elif tool_messages_sent:
             # Tools take the complete() path whatever on_chunk says — the
             # decision is made before it is known whether the model will even
@@ -2015,9 +2040,15 @@ class Agent:
             # (SPEC-w04d17.md §3), the same trade format=json already makes.
             result, tool_logs = self._run_tool_loop(messages)
         elif on_chunk is not None and chat_core.should_stream(self.config):
-            result = self._stream(self.config, messages, on_chunk, self.capabilities)
+            # The kwarg goes only when a callback is set: stream doubles that
+            # predate on_reasoning keep working.
+            stream_kwargs = {"on_reasoning": on_reasoning} if on_reasoning is not None else {}
+            result = self._stream(
+                self.config, messages, on_chunk, self.capabilities, **stream_kwargs
+            )
         else:
-            result = self._complete(self.config, messages, self.capabilities)
+            with self._ticking("answer"):
+                result = self._complete(self.config, messages, self.capabilities)
 
         if strategy == "memory" and memory_update is not None:
             # ``_run_memory`` extracted the virtual user message before the
