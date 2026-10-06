@@ -14,6 +14,7 @@ import pytest
 
 from advent_core import chat as chat_core
 from advent_core import client as client_mod
+from advent_core import formats
 from advent_core.chat import _extract_delta, build_messages, should_stream, trim_history
 from advent_core.client import model_names, resolve_alias
 from advent_core.config import Config
@@ -984,3 +985,55 @@ def test_without_base_url_the_sdk_path_is_still_used(monkeypatch):
 
     monkeypatch.setattr(oc_mod, "chat_complete", _no_http)
     assert chat_core.complete(_config(), [{"role": "user", "content": "q"}]).text == "sdk"
+
+
+# --- Day 27: fenced JSON verdict and local response_format precedence -------------
+
+
+def _with_rf(config, rf):
+    import dataclasses
+
+    return dataclasses.replace(
+        config, params=dataclasses.replace(config.params, response_format=rf)
+    )
+
+
+_FENCED = '```json\n{"a": 1}\n```'
+
+
+def test_local_fenced_json_is_a_valid_format_verdict(monkeypatch):
+    _local_server(monkeypatch, lambda r: httpx.Response(200, json=_completion_json(_FENCED)))
+    res = chat_core.complete(_local_config(format="json"), [{"role": "user", "content": "q"}])
+    assert res.format_ok is True
+    assert res.text == _FENCED
+
+
+def test_local_unfenced_garbage_is_still_invalid(monkeypatch):
+    _local_server(
+        monkeypatch, lambda r: httpx.Response(200, json=_completion_json("```json\n{x\n```"))
+    )
+    res = chat_core.complete(_local_config(format="json"), [{"role": "user", "content": "q"}])
+    assert res.format_ok is False
+
+
+def test_cloud_verdict_on_fenced_json_stays_false():
+    assert formats.verify("json", _FENCED).ok is False
+    assert formats.verify("json", _FENCED, strip_fence=True).ok is True
+    assert formats.verify("json", "```json\n```json\n{}\n```\n```", strip_fence=True).ok is False
+
+
+def test_local_explicit_response_format_beats_the_json_preset(monkeypatch):
+    rf = {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}}
+    payload, *_ = chat_core._payload(
+        _with_rf(_local_config(format="json"), rf), [{"role": "user", "content": "q"}]
+    )
+    assert payload["response_format"] == rf
+
+
+def test_cloud_payload_keeps_the_json_preset_response_format():
+    rf = {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}}
+    config = _with_rf(
+        Config(api_key="k", model="m", params=GenerationParams.build(format="json")), rf
+    )
+    payload, *_ = chat_core._payload(config, [{"role": "user", "content": "q"}])
+    assert payload["response_format"] == {"type": "json_object"}

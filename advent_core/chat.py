@@ -191,7 +191,7 @@ def _complete_local(
     """complete() through the OpenAI-compatible HTTP client (config.base_url is set)."""
     res = openai_compat.chat_complete(config.base_url, payload)
     _reject_reasoning_only(res)
-    verdict = formats.verify(format_name, res.text, schema)
+    verdict = formats.verify(format_name, res.text, schema, strip_fence=True)
     return CallResult(
         text=res.text,
         model_requested=config.model,
@@ -223,7 +223,7 @@ def _stream_local(
         config.base_url, payload, on_reasoning=on_reasoning, on_content=on_chunk
     )
     _reject_reasoning_only(res)
-    verdict = formats.verify(format_name, res.text, schema)
+    verdict = formats.verify(format_name, res.text, schema, strip_fence=True)
     return CallResult(
         text=res.text,
         model_requested=config.model,
@@ -448,7 +448,9 @@ def _payload(
         # исходной ConfigError.
         raise ConfigurationError(str(exc)) from exc
 
-    if response_format is None and config.params.response_format is not None:
+    if config.params.response_format is not None and (response_format is None or config.is_local):
+        # Local: an explicit schema beats the format preset's json_object, which
+        # LM Studio would drop anyway; cloud keeps the preset's.
         response_format = config.params.response_format
 
     if response_format is not None:

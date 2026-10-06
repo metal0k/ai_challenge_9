@@ -483,6 +483,35 @@ RAG_CITE_INSTRUCTION = (
     "Каждое утверждение ответа подтверждается хотя бы одной цитатой. "
     'Если во фрагментах ответа нет — "status": "unknown", остальные поля пустые.'
 )
+# Local only: LM Studio drops json_object, so the cite JSON is grammar-enforced instead
+# (otherwise ornith fences it). Mirrors the prompt above and what _parse_cited accepts.
+RAG_CITE_RESPONSE_FORMAT: dict = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "cite_answer",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["answer", "unknown"]},
+                "answer": {"type": "string"},
+                "sources": {"type": "array", "items": {"type": "integer"}},
+                "quotes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer"},
+                            "text": {"type": "string"},
+                        },
+                        "required": ["id", "text"],
+                    },
+                },
+            },
+            "required": ["status", "answer", "sources", "quotes"],
+        },
+    },
+}
 RAG_UNKNOWN_PREFIX = "Не знаю:"
 RAG_UNKNOWN_TEXTS = {
     "empty_context": "в документации проекта не нашлось фрагментов, относящихся к вопросу",

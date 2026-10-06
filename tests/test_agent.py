@@ -2998,3 +2998,72 @@ def test_retrieval_task_has_goal_and_terms_only_not_clarified_or_constraints():
     agent.ask("и дальше?", [], memory=memory_state)
 
     assert seen[0].task == f"Цель: {D25_GOAL}\nТермин: одна запись"
+
+
+# --- Day 27: local cite request carries a json_schema ----------------------------
+
+from advent_core.rag import RAG_CITE_RESPONSE_FORMAT  # noqa: E402
+
+
+def _local_cite_agent(*replies):
+    recorder = _ConfigRecorder(*(CallResult(text=r, model_requested="m") for r in replies))
+    config = Config(
+        api_key="k",
+        model="ornith",
+        params=GenerationParams(rag=True, rag_cite=True),
+        base_url="http://127.0.0.1:1234",
+    )
+    return build_agent(recorder, config, retrieve=_Retriever()), recorder
+
+
+def test_local_cite_request_carries_the_literal_json_schema():
+    agent, recorder = _local_cite_agent(_cite_json())
+    agent.ask("какой порог?", [])
+    sent = recorder.configs[0].params
+    assert sent.format == "json"
+    assert sent.response_format == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "cite_answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["answer", "unknown"]},
+                    "answer": {"type": "string"},
+                    "sources": {"type": "array", "items": {"type": "integer"}},
+                    "quotes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer"},
+                                "text": {"type": "string"},
+                            },
+                            "required": ["id", "text"],
+                        },
+                    },
+                },
+                "required": ["status", "answer", "sources", "quotes"],
+            },
+        },
+    }
+    assert agent.config.params.response_format is None
+
+
+def test_cloud_cite_request_has_no_response_format_override():
+    agent, recorder = _cite_agent(_Retriever(), _cite_json())
+    agent.ask("q", [])
+    assert recorder.configs[0].params.response_format is None
+
+
+def test_cite_schema_accepts_an_answer_and_the_refusal_and_rejects_a_list_answer():
+    import jsonschema
+
+    schema = RAG_CITE_RESPONSE_FORMAT["json_schema"]["schema"]
+    jsonschema.validate(json.loads(_cite_json()), schema)
+    jsonschema.validate({"status": "unknown", "answer": "", "sources": [], "quotes": []}, schema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(json.loads(_cite_json(answer=["шаг"])), schema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(json.loads(_cite_json(status="maybe")), schema)

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -201,8 +202,25 @@ class FormatVerdict:
     detail: str
 
 
-def verify(format_name: str, text: str, schema: dict[str, Any] | None = None) -> FormatVerdict:
-    """Проверяет ответ на соответствие пресету format_name."""
+_FENCE_RE = re.compile(r"\A```(?:json)?[ \t]*\r?\n(.*?)\r?\n?```\Z", re.DOTALL)
+
+
+def verify(
+    format_name: str,
+    text: str,
+    schema: dict[str, Any] | None = None,
+    *,
+    strip_fence: bool = False,
+) -> FormatVerdict:
+    """Проверяет ответ на соответствие пресету format_name.
+
+    strip_fence (local path only): LM Studio has no json_object, so the model may
+    wrap valid JSON in exactly one ```json fence; that one wrapper is removed first.
+    """
+    if strip_fence and format_name in ("json", "schema"):
+        match = _FENCE_RE.match(text.strip())
+        if match:
+            text = match.group(1)
     if format_name in ("text", "yaml", "md"):
         return FormatVerdict(ok=None, detail="—")
 

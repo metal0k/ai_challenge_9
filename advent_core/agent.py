@@ -72,6 +72,7 @@ from advent_core.params import (
 )
 from advent_core.profiles import messages as profile_messages
 from advent_core.rag import (
+    RAG_CITE_RESPONSE_FORMAT,
     RAG_UNKNOWN_PREFIX,
     CitedAnswer,
     RagContext,
@@ -2237,6 +2238,8 @@ class Agent:
                 once=True,
             )
         params = replace(self.config.params, format="json", schema_file=None, stop=None)
+        if self.config.is_local:
+            params = replace(params, response_format=RAG_CITE_RESPONSE_FORMAT)
         return replace(self.config, stream=False, params=params)
 
     def _cite_refusal(
