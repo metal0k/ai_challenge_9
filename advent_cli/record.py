@@ -83,6 +83,8 @@ MODULE_COMMANDS = {
     "week_04.cli": "adventmcp",
     # Week 05 (RAG) has its own entry point too, same reasoning as week 04.
     "week_05.cli": "adventrag",
+    # Week 06 (local LLM) is its own entry point as well.
+    "week_06.cli": "adventlocal",
     # День 07 показывает файл сессии глазами — подпись в кадре должна
     # соответствовать тому, что зритель может повторить.
     "json.tool": "python -m json.tool",
@@ -168,6 +170,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 6 and day == 26:
+        return _demo_steps_w06d26()
     if week == 5 and day == 25:
         return _demo_steps_w05d25()
     if week == 5 and day == 24:
@@ -2118,6 +2122,42 @@ def _prepare_w05d25(
             path.unlink(missing_ok=True)
 
 
+_W06D26_QUESTION = "Столица Австралии? Ответь одним словом."
+# compare makes three local calls, each up to its own deadline, then cloud calls and
+# the codecheck: the step timeout must clear 3 * deadline with room to spare.
+_W06D26_ASK_DEADLINE = 120
+_W06D26_COMPARE_DEADLINE = 240
+
+
+def _demo_steps_w06d26() -> list[Step]:
+    """Day 26 — a local LLM over HTTP: status, one question, local-vs-cloud comparison.
+
+    `compare` is last: its summary table is the day's headline. The model is never loaded
+    here (shared LM Studio); `status` only checks it, and `lms ps` is not called.
+    """
+    return [
+        Step(
+            title="1. Локальный сервер: модели и состояние — по HTTP",
+            module="week_06.cli",
+            args=["status"],
+            timeout=60,
+        ),
+        Step(
+            title="2. Простой запрос: reasoning на stderr, ответ и footer",
+            module="week_06.cli",
+            args=["ask", _W06D26_QUESTION, "--deadline", str(_W06D26_ASK_DEADLINE)],
+            timeout=180,
+        ),
+        Step(
+            title="3. Три задачи: локальная модель и ministral-14b, итоговая таблица",
+            module="week_06.cli",
+            args=["compare", "--deadline", str(_W06D26_COMPARE_DEADLINE)],
+            timeout=900,
+            line_pause=8.0,
+        ),
+    ]
+
+
 def _demo_steps_w05d25() -> list[Step]:
     """Day 25 — mini-chat with RAG, sources and task state: the agent's REPL, then chat-eval.
 
@@ -2439,6 +2479,19 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w03d14(session="w03d14-rehearsal")
     if (week, day) == (3, 15):
         return _demo_steps_w03d15(session="w03d15-rehearsal")
+    if (week, day) == (6, 26):
+        return [
+            # Readiness gate first: fails before recording if the model is not loaded.
+            Step(title="репетиция: status", module="week_06.cli", args=["status"], timeout=60),
+            # Encoding gate (Cyrillic through a pipe) plus one real local call.
+            Step(
+                title="репетиция: ask из stdin",
+                module="week_06.cli",
+                args=["ask", "--deadline", str(_W06D26_ASK_DEADLINE)],
+                stdin_lines=[_W06D26_QUESTION],
+                timeout=180,
+            ),
+        ]
     if (week, day) == (5, 21):
         return [
             # Positive: import, git corpus read, chunking, Cyrillic table; no API.

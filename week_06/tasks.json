@@ -1,0 +1,20 @@
+[
+  {
+    "id": "fact",
+    "level": "простой",
+    "prompt": "Столица Австралии? Ответь одним словом.",
+    "check": "fact"
+  },
+  {
+    "id": "alice",
+    "level": "рассуждение",
+    "problem": "alice",
+    "check": "marker"
+  },
+  {
+    "id": "palindrome",
+    "level": "генерация кода",
+    "prompt": "Напиши на Python функцию `is_palindrome(text: str) -> bool`: строка — палиндром без учёта регистра, пробелов и знаков препинания. Дай один блок кода.",
+    "check": "code"
+  }
+]

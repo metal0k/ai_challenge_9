@@ -177,7 +177,7 @@ def warn_if_prices_stale(prices: PriceTable, *, today: date | None = None) -> No
         )
 
 
-def _call_cost(
+def call_cost(
     usage_prompt: int | None, usage_completion: int | None, cached: int | None, price: ModelPrice
 ) -> float | None:
     """Стоимость одного ответа в $ по формуле SPEC §10. None — usage не пришёл.
@@ -195,6 +195,10 @@ def _call_cost(
         + usage_completion * price.output
     )
     return cost / 1_000_000
+
+
+# Old private name kept: existing callers and tests reference it.
+_call_cost = call_cost
 
 
 # --------------------------------------------------------------------------
