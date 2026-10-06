@@ -1242,3 +1242,47 @@ a test pins that a `switch` message is followed by a `question`.
 chunks with quotes ran 388 tokens on the first take and was truncated on the
 second, so the opening answer on camera was «не знаю (обрыв)». Day 25's step
 uses 1200.
+
+**Week 6 (local AI) has its own entry point, `adventlocal`, and its own HTTP
+client — the Mistral SDK seam is not enough.** `ADVENT_BASE_URL` (commit
+`f8cb0d9`) does point `chat_core` at LM Studio, but in streaming the SDK never
+sends `stream_options`, so usage comes back empty («tokens ?»), and
+`reasoning_text` is empty in non-stream. `week_06/local_client.py` speaks raw
+SSE with `include_usage: true`, which returns
+`completion_tokens_details.reasoning_tokens` in the last chunk.
+`/api/v0/models` (LM Studio's own REST) carries `state: loaded|not-loaded`,
+`loaded_context_length` and quantization — `/v1/models` has none of them, so
+readiness is checked there.
+
+**The local server's speed depends on how much VRAM is left free, and a slow
+server raises no error.** On the RTX 3070 (8 GB), `ornith-1.5-9b` at context
+73728 left 344 MiB free and ran at 15–20 tok/s: the palindrome answer took 188 s.
+At 57344 it left 719 MiB free and ran at ~55 tok/s. Start it with
+`start-local-llm.ps1 -Context 57344`. Two more measured facts:
+- `reasoning_effort: "low"` does not shorten ornith's reasoning (938 tokens
+  against 392 without it).
+- Any `lms` command wakes the headless service, which rewrites
+  `~/.lmstudio/settings.json` to factory defaults. So `adventlocal status` is
+  read-only HTTP, and `lms ps` runs only behind an explicit `--cli`.
+
+**An ASCII-only palindrome passes Cyrillic positives — only Cyrillic negatives
+catch it.** `re.sub(r'[^a-zA-Z0-9]', '', s)` turns a Russian string into `""`,
+and `""` is a palindrome. So «А роза упала на лапу Азора» passes and
+«Привет, мир» fails. The first hidden-test set had positives only, and would
+have scored ministral-14b's wrong function 4/4 on Cyrillic; the spec-review
+caught it. The general point: a test case that a degenerate input satisfies
+vacuously proves nothing.
+
+**"The last code block" is not "the answer's code".** ornith answered with the
+function in one block and `print(is_palindrome(...))` examples in a second; the
+checker ran the examples and reported an error on a correct answer. Neither
+review caught it — the first live run did. Pick the last block that *defines*
+the target function. Do not concatenate blocks: an example block containing a
+banned call would then make a correct answer `unsafe`.
+
+**An AST guard that bans calls by name is bypassed by an alias.**
+`f = open; f(path, 'w')` passed `unsafe_reason()` until it banned every
+*reference* to the dangerous builtins (`ast.Name` in any context), not only
+`ast.Call` on them. The guard is in front of a child process that runs with
+`-I -S`, a minimal env without `.env` secrets, an empty temp cwd and a timeout.
+That is still not a sandbox, and the README says so.
