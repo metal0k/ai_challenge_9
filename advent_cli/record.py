@@ -182,6 +182,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 6 and day == 28:
+        return _demo_steps_w06d28()
     if week == 6 and day == 27:
         return _demo_steps_w06d27()
     if week == 6 and day == 26:
@@ -2246,6 +2248,54 @@ def _rehearsal_steps_w06d27() -> list[Step]:
     ]
 
 
+# Day 28: question ids are a placeholder until the 10x3 measurement picks two that
+# split the backends and two stable ones (SPEC-w06d28 section 6).
+_W06D28_QUESTIONS = "1,7,9,10"
+_W06D28_RUNS = "2"
+_W06D28_TIMEOUT = 2400
+
+
+def _demo_steps_w06d28() -> list[Step]:
+    """Day 28 - the same RAG on cloud then local; the closing tables are the last screen."""
+    return [
+        Step(
+            title="1. Сервер: ornith загружена", module="week_06.cli", args=["status"], timeout=60
+        ),
+        Step(
+            title="2. Локальный индекс и embedding-модель готовы",
+            module="week_05.cli",
+            args=["check"],
+            timeout=60,
+        ),
+        Step(
+            title="3. RAG cite: облако против локальной модели, итоговые таблицы",
+            module="week_06.cli",
+            args=[
+                "rag",
+                "--questions",
+                _W06D28_QUESTIONS,
+                "--runs",
+                _W06D28_RUNS,
+                "--no-unanswerable",
+            ],
+            timeout=_W06D28_TIMEOUT,
+        ),
+    ]
+
+
+def _rehearsal_steps_w06d28() -> list[Step]:
+    """Readiness gates only (HTTP and sqlite): the paid bench itself is not rehearsed."""
+    return [
+        Step(title="репетиция: status", module="week_06.cli", args=["status"], timeout=60),
+        Step(
+            title="репетиция: локальный RAG-индекс и embedding-модель",
+            module="week_05.cli",
+            args=["check"],
+            timeout=60,
+        ),
+    ]
+
+
 def _demo_steps_w05d25() -> list[Step]:
     """Day 25 — mini-chat with RAG, sources and task state: the agent's REPL, then chat-eval.
 
@@ -2567,6 +2617,8 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w03d14(session="w03d14-rehearsal")
     if (week, day) == (3, 15):
         return _demo_steps_w03d15(session="w03d15-rehearsal")
+    if (week, day) == (6, 28):
+        return _rehearsal_steps_w06d28()
     if (week, day) == (6, 27):
         return _rehearsal_steps_w06d27()
     if (week, day) == (6, 26):

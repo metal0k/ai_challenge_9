@@ -759,6 +759,7 @@ def embed_queries_local(
     week: int,
     day: int | None,
     journal_extra: dict | None = None,
+    on_request: Callable[[int | None, int], None] | None = None,
 ) -> EmbedResult:
     """Embed query `texts` for a local `run`: its model and stored query prefix."""
     return embed_local(
@@ -770,6 +771,7 @@ def embed_queries_local(
         week=week,
         day=day,
         journal_extra=journal_extra,
+        on_request=on_request,
     )
 
 

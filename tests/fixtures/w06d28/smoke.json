@@ -1,0 +1,106 @@
+{
+  "week": 6,
+  "day": 28,
+  "runs": 1,
+  "backends": [
+    "cloud"
+  ],
+  "skipped": [
+    "local"
+  ],
+  "failed": "local: Локальный сервер http://127.0.0.1:1234 не отвечает. (запусти LM Studio: start-local-llm.ps1 -Context 57344)",
+  "corpus_rev": "6ee4ac4155ce50618371d456c04a184f9c7cb60c",
+  "questions": [
+    10
+  ],
+  "unanswerable": [],
+  "settings": {
+    "cloud": {
+      "model": "ministral-14b-latest",
+      "endpoint": "cloud",
+      "index": "index.sqlite3",
+      "embed_model": "mistral-embed",
+      "corpus_rev": "6ee4ac4155ce50618371d456c04a184f9c7cb60c",
+      "strategy": "structure",
+      "k": 5,
+      "k_before": 20,
+      "threshold": 5.0,
+      "rewrite": true,
+      "rerank": true,
+      "cite": true,
+      "aux_reasoning": false,
+      "answer_max_tokens": 4096,
+      "temperature": null,
+      "top_p": null,
+      "protocol": "rerank: JSON-инструкция в промпте (json mode); aux без reasoning; ответ ministral-14b"
+    }
+  },
+  "offline": null,
+  "results": [
+    {
+      "backend": "cloud",
+      "kind": "answerable",
+      "question_id": 10,
+      "run": 1,
+      "outcome": "answered",
+      "correct": true,
+      "error": null,
+      "facts": [
+        true
+      ],
+      "facts_total": 1,
+      "sources_cited": true,
+      "quotes_emitted": 2,
+      "quotes_reattributed": 0,
+      "quotes_dropped": 0,
+      "quotes_verbatim": 2,
+      "wall_ms": 45928,
+      "rewrite_ms": 8854,
+      "embed_search_ms": 8818,
+      "rerank_ms": 19485,
+      "answer_ms": 8684,
+      "tok_s": 19.8065407646246,
+      "retries": 0,
+      "model_called": true,
+      "answer": "Одна компакция истории стоит примерно 1450 токенов (сумма ~1076 prompt-токенов и ~334 completion-токенов).",
+      "ledger": [
+        {
+          "stage": "rewrite",
+          "model": "ministral-14b-latest",
+          "endpoint": "cloud",
+          "prompt_tokens": 85,
+          "completion_tokens": 51,
+          "latency_ms": 8854,
+          "cost": 2.7200000000000004e-05
+        },
+        {
+          "stage": "embed",
+          "model": "mistral-embed",
+          "endpoint": "cloud",
+          "prompt_tokens": 87,
+          "completion_tokens": null,
+          "latency_ms": 796,
+          "cost": 8.7e-06
+        },
+        {
+          "stage": "rerank",
+          "model": "ministral-14b-latest",
+          "endpoint": "cloud",
+          "prompt_tokens": 17823,
+          "completion_tokens": 535,
+          "latency_ms": 19485,
+          "cost": 0.0036716000000000006
+        },
+        {
+          "stage": "answer",
+          "model": "ministral-14b-latest",
+          "endpoint": "cloud",
+          "prompt_tokens": 3018,
+          "completion_tokens": 172,
+          "latency_ms": 8684,
+          "cost": 0.000638
+        }
+      ]
+    }
+  ]
+}

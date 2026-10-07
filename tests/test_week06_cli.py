@@ -180,7 +180,7 @@ def test_status_ready(monkeypatch, out, no_network):
 def test_status_model_not_loaded_exits_2(monkeypatch, out, err, no_network):
     no_network.models = [lc.LocalModel("ornith", "llm", "not-loaded")]
     assert run_main(monkeypatch, "status") == 2
-    assert "-Context 57344" in err.getvalue()
+    assert "-Context 40960" in err.getvalue()
 
 
 def test_status_model_missing_exits_2(monkeypatch, out, err, no_network):

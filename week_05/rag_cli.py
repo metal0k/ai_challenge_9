@@ -21,12 +21,15 @@ from advent_core.rag import (
     RAG_UNKNOWN_PREFIX,
     RAG_UNKNOWN_TEXTS,
     CitedAnswer,
+    LedgerEntry,
+    OnCallFn,
     RagContext,
     RagHit,
     RagSettings,
     check_facts,
     fact_span,
 )
+from advent_core.telemetry import CallResult
 from week_05 import index as index_module
 from week_05 import rag as rag_module
 
@@ -97,6 +100,7 @@ class ModeRun:
     cited: CitedAnswer | None = None
     display_text: str | None = None
     model_called: bool = True
+    result: CallResult | None = None
 
 
 def check_args(strategy: str, k: int, k_before: int, threshold: float) -> None:
@@ -147,13 +151,31 @@ def _agent_warning(text: str) -> None:
     console.warn(text)
 
 
-def build_agent(config: Config, db_path: Path | None, day: int = JOURNAL_DAY_PLAIN) -> Agent:
+def build_agent(
+    config: Config,
+    db_path: Path | None,
+    day: int = JOURNAL_DAY_PLAIN,
+    *,
+    aux_config: Config | None = None,
+    week: int = rag_module.RAG_WEEK,
+    extra: dict | None = None,
+    on_call: OnCallFn | None = None,
+) -> Agent:
+    retriever_kwargs: dict = {}
+    if aux_config is not None:
+        retriever_kwargs["aux_config"] = aux_config
+    if week != rag_module.RAG_WEEK:
+        retriever_kwargs["week"] = week
+    if extra:
+        retriever_kwargs["extra"] = extra
+    if on_call is not None:
+        retriever_kwargs["on_call"] = on_call
     return Agent(
         config,
         on_warning=_agent_warning,
         complete=chat_core.complete,
         stream=chat_core.stream,
-        retrieve=rag_module.make_retriever(db_path, day=day, aux_day=day),
+        retrieve=rag_module.make_retriever(db_path, day=day, aux_day=day, **retriever_kwargs),
     )
 
 
@@ -176,28 +198,46 @@ def run_mode(
     command: str,
     question_id: int | None = None,
     day: int = JOURNAL_DAY_PLAIN,
+    week: int = rag_module.RAG_WEEK,
+    extra: dict | None = None,
+    on_call: OnCallFn | None = None,
 ) -> ModeRun:
     params = agent.config.params
     params.rag = mode != "off"
     params.rag_rewrite = params.rag_rerank = mode in ("full", "cite")
     params.rag_cite = mode == "cite"
     reply = agent.ask(question, [])
-    extra: dict[str, object] = {
+    record_extra: dict[str, object] = {
         "command": command,
         "rag": mode != "off",
         "question_id": question_id,
     }
     if mode in ("full", "cite"):
-        extra["mode"] = mode
+        record_extra["mode"] = mode
+    if extra:
+        record_extra = {**record_extra, **extra, "stage": "answer"}
     # A refusal made by code has a synthetic CallResult: nothing was sent, nothing to journal.
     if reply.model_called:
         log_call(
             reply.result,
             reply.result.sent_messages or [],
-            week=rag_module.RAG_WEEK,
+            week=week,
             day=day,
-            extra=extra,
+            extra=record_extra,
         )
+        if on_call is not None:
+            usage = reply.result.usage
+            on_call(
+                LedgerEntry(
+                    stage="answer",
+                    model=reply.result.model_requested or reply.result.model_actual or "",
+                    endpoint="local" if agent.config.is_local else "cloud",
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                    latency_ms=reply.result.latency_ms,
+                    result=reply.result,
+                )
+            )
     # ctx.warnings already reached stderr through the agent's on_warning.
     return ModeRun(
         text=reply.text,
@@ -209,6 +249,7 @@ def run_mode(
         cited=reply.cited,
         display_text=reply.display_text,
         model_called=reply.model_called,
+        result=reply.result,
     )
 
 

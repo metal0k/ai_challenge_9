@@ -29,7 +29,7 @@ from advent_core.journal import log_call
 from advent_core.params import GenerationParams
 from advent_core.telemetry import CallResult, Usage
 from week_01.models_bench import PriceTable, call_cost, load_prices, warn_if_prices_stale
-from week_06 import codecheck, tasks
+from week_06 import codecheck, ragbench, tasks
 from week_06 import local_client as lc
 
 WEEK = 6
@@ -718,6 +718,46 @@ def compare_command(
     if not any(p.answered for p in probes):
         console.warn("ни один вызов не удался")
         raise typer.Exit(1)
+
+
+@app.command("rag")
+def rag_command(
+    runs: int = typer.Option(
+        ragbench.DEFAULT_RUNS, "--runs", min=1, max=ragbench.MAX_RUNS, help="Прогонов на вопрос."
+    ),
+    questions: str | None = typer.Option(
+        None, "--questions", help="id контрольных вопросов через запятую (по умолчанию все)."
+    ),
+    backends: str = typer.Option("local,cloud", "--backends", help="Подмножество: local,cloud."),
+    unanswerable: bool = typer.Option(
+        True, "--unanswerable/--no-unanswerable", help="Добавить вопросы без ответа в репо."
+    ),
+    save: Path | None = typer.Option(None, "--save", help="JSON со всеми прогонами."),
+    report: list[Path] | None = typer.Option(
+        None,
+        "--report",
+        help="Только отчёт из файла --save (повторяемо: склеивает backend'ы), без сети.",
+    ),
+    url: str | None = _URL_OPT,
+) -> None:
+    """RAG (rewrite + rerank + cite) в облаке и локально: качество, скорость, стабильность."""
+    if report:
+        if save is not None:
+            raise ConfigError("--report не сочетается с --save: отчёт ничего не запускает.")
+        code = ragbench.run_report_command(report)
+        if code:
+            raise typer.Exit(code)
+        return
+    code = ragbench.run_rag_command(
+        runs=runs,
+        questions=questions,
+        backends=backends,
+        unanswerable=unanswerable,
+        save=save,
+        url=url,
+    )
+    if code:
+        raise typer.Exit(code)
 
 
 def main() -> None:

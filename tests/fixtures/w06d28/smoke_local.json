@@ -1,0 +1,119 @@
+{
+  "week": 6,
+  "day": 28,
+  "runs": 1,
+  "backends": [
+    "local"
+  ],
+  "skipped": [],
+  "failed": null,
+  "corpus_rev": "6ee4ac4155ce50618371d456c04a184f9c7cb60c",
+  "questions": [
+    10
+  ],
+  "unanswerable": [],
+  "settings": {
+    "local": {
+      "model": "ornith",
+      "endpoint": "local",
+      "index": "index.local.sqlite3",
+      "embed_model": "text-embedding-bge-m3",
+      "corpus_rev": "6ee4ac4155ce50618371d456c04a184f9c7cb60c",
+      "strategy": "structure",
+      "k": 5,
+      "k_before": 20,
+      "threshold": 5.0,
+      "rewrite": true,
+      "rerank": true,
+      "cite": true,
+      "aux_reasoning": false,
+      "answer_max_tokens": 4096,
+      "temperature": null,
+      "top_p": null,
+      "protocol": "rerank: json_schema-грамматика, до 2 попыток, свой cap; aux без reasoning; ответ с reasoning, cite-JSON по грамматике"
+    }
+  },
+  "offline": {
+    "attempted": {
+      "local": 8,
+      "cloud": 0
+    },
+    "blocked": {
+      "local": 0,
+      "cloud": 0
+    },
+    "completed": {
+      "local": 8,
+      "cloud": 0
+    },
+    "ledger_local": 4,
+    "ledger_cloud": 0
+  },
+  "results": [
+    {
+      "backend": "local",
+      "kind": "answerable",
+      "question_id": 10,
+      "run": 1,
+      "outcome": "answered",
+      "correct": true,
+      "error": null,
+      "facts": [
+        true
+      ],
+      "facts_total": 1,
+      "sources_cited": true,
+      "quotes_emitted": 2,
+      "quotes_reattributed": 0,
+      "quotes_dropped": 0,
+      "quotes_verbatim": 2,
+      "wall_ms": 73989,
+      "rewrite_ms": 1530,
+      "embed_search_ms": 657,
+      "rerank_ms": 32000,
+      "answer_ms": 39750,
+      "tok_s": 9.786163522012579,
+      "retries": 0,
+      "model_called": true,
+      "answer": "Примерно 1450 токенов (около 1076 prompt + около 334 completion).",
+      "ledger": [
+        {
+          "stage": "rewrite",
+          "model": "ornith",
+          "endpoint": "local",
+          "prompt_tokens": 83,
+          "completion_tokens": 10,
+          "latency_ms": 1530,
+          "cost": 0.0
+        },
+        {
+          "stage": "embed",
+          "model": "text-embedding-bge-m3",
+          "endpoint": "local",
+          "prompt_tokens": 0,
+          "completion_tokens": null,
+          "latency_ms": 546,
+          "cost": 0.0
+        },
+        {
+          "stage": "rerank",
+          "model": "ornith",
+          "endpoint": "local",
+          "prompt_tokens": 17933,
+          "completion_tokens": 399,
+          "latency_ms": 32000,
+          "cost": 0.0
+        },
+        {
+          "stage": "answer",
+          "model": "ornith",
+          "endpoint": "local",
+          "prompt_tokens": 4109,
+          "completion_tokens": 389,
+          "latency_ms": 39750,
+          "cost": 0.0
+        }
+      ]
+    }
+  ]
+}

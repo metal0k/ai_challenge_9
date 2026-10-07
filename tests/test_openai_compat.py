@@ -587,3 +587,32 @@ def test_embed_normalizes_in_float64_so_huge_vectors_do_not_become_zero(server):
     assert np.isfinite(res.vectors).all()
     np.testing.assert_allclose(res.vectors, [[2**-0.5, 2**-0.5], [1.0, 0.0]], atol=1e-6)
     np.testing.assert_allclose(np.linalg.norm(res.vectors, axis=1), [1.0, 1.0], atol=1e-6)
+
+
+def test_embed_on_request_reports_each_good_request_before_a_later_failure(server):
+    state = {"n": 0}
+
+    def handler(request):
+        state["n"] += 1
+        if state["n"] == 2:
+            return httpx.Response(500, json={"error": "boom"})
+        return httpx.Response(200, json=emb([[1.0, 0.0]], usage=9))
+
+    server(handler)
+    seen: list[tuple[int | None, int]] = []
+    with pytest.raises(ServerError):
+        oc.embed(
+            "http://x",
+            "m",
+            ["a", "b"],
+            batch=1,
+            on_request=lambda tokens, ms: seen.append((tokens, ms)),
+        )
+    assert len(seen) == 1 and seen[0][0] == 9 and seen[0][1] >= 0
+
+
+def test_embed_on_request_reports_unknown_usage_as_none(server):
+    server(respond(emb([[1.0, 0.0]], usage=None)))
+    seen: list[int | None] = []
+    oc.embed("http://x", "m", ["a"], on_request=lambda tokens, ms: seen.append(tokens))
+    assert seen == [None]

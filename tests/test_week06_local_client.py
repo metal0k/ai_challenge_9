@@ -297,7 +297,7 @@ def test_connect_error_is_network_error_with_local_hint(server):
     server(refuse)
     with pytest.raises(NetworkError) as info:
         run_chat()
-    assert "start-local-llm.ps1 -Context 57344" in info.value.hint
+    assert "start-local-llm.ps1 -Context 40960" in info.value.hint
 
 
 def test_timeout_is_network_error(server):
@@ -375,7 +375,7 @@ def test_ensure_ready_not_loaded_exit_2_with_hint(server):
     with pytest.raises(ConfigurationError) as info:
         lc.ensure_ready("text-embed", "http://x")
     assert info.value.exit_code == 2
-    assert "-Context 57344" in info.value.hint
+    assert "-Context 40960" in info.value.hint
 
 
 def test_ensure_ready_missing_model(server):

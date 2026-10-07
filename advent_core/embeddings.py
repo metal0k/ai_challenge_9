@@ -229,6 +229,7 @@ def _embed_batch(
     day: int | None,
     journal_path: Path | None,
     journal_extra: dict | None,
+    on_request: Callable[[int | None, int], None] | None = None,
 ) -> tuple[int | None, int, int]:
     """Embed texts[start:end]; returns (prompt_tokens|None, requests, latency_ms).
 
@@ -282,6 +283,7 @@ def _embed_batch(
                 day=day,
                 journal_path=journal_path,
                 journal_extra=journal_extra,
+                on_request=on_request,
             )
             right = _embed_batch(
                 client,
@@ -296,6 +298,7 @@ def _embed_batch(
                 day=day,
                 journal_path=journal_path,
                 journal_extra=journal_extra,
+                on_request=on_request,
             )
             tokens = None if left[0] is None or right[0] is None else left[0] + right[0]
             requests = 1 + left[1] + right[1]
@@ -380,6 +383,8 @@ def _embed_batch(
         journal_path=journal_path,
         journal_extra=journal_extra,
     )
+    if on_request is not None:
+        on_request(usage.prompt_tokens, latency_ms)
     return usage.prompt_tokens, 1, latency_ms
 
 
@@ -390,6 +395,7 @@ def embed_texts(
     *,
     ids: list[str] | None = None,
     on_batch: Callable[[int, int], None] | None = None,
+    on_request: Callable[[int | None, int], None] | None = None,
     week: int = 5,
     day: int | None = 21,
     journal_path: Path | None = None,
@@ -402,6 +408,8 @@ def embed_texts(
     chunks in the "exceeds max 8192 tokens" error; without it the error
     names the input's position instead. `on_batch(done_inputs, total_inputs)`
     fires after each successful batch (progress, stderr only — never stdout).
+    `on_request(prompt_tokens|None, latency_ms)` fires after every successful
+    request, so a later failed batch cannot erase the cost already paid.
     """
     n = len(texts)
     vectors: dict[int, list[float]] = {}
@@ -426,6 +434,7 @@ def embed_texts(
             day=day,
             journal_path=journal_path,
             journal_extra=journal_extra,
+            on_request=on_request,
         )
         total_requests += requests
         total_latency_ms += latency_ms
@@ -466,6 +475,7 @@ def embed_local(
     kind: str = "doc",
     prefix: str | None = None,
     on_batch: Callable[[int, int], None] | None = None,
+    on_request: Callable[[int | None, int], None] | None = None,
     week: int = 5,
     day: int | None = 21,
     journal_path: Path | None = None,
@@ -490,6 +500,7 @@ def embed_local(
             [prefix + t for t in texts],
             expected_dim=spec.dim if spec else None,
             on_batch=on_batch,
+            on_request=on_request,
         )
     except AdventError:
         _journal(

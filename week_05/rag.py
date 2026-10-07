@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,9 +20,12 @@ from advent_core.params import GenerationParams
 from advent_core.rag import (
     RAG_REWRITE_PROMPT,
     CitedAnswer,
+    LedgerEntry,
+    OnCallFn,
     RagContext,
     RagHit,
     RagSettings,
+    RagTimings,
     RetrievalTrace,
     RetrieveFn,
     apply_rerank,
@@ -124,6 +128,8 @@ def _aux_call(
     reasoning: bool = True,
     local_cap: int | None = None,
     rerank_schema: bool = False,
+    week: int = RAG_WEEK,
+    extra: dict | None = None,
 ) -> CallResult:
     """One isolated helper call: nothing from .env params, no system persona.
 
@@ -160,12 +166,16 @@ def _aux_call(
     )
     messages: list[Message] = [{"role": "user", "content": prompt}]
     result = chat_core.complete(config, messages)
+    record_extra: dict = {"command": command}
+    if extra:
+        # caller identity wins over `command`; the stage keeps its own field
+        record_extra = {**record_extra, **extra, "stage": command.removeprefix("rag_")}
     log_call(
         result,
         list(result.sent_messages or messages),
-        week=RAG_WEEK,
+        week=week,
         day=day,
-        extra={"command": command},
+        extra=record_extra,
     )
     return result
 
@@ -219,6 +229,9 @@ def make_retriever(
     day: int = RAG_DAY,
     aux_day: int = RAG_AUX_DAY,
     aux_config: Config | None = None,
+    extra: dict | None = None,
+    on_call: OnCallFn | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> RetrieveFn:
     """Create a retriever bound to a database path and journal coordinates.
 
@@ -226,7 +239,29 @@ def make_retriever(
     `aux_config` replaces the cloud `RAG_AUX_MODEL` config for rewrite/rerank
     (the agent's own model/base_url in `--local`); the query embedding follows
     the index run's endpoint, model and prefix, not the config.
+    `extra` is merged into every journal record written here (stage kept in `stage`);
+    `on_call` gets a LedgerEntry for every completed call, retries included;
+    `clock` times the stages into `RagContext.timings`.
     """
+    aux_endpoint = "local" if aux_config is not None and aux_config.is_local else "cloud"
+    aux_kwargs: dict = {"week": week}
+    if extra:
+        aux_kwargs["extra"] = extra
+
+    def ledger(stage: str, result: CallResult) -> None:
+        if on_call is None:
+            return
+        on_call(
+            LedgerEntry(
+                stage=stage,
+                model=result.model_requested or result.model_actual or "",
+                endpoint=aux_endpoint,
+                prompt_tokens=result.usage.prompt_tokens,
+                completion_tokens=result.usage.completion_tokens,
+                latency_ms=result.latency_ms,
+                result=result,
+            )
+        )
 
     def retrieve(question: str, settings: RagSettings) -> RagContext:
         """Rewrite -> embed -> search -> RRF -> rerank -> threshold -> top-k."""
@@ -252,6 +287,7 @@ def make_retriever(
                     day=rewrite_day,
                     aux_config=aux_config,
                     reasoning=settings.aux_reasoning,
+                    **aux_kwargs,
                 )
             except AdventError as exc:
                 if not contextual:
@@ -259,6 +295,7 @@ def make_retriever(
                 warnings.append(f"{label}rewrite не удался ({exc}) — поиск без него")
                 return None
             aux_calls.append(result)
+            ledger("rewrite", result)
             cleaned = clean_rewrite(result.text)
             if cleaned is None:
                 tail = "поиск без него" if contextual else "поиск только по исходному вопросу"
@@ -269,6 +306,8 @@ def make_retriever(
         # so a polluted context-aware rewrite cannot drown the result.
         rewritten: str | None = None
         texts = [question]
+        rewrite_ms: int | None = None
+        t_rewrite = clock()
         if settings.rewrite:
             if contextual:
                 plain = rewrite_once(
@@ -291,8 +330,32 @@ def make_retriever(
                 rewritten = rewrite_once(rewrite_prompt(question, None), aux_day, "")
                 if rewritten is not None:
                     texts.append(rewritten)
+            rewrite_ms = int((clock() - t_rewrite) * 1000)
         journal_extra = {"strategy": strategy, "command": "rag"}
-        if getattr(run, "endpoint", index_module.ENDPOINT_CLOUD) == index_module.ENDPOINT_LOCAL:
+        if extra:
+            journal_extra = {**journal_extra, **extra, "stage": "embed"}
+        is_local_run = (
+            getattr(run, "endpoint", index_module.ENDPOINT_CLOUD) == index_module.ENDPOINT_LOCAL
+        )
+        run_endpoint = "local" if is_local_run else "cloud"
+
+        def on_embed_request(tokens: int | None, latency_ms: int) -> None:
+            # One entry per successful request: a later failed batch must not erase paid ones.
+            if on_call is not None:
+                on_call(
+                    LedgerEntry(
+                        stage="embed",
+                        model=run.model,
+                        endpoint=run_endpoint,
+                        prompt_tokens=tokens,
+                        completion_tokens=None,
+                        latency_ms=latency_ms,
+                    )
+                )
+
+        request_kwargs = {"on_request": on_embed_request} if on_call is not None else {}
+        t_embed = clock()
+        if is_local_run:
             embedded = index_module.embed_queries_local(
                 run,
                 texts,
@@ -300,9 +363,15 @@ def make_retriever(
                 week=week,
                 day=day,
                 journal_extra=journal_extra,
+                **request_kwargs,
             )
         else:
-            with mistral_client(Config.resolve()) as client:
+            embed_config = (
+                aux_config
+                if aux_config is not None and not aux_config.is_local
+                else Config.resolve()
+            )
+            with mistral_client(embed_config) as client:
                 embedded = embed_texts(
                     client,
                     run.model,
@@ -310,17 +379,35 @@ def make_retriever(
                     week=week,
                     day=day,
                     journal_extra=journal_extra,
+                    **request_kwargs,
                 )
+        embed_ms = int((clock() - t_embed) * 1000)
+        t_search = clock()
         lists = [
             _to_hits(index_module.search(db_path, strategy, embedded.vectors[i], k=n))
             for i in range(len(texts))
         ]
         original = lists[0]
         fused = rrf_merge(lists) if len(lists) > 1 else original
+        search_ms = int((clock() - t_search) * 1000)
+        if on_call is not None:
+            # Not a model call: lets a caller sum search time across retried attempts.
+            on_call(
+                LedgerEntry(
+                    stage="search",
+                    model=run.model,
+                    endpoint=run_endpoint,
+                    prompt_tokens=None,
+                    completion_tokens=None,
+                    latency_ms=search_ms,
+                )
+            )
 
         reranked: tuple[RagHit, ...] = ()
         passed: int | None = None
         unrated = 0
+        rerank_ms: int | None = None
+        t_rerank = clock()
         if settings.rerank:
             resolved = resolved_question(
                 question,
@@ -341,8 +428,10 @@ def make_retriever(
                     reasoning=settings.aux_reasoning,
                     local_cap=local_rerank_cap(len(fused)) if local else None,
                     rerank_schema=True,
+                    **aux_kwargs,
                 )
                 aux_calls.append(result)
+                ledger("rerank", result)
                 try:
                     scores = parse_rerank(result.text, len(fused), tolerant=local)
                     break
@@ -354,6 +443,7 @@ def make_retriever(
                 warnings.append(f"reranker не оценил {unrated} из {len(fused)} чанков")
             reranked = order_by_rerank(fused, scores)
             raw, passed = apply_rerank(fused, scores, settings.threshold, k)
+            rerank_ms = int((clock() - t_rerank) * 1000)
         else:
             raw = fused[:k]
 
@@ -381,6 +471,7 @@ def make_retriever(
             warnings=tuple(warnings),
             trace=RetrievalTrace(original, fused, reranked) if staged else None,
             task_used=bool(settings.task),
+            timings=RagTimings(rewrite_ms, embed_ms, search_ms, rerank_ms),
         )
 
     return retrieve

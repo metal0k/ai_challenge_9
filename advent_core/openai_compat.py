@@ -38,7 +38,9 @@ DEFAULT_URL = "http://127.0.0.1:1234"
 READ_TIMEOUT = 300.0
 DEADLINE = 600.0
 EMBED_BATCH = 16
-START_HINT = "запусти LM Studio: start-local-llm.ps1 -Context 57344"
+# Single source for every startup hint; 40960 leaves ~900 MiB VRAM free next to bge-m3.
+LOCAL_CONTEXT = 40960
+START_HINT = f"запусти LM Studio: start-local-llm.ps1 -Context {LOCAL_CONTEXT}"
 
 if TYPE_CHECKING:
     from advent_core.embeddings import EmbedResult
@@ -621,6 +623,7 @@ def embed(
     batch: int = EMBED_BATCH,
     expected_dim: int | None = None,
     on_batch: Callable[[int, int], None] | None = None,
+    on_request: Callable[[int | None, int], None] | None = None,
     timeout: float = READ_TIMEOUT,
     deadline: float = DEADLINE,
 ) -> EmbedResult:
@@ -649,6 +652,7 @@ def embed(
                 hint=START_HINT,
             )
         chunk = texts[lo : lo + batch]
+        t_request = _clock()
         resp = _post_json(
             base,
             "/v1/embeddings",
@@ -662,10 +666,13 @@ def embed(
         parts.append(_validate_embeddings(data.get("data"), len(chunk), expected_dim, dim_box))
         raw_usage = data.get("usage")
         used = raw_usage.get("prompt_tokens") if isinstance(raw_usage, dict) else None
-        if isinstance(used, int) and not isinstance(used, bool) and prompt_tokens is not None:
+        known = isinstance(used, int) and not isinstance(used, bool)
+        if known and prompt_tokens is not None:
             prompt_tokens += used
         else:
             prompt_tokens = None
+        if on_request:
+            on_request(used if known else None, int((_clock() - t_request) * 1000))
         if isinstance(data.get("model"), str) and data["model"]:
             actual = data["model"]
         if on_batch:

@@ -388,3 +388,52 @@ def test_all_zero_vector_raises():
 
     with pytest.raises(AdventError, match="нулевой вектор"):
         embed_texts(FakeClient(handler), DEFAULT_EMBED_MODEL, ["a", "b"], journal_path=None)
+
+
+# --- on_request: every successful request is reported, even when a later one fails ---------
+
+
+def test_on_request_survives_a_failed_second_batch(monkeypatch):
+    monkeypatch.setattr(embeddings_module, "BATCH_MAX_INPUTS", 1)
+    state = {"n": 0}
+
+    def handler(inputs):
+        state["n"] += 1
+        if state["n"] == 2:
+            raise FakeAPIError("boom", 500)
+        return _identity_response(inputs, tokens_per_input=7)
+
+    seen: list[tuple[int | None, int]] = []
+    client = FakeClient(handler)
+    with pytest.raises(AdventError):
+        embed_texts(
+            client,
+            DEFAULT_EMBED_MODEL,
+            ["a", "b"],
+            journal_path=None,
+            on_request=lambda tokens, ms: seen.append((tokens, ms)),
+        )
+    assert len(seen) == 1 and seen[0][0] == 7
+
+
+def test_on_request_reports_the_good_half_when_the_split_retry_fails():
+    state = {"n": 0}
+
+    def handler(inputs):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise FakeAPIError("Too many tokens overall, split into more batches.", 400)
+        if state["n"] == 3:
+            raise FakeAPIError("boom", 500)
+        return _identity_response(inputs, tokens_per_input=5)
+
+    seen: list[int | None] = []
+    with pytest.raises(AdventError):
+        embed_texts(
+            FakeClient(handler),
+            DEFAULT_EMBED_MODEL,
+            ["a", "b"],
+            journal_path=None,
+            on_request=lambda tokens, ms: seen.append(tokens),
+        )
+    assert seen == [5]

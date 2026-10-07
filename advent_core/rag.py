@@ -130,6 +130,38 @@ class RagSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class RagTimings:
+    """Per-stage wall time in ms; None = the stage did not run."""
+
+    rewrite_ms: int | None = None
+    embed_ms: int | None = None  # all query embeddings
+    search_ms: int | None = None  # cosine + RRF
+    rerank_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerEntry:
+    """One completed model call (rewrite / rerank / embed / answer), or a "search" timing.
+
+    "embed" fires per successful request; "search" is local cosine + RRF (no model, no tokens).
+
+    Token fields are None when the server did not report them: unknown, never 0.
+    `result` carries the CallResult of a chat call (None for an embedding).
+    """
+
+    stage: str
+    model: str
+    endpoint: str  # "local" | "cloud"
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    latency_ms: int
+    result: object | None = None
+
+
+OnCallFn = Callable[[LedgerEntry], None]
+
+
+@dataclass(frozen=True, slots=True)
 class RagContext:
     hits: tuple[RagHit, ...]
     strategy: str
@@ -148,6 +180,7 @@ class RagContext:
     warnings: tuple[str, ...] = ()
     trace: RetrievalTrace | None = None
     task_used: bool = False  # day 25: the retrieval saw a task-state text
+    timings: RagTimings | None = None
 
 
 RetrieveFn = Callable[[str, RagSettings], RagContext]
