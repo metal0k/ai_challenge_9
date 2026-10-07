@@ -460,28 +460,82 @@ def _error_cell(
     )
 
 
-class Heartbeat:
-    """Background stderr line every PROGRESS_INTERVAL s so a long local call never looks frozen."""
+NONTTY_INTERVAL = 10.0  # piped stderr: a full line at most this often
+_CLEAR_LINE = "\r\x1b[K"
+_tick_lock = threading.Lock()
+_tick_visible = False  # an in-place tick line is currently on the terminal
 
-    def __init__(self, label: str) -> None:
+
+def _stderr_is_tty() -> bool:
+    return bool(console.err.is_terminal)
+
+
+def say_err(message: str, **kwargs: Any) -> None:
+    """Print a stderr line, first wiping a live in-place tick (no half-overwritten text)."""
+    global _tick_visible
+    with _tick_lock:
+        if _tick_visible:
+            console.err.file.write(_CLEAR_LINE)
+            console.err.file.flush()
+            _tick_visible = False
+        console.err.print(message, **kwargs)
+
+
+class Heartbeat:
+    """Stderr pulse so a long local call never looks frozen.
+
+    tty: one line rewritten in place (cleared before any other output);
+    non-tty: a full line at most every NONTTY_INTERVAL s.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        is_tty: Callable[[], bool] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.label = label
+        self._is_tty = is_tty or _stderr_is_tty  # resolved per tick, never bound at import
+        self._clock = clock
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._start = 0.0
+        self._last_line = 0.0
 
     def _run(self) -> None:
         while not self._stop.wait(PROGRESS_INTERVAL):
-            seconds = int(time.monotonic() - self._start)
-            console.err.print(f"  … {self.label} {seconds} s", style="dim", markup=False)
+            self._pulse()
+
+    def _pulse(self) -> None:
+        global _tick_visible
+        now = self._clock()
+        text = f"  … {self.label} {int(now - self._start)} s"
+        with _tick_lock:
+            if self._stop.is_set():
+                return
+            if self._is_tty():
+                console.err.file.write(f"{_CLEAR_LINE}{text}")
+                console.err.file.flush()
+                _tick_visible = True
+            elif now - self._last_line >= NONTTY_INTERVAL:
+                self._last_line = now
+                console.err.print(text, style="dim", markup=False, highlight=False)
 
     def __enter__(self) -> Heartbeat:
-        self._start = time.monotonic()
+        self._start = self._last_line = self._clock()
         self._thread.start()
         return self
 
     def __exit__(self, *exc: object) -> None:
+        global _tick_visible
         self._stop.set()
         self._thread.join(timeout=2)
+        with _tick_lock:
+            if _tick_visible:
+                console.err.file.write(_CLEAR_LINE)
+                console.err.file.flush()
+                _tick_visible = False
 
 
 def _run_cell(
@@ -497,7 +551,7 @@ def _run_cell(
 ) -> BenchRun:
     ledger: list[CallRecord] = []
     label = f"{backend.name} #{question.id} прогон {run}"
-    console.err.print(f"→ {label}", style="dim", markup=False)
+    say_err(f"→ {label}", style="dim", markup=False)
 
     def on_call(entry: LedgerEntry) -> None:
         ledger.append(
@@ -511,9 +565,7 @@ def _run_cell(
                 cost=ledger_cost(entry, prices),
             )
         )
-        console.err.print(
-            f"  {entry.stage} {entry.latency_ms / 1000:.1f} s", style="dim", markup=False
-        )
+        say_err(f"  {entry.stage} {entry.latency_ms / 1000:.1f} s", style="dim", markup=False)
 
     retries = 0
     started = clock()
@@ -525,7 +577,7 @@ def _run_cell(
             except AdventError as error:
                 if error.exit_code not in rag_cli.TRANSIENT_EXIT_CODES:
                     raise
-                console.warn(f"{label}: {error.message} — повтор")
+                say_err(f"{label}: {error.message} — повтор", style="yellow", markup=False)
                 pause(RETRY_PAUSE_S)
                 retries = 1
                 mode_run = ask(backend, question, run, on_call)
