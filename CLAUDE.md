@@ -1349,3 +1349,47 @@ server log lists every unload, and the day's two were deliberate reloads. Read
 that log before suspecting a neighbour. ornith runs at `-Context 40960` next to
 bge-m3, leaving 899 MiB free; at 57344 only 309 MiB were free and generation
 fell to 42 tok/s.
+
+**On this repo's RAG, the local system beat the cloud on quality and lost on
+speed.** Day 28, both indexes from `6ee4ac4`, 10 control questions + 3
+unanswerable, 3 runs each, cite mode: bge-m3 + ornith found 38/45 facts and was
+right in all runs on 11/13 questions; mistral-embed + ministral-14b found 29/45
+and 7/13, with one rerank reply that was not JSON. The cloud was 1.6× faster per
+question (22.6 s against 36.4 s; the local answer carries ~6× the completion
+tokens because of reasoning) and named an expected source in its quotes more often
+(22/24 against 15/26). It is a comparison of configured systems — the local
+rerank is grammar-constrained, the cloud one is prompted — not of models.
+
+**A reused helper must carry the backend's config, or "local" is only half
+local.** `week_05.rag_cli.build_agent()` never passed `aux_config`, so the
+day-28 probe through `adventrag eval` with a loopback `ADVENT_BASE_URL` sent its
+rewrite/rerank calls under `RAG_AUX_MODEL` (`ministral-14b-latest`) to LM
+Studio — and the run still completed, so nothing looked wrong. Assert the model
+and endpoint of every stage per backend; the bench's per-call ledger is what
+makes that visible.
+
+**Never run pytest while a live run writes the journal.** `tests/conftest.py`
+fails any test during which the real `logs/calls.jsonl` changed; a live
+`adventlocal rag` writing it in parallel turned ~41 unrelated tests into
+"wrote to the real journal" errors. The suite alone: 2916 passed.
+
+**The GPU is shared with other sessions, and a neighbour causes the same VRAM
+cliff as an oversized context.** An Android emulator from another session left
+466 MiB free and ornith fell to 10–16 tok/s with no error. Agree a GPU window by
+message before measuring or recording, and say "GPU free" afterwards. LM Studio
+also vanished twice that day with nothing in its server log (`llama-server`
+alone, then the whole app); check `nvidia-smi` and `adventlocal status` right
+before a take, not an hour earlier.
+
+**A measurement that is too slow to film is replayed, not re-run.**
+`adventlocal rag --save` writes every run; `--report PATH...` merges saved files
+(refusing a different `corpus_rev` or question set) and prints the full report
+without network. That is how the local and cloud halves were measured in
+different windows. The 6:12 take was judged too long and was sped up ×3 in post
+with an on-screen "ускорено ×3" label — on a day about speed, timings on screen
+must stay real, so the label is mandatory — and the final screen was held 10 s,
+because the tables had appeared only 4 s before the end.
+
+**`codex exec` in a background shell waits on stdin.** It printed "Reading
+additional input from stdin..." and hung for the whole review; pass
+`< /dev/null`.
