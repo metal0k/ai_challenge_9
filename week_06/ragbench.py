@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -41,9 +42,12 @@ from week_05 import cli as rag_index_cli
 from week_05 import index as index_module
 from week_05 import rag as rag_module
 from week_05 import rag_cli
+from week_06 import profiles, vram
+from week_06.profiles import Profile
 
 WEEK = 6
 DAY = 28
+PROFILE_DAY = profiles.PROFILE_DAY  # a run made with --profile is journaled as day 29
 BACKENDS = ("cloud", "local")  # execution order, not display order
 LOCAL_MODEL = "ornith"
 CLOUD_MODEL = "ministral-14b-latest"
@@ -92,6 +96,12 @@ class Backend:
     config: Config
     db_path: Path
     run: Any = None  # index RunInfo (corpus_rev, embed model) for the report
+    profile: Profile | None = None  # local only; None = plain Day 28 settings
+    identity: Mapping[str, Any] | None = None  # loaded model as /api/v0/models reports it
+
+    @property
+    def day(self) -> int:
+        return PROFILE_DAY if self.profile is not None else DAY
 
     @property
     def endpoint(self) -> str:
@@ -136,20 +146,36 @@ def local_config(url: str | None = None, model: str = LOCAL_MODEL) -> Config:
     )
 
 
-def apply_rag_settings(params: GenerationParams) -> None:
-    """Every RAG setting explicit; sampling params stay unset (server defaults)."""
+def apply_rag_settings(params: GenerationParams, profile: Profile | None = None) -> None:
+    """Every RAG setting explicit: the fixed ones first, then the profile (baseline = Day 28).
+
+    The profile goes last on purpose: the per-cell reset used to overwrite it (SPEC-w06d29 9a-1).
+    Unset sampling stays None (server default); aux calls ignore all of this (t=0, no reasoning).
+    """
     params.rag_strategy = STRATEGY
     params.rag_k = K
-    params.rag_k_before = K_BEFORE
     params.rag_threshold = THRESHOLD
     params.rag = True
     params.rag_rewrite = True
     params.rag_rerank = True
     params.rag_cite = True
     params.rag_aux_reasoning = False
-    params.max_tokens = ANSWER_MAX_TOKENS
-    params.temperature = None
-    params.top_p = None
+    chosen = profile if profile is not None else profiles.BASELINE
+    params.rag_k_before = chosen.k_before
+    params.rag_rerank_format = chosen.rerank_format
+    params.rag_cite_prompt = chosen.cite_prompt
+    params.max_tokens = chosen.answer_max_tokens
+    params.temperature = chosen.answer_temperature
+    params.top_p = chosen.answer_top_p
+    params.top_k = chosen.answer_top_k
+    params.reasoning_effort = None if chosen.answer_reasoning else "none"
+
+
+def request_config(backend: Backend) -> Config:
+    """Config of one answer (isolated copy plus settings); the settings report reads it too."""
+    config = isolated_config(backend.config)
+    apply_rag_settings(config.params, backend.profile)
+    return config
 
 
 def isolated_config(config: Config) -> Config:
@@ -163,19 +189,65 @@ def make_cloud_backend(config: Config, db_path: Path | None = None) -> Backend:
     return Backend("cloud", config, db, run)
 
 
-def make_local_backend(config: Config, db_path: Path | None = None) -> Backend:
+def model_identity(info: Any) -> dict[str, Any]:
+    """What /api/v0/models says about the loaded model (publisher only if the API offers it)."""
+    return {
+        "id": getattr(info, "id", None),
+        "quantization": getattr(info, "quantization", None),
+        "loaded_context_length": getattr(info, "loaded_context_length", None),
+        "arch": getattr(info, "arch", None),
+        "publisher": getattr(info, "publisher", None),
+    }
+
+
+def check_loaded_matches(info: Any, profile: Profile) -> None:
+    """Refuse to measure a profile on a differently loaded model.
+
+    The API reports a quantization string, not a file, so publisher is the only way to tell
+    ornith-ai Q4_K_M from bartowski Q4_K_M: a KNOWN publisher that differs is refused, an absent
+    one is allowed (and saved as unknown, never filled in from the profile).
+    """
+    quant = getattr(info, "quantization", None)
+    context = getattr(info, "loaded_context_length", None)
+    publisher = getattr(info, "publisher", None)
+    problems: list[str] = []
+    if publisher and str(publisher).strip().lower() != profile.publisher.lower():
+        problems.append(f"издатель {publisher} вместо {profile.publisher}")
+    if str(quant or "").strip().upper() != profile.quant.upper():
+        problems.append(f"quant {quant or 'неизвестен'} вместо {profile.quant}")
+    if context != profile.context:
+        shown = context if context is not None else "неизвестен"
+        problems.append(f"контекст {shown} вместо {profile.context}")
+    if problems:
+        raise AdventError(
+            f"Загружена не та модель для профиля {profile.name}: {'; '.join(problems)}.",
+            hint=(
+                f"Загрузи {profile.gguf} ({profile.publisher}) через "
+                f"start-local-llm.ps1 -Context {profile.context}."
+            ),
+        )
+
+
+def make_local_backend(
+    config: Config, db_path: Path | None = None, profile: Profile | None = None
+) -> Backend:
     """Local pre-flight: index built locally, embedding model loaded, ornith loaded.
 
     Must run only in the local phase: the guard is already on and a cloud-built index
-    is refused by `check_index`.
+    is refused by `check_index`. With a profile the loaded model must match its quant and
+    context (the model is loaded by hand, never by this code).
     """
     db = db_path or index_module.LOCAL_DB
     base = str(config.base_url)
     run = rag_module.check_index(db, STRATEGY)
     rag_index_cli._warm_up_jit_model(run, base)
     oc.ensure_ready(run.model, base, require_state=True)
-    oc.ensure_ready(config.model, base, require_state=True)
-    return Backend("local", config, db, run)
+    if profile is None:
+        info = oc.ensure_ready(config.model, base, require_state=True)
+    else:
+        info = oc.loaded_model_info(config.model, base)
+        check_loaded_matches(info, profile)
+    return Backend("local", config, db, run, profile, model_identity(info))
 
 
 def _index_run(db: Path, backend: str) -> Any:
@@ -317,8 +389,7 @@ def default_ask(
     backend: Backend, question: Question, run: int, on_call: OnCallFn
 ) -> rag_cli.ModeRun:
     """One answer through the permanent pipeline; a fresh agent and params per cell."""
-    config = isolated_config(backend.config)
-    apply_rag_settings(config.params)
+    config = request_config(backend)
     identity = {
         "command": "ragbench",
         "backend": backend.name,
@@ -328,7 +399,7 @@ def default_ask(
     agent = rag_cli.build_agent(
         config,
         backend.db_path,
-        DAY,
+        backend.day,
         aux_config=config,
         week=WEEK,
         extra=identity,
@@ -340,7 +411,7 @@ def default_ask(
         mode="cite",
         command="ragbench",
         question_id=question.id,
-        day=DAY,
+        day=backend.day,
         week=WEEK,
         extra=identity,
         on_call=on_call,
@@ -620,12 +691,22 @@ class BenchResult:
     failed: str | None = None  # a backend's setup failed after earlier results were kept
     settings: dict[str, Any] = field(default_factory=dict)
     question_count: int | None = None  # set when rebuilt from --save files (no Plan)
+    started_at: str | None = None  # ISO local time; legacy files have none
+    finished_at: str | None = None
+    profile: Profile | None = None
+    model_identity: dict[str, Any] | None = None
+    vram: dict[str, int | None] | None = None  # None = no sampler ran
 
     @property
     def n_questions(self) -> int:
         if self.plan is not None:
             return len(self.plan.questions) + len(self.plan.unanswerable)
         return self.question_count or 0
+
+
+def _now() -> str:
+    """Seam: local wall-clock time as ISO text (tests replace it)."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def run_bench(
@@ -640,15 +721,20 @@ def run_bench(
     pause: Callable[[float], None] | None = None,
     heartbeat: Callable[[str], AbstractContextManager] | None = None,
     on_run: Callable[[BenchRun, int], None] | None = None,
+    vram_sampler: Callable[[], Any] | None = None,
 ) -> BenchResult:
-    """Cloud phase, then guard + counter reset, then local; run-major order in each backend."""
+    """Cloud phase, then guard + counter reset, then local; run-major order in each backend.
+
+    vram_sampler: factory of a started-by-us sampler (start/stop); sampled only in the local
+    phase. None (Day 28 behaviour) runs no sampler at all.
+    """
     if "cloud" in factories and offline_mod.is_enabled():
         raise AdventError(
             "Offline-режим уже включён в этом процессе — облачный backend недоступен.",
             hint="Запусти `adventlocal rag --backends local` или сними ADVENT_OFFLINE.",
         )
     sleeper = pause if pause is not None else _pause
-    result = BenchResult(n_runs=runs, plan=plan)
+    result = BenchResult(n_runs=runs, plan=plan, started_at=_now())
     items: list[Question] = [*plan.questions, *plan.unanswerable]
     emit = on_run if on_run is not None else print_run_line
     for name in BACKENDS:
@@ -670,22 +756,32 @@ def run_bench(
             continue
         result.backends.append(name)
         result.settings[name] = effective_settings(backend)
+        if name == "local":
+            result.profile = backend.profile
+            result.model_identity = dict(backend.identity) if backend.identity else None
+        sampler = vram_sampler() if name == "local" and vram_sampler is not None else None
+        if sampler is not None:
+            sampler.start()
         mine: list[BenchRun] = []
-        for run in range(1, runs + 1):
-            for question in items:
-                cell = _run_cell(
-                    backend,
-                    question,
-                    run,
-                    ask=ask,
-                    prices=prices,
-                    clock=clock,
-                    pause=sleeper,
-                    heartbeat=heartbeat,
-                )
-                mine.append(cell)
-                result.runs.append(cell)
-                emit(cell, runs)
+        try:
+            for run in range(1, runs + 1):
+                for question in items:
+                    cell = _run_cell(
+                        backend,
+                        question,
+                        run,
+                        ask=ask,
+                        prices=prices,
+                        clock=clock,
+                        pause=sleeper,
+                        heartbeat=heartbeat,
+                    )
+                    mine.append(cell)
+                    result.runs.append(cell)
+                    emit(cell, runs)
+        finally:
+            if sampler is not None:
+                result.vram = sampler.stop().as_dict()
         if name == "local":
             counts = offline_mod.counters()
             ledger_calls = [c for r in mine for c in r.ledger if c.stage != "search"]
@@ -696,30 +792,87 @@ def run_bench(
                 ledger_local=sum(1 for c in ledger_calls if c.endpoint == "local"),
                 ledger_cloud=sum(1 for c in ledger_calls if c.endpoint != "local"),
             )
+    result.finished_at = _now()
     return result
 
 
-def effective_settings(backend: Backend) -> dict[str, Any]:
+LMSTUDIO_OVERRIDE_DIR = (
+    Path.home() / ".lmstudio" / ".internal" / "user-concrete-model-default-config"
+)
+SAMPLING_SERVER_DEFAULT = "server_default_unknown"
+SAMPLING_NOTE_NOT_FOUND = (
+    "дефолт сервера LM Studio (значения неизвестны; per-model override не найден)"
+)
+SAMPLING_NOTE_FOUND = (
+    "дефолт сервера LM Studio (значения неизвестны; найден per-model override: {})"
+)
+
+
+def find_model_override(model: str, directory: Path | None = None) -> str | None:
+    """Name of a per-model LM Studio config file mentioning `model`; read-only, no `lms`."""
+    folder = directory if directory is not None else LMSTUDIO_OVERRIDE_DIR
+    try:
+        names = sorted(p.name for p in folder.rglob("*") if p.is_file())
+    except OSError:
+        return None
+    key = model.lower()
+    return next((n for n in names if key in n.lower()), None)
+
+
+def sampling_provenance(
+    params: GenerationParams, model: str, directory: Path | None = None
+) -> dict[str, Any]:
+    """Where each answer sampling value comes from: the profile, or the unknown server default."""
+    sources = {
+        name: ("profile" if getattr(params, name) is not None else SAMPLING_SERVER_DEFAULT)
+        for name in ("temperature", "top_p", "top_k")
+    }
+    override = find_model_override(model, directory)
+    out: dict[str, Any] = {
+        "sampling_source": sources,
+        "model_override_found": override is not None,
+        "model_override_file": override,
+    }
+    if SAMPLING_SERVER_DEFAULT in sources.values():
+        out["sampling_note"] = (
+            SAMPLING_NOTE_FOUND.format(override) if override else SAMPLING_NOTE_NOT_FOUND
+        )
+    return out
+
+
+def effective_settings(backend: Backend, override_dir: Path | None = None) -> dict[str, Any]:
+    """Settings read from the config the answer is really sent with (request_config)."""
     run = backend.run
-    return {
+    p = request_config(backend).params
+    out: dict[str, Any] = {
         "model": backend.config.model,
         "endpoint": backend.endpoint,
         "index": backend.db_path.name,
         "embed_model": getattr(run, "model", None),
         "corpus_rev": getattr(run, "corpus_rev", None),
-        "strategy": STRATEGY,
-        "k": K,
-        "k_before": K_BEFORE,
-        "threshold": THRESHOLD,
-        "rewrite": True,
-        "rerank": True,
-        "cite": True,
-        "aux_reasoning": False,
-        "answer_max_tokens": ANSWER_MAX_TOKENS,
-        "temperature": None,
-        "top_p": None,
+        "strategy": p.rag_strategy,
+        "k": p.rag_k,
+        "k_before": p.rag_k_before,
+        "threshold": p.rag_threshold,
+        "rewrite": p.rag_rewrite,
+        "rerank": p.rag_rerank,
+        "cite": p.rag_cite,
+        "aux_reasoning": p.rag_aux_reasoning,
+        "answer_max_tokens": p.max_tokens,
+        "temperature": p.temperature,
+        "top_p": p.top_p,
+        "top_k": p.top_k,
+        "answer_reasoning": p.reasoning_effort != "none",
+        "rerank_format": p.rag_rerank_format,
+        "cite_prompt": p.rag_cite_prompt,
         "protocol": PROTOCOLS[backend.name],
     }
+    if backend.name == "local":
+        out.update(sampling_provenance(p, backend.config.model, override_dir))
+    if backend.profile is not None:
+        out["profile"] = backend.profile.name
+        out["profile_fields"] = profiles.settings_dict(backend.profile)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1153,12 +1306,36 @@ def offline_line(report: OfflineReport) -> str:
     )
 
 
+def identity_line(identity: Mapping[str, Any] | None) -> str:
+    if not identity:
+        return "модель: неизвестно"
+    parts = [
+        f"{key} {identity.get(key)}"
+        for key in ("id", "quantization", "loaded_context_length", "arch", "publisher")
+        if identity.get(key) is not None
+    ]
+    return "модель: " + (", ".join(parts) if parts else "неизвестно")
+
+
+def profile_lines(result: BenchResult) -> list[str]:
+    """Profile, loaded-model identity and VRAM; nothing for a plain Day 28 run."""
+    lines: list[str] = []
+    if result.profile is not None:
+        lines.append(f"профиль: {result.profile.name} — {result.profile.title}")
+        lines.append(identity_line(result.model_identity))
+    if result.vram is not None:
+        lines.append(vram.describe(vram.report_from_dict(result.vram)))
+    return lines
+
+
 def print_report(result: BenchResult) -> None:
     """Counter line, three tables, conclusions; a failed acceptance repeats in red at the end."""
     out = console.out
     if result.offline is not None:
         out.print("")
         out.print(offline_line(result.offline), markup=False, highlight=False)
+    for line in profile_lines(result):
+        out.print(line, markup=False, highlight=False)
     if result.runs:
         out.print("")
         for table in (
@@ -1200,7 +1377,13 @@ def result_to_json(result: BenchResult) -> dict[str, Any]:
     plan = result.plan
     return {
         "week": WEEK,
-        "day": DAY,
+        "day": PROFILE_DAY if result.profile is not None else DAY,
+        "started_at": result.started_at,
+        "finished_at": result.finished_at,
+        "profile": result.profile.name if result.profile is not None else None,
+        "profile_fields": profiles.settings_dict(result.profile) if result.profile else None,
+        "model_identity": result.model_identity,
+        "vram": result.vram,
         "runs": result.n_runs,
         "backends": result.backends,
         "skipped": result.skipped,
@@ -1259,10 +1442,20 @@ def run_rag_command(
     save: Path | None = None,
     url: str | None = None,
     prices_loader: Callable[[], PriceTable] | None = None,
+    profile: str | None = None,
+    vram_sampler: Callable[[], Any] | None = None,
 ) -> int:
     """Everything the `rag` command does; returns the process exit code."""
     wanted = parse_backends(backends)
     ids = parse_ids(questions)
+    chosen = profiles.get_profile(profile) if profile else None
+    if chosen is not None and chosen.name != profiles.BASELINE.name and wanted != ["local"]:
+        raise ConfigError(
+            f"Профиль {chosen.name} применяется только к локальной модели: "
+            "укажи --backends local (облако не профилируется)."
+        )
+    if chosen is not None and vram_sampler is None:
+        vram_sampler = vram.VramSampler
     cloud_cfg: Config | None = None
     if "cloud" in wanted:
         # ADVENT_OFFLINE in env/.env turns the guard on at the first HTTP call: refuse before.
@@ -1297,8 +1490,18 @@ def run_rag_command(
     if cloud_cfg is not None:
         factories["cloud"] = lambda: make_cloud_backend(cloud_cfg)
     if "local" in wanted:
-        factories["local"] = lambda: make_local_backend(local_config(local_url))
-    result = run_bench(factories, plan, runs=runs, prices=prices, heartbeat=Heartbeat)
+        if chosen is None:
+            factories["local"] = lambda: make_local_backend(local_config(local_url))
+        else:
+            factories["local"] = lambda: make_local_backend(local_config(local_url), profile=chosen)
+    result = run_bench(
+        factories,
+        plan,
+        runs=runs,
+        prices=prices,
+        heartbeat=Heartbeat,
+        vram_sampler=vram_sampler,
+    )
     print_report(result)
     if save is not None:
         save_json(result, save)

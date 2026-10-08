@@ -74,6 +74,17 @@ RAG_RERANK_LOCAL_TAIL = (
     'Ответь ТОЛЬКО JSON-объектом вида {"scores": [{"id": 1, "score": 0}, ...]} '
     "— по одной записи на каждый из {n} фрагментов, без пояснений и без текста вокруг."
 )
+# Day 29, local only: one int per fragment in order (~2-3 tokens each against ~15 for objects).
+RAG_RERANK_INSTRUCTION_POSITIONAL = (
+    "Оцени, насколько каждый фрагмент помогает ответить на вопрос. "
+    "Шкала 0–10: 10 — фрагмент содержит прямой ответ, 0 — не относится. "
+    'Верни JSON {"scores": [оценка фрагмента 1, оценка фрагмента 2, ...]} — '
+    "ровно {n} целых чисел по порядку фрагментов."
+)
+RAG_RERANK_LOCAL_TAIL_POSITIONAL = (
+    'Ответь ТОЛЬКО JSON-объектом вида {"scores": [7, 0, 10, ...]} — '
+    "ровно {n} целых чисел от 0 до 10 по порядку фрагментов, без пояснений и без текста вокруг."
+)
 RRF_K0 = 60
 _REWRITE_STRIP = ' \t*`"«»'
 _DIGIT_GAP_RE = re.compile(r"(?<=\d)\s+(?=\d)")
@@ -117,6 +128,8 @@ class RagSettings:
     last_question: str | None = None
     # Day 25: the beginning of the answer to last_question (what "тогда" points at).
     last_answer: str | None = None
+    # Day 29: "positional" asks a LOCAL reranker for a bare int array; cloud ignores it.
+    rerank_format: str = "objects"
 
     def __post_init__(self) -> None:
         last = (self.last_question or "").strip()
@@ -290,7 +303,9 @@ def resolved_question(
     return f"{question}\n{RAG_CONTEXT_LABEL} {'; '.join(parts)})"
 
 
-def build_rerank_prompt(question: str, hits: Sequence[RagHit], *, local: bool = False) -> str:
+def build_rerank_prompt(
+    question: str, hits: Sequence[RagHit], *, local: bool = False, positional: bool = False
+) -> str:
     """Rerank request: instruction, question, numbered whole chunks, question again.
 
     The question before the fragments is measured: with it only at the end the reranker
@@ -302,11 +317,14 @@ def build_rerank_prompt(question: str, hits: Sequence[RagHit], *, local: bool = 
         if hit.section.strip():
             header += f" — {hit.section}"
         blocks.append(header + "\n" + hit.text.strip())
-    instruction = RAG_RERANK_INSTRUCTION.replace("{n}", str(len(hits)))
+    instruction = (
+        RAG_RERANK_INSTRUCTION_POSITIONAL if positional else RAG_RERANK_INSTRUCTION
+    ).replace("{n}", str(len(hits)))
     line = f"{RAG_QUESTION_LABEL} {question}"
     parts = [instruction, line, *blocks, line]
     if local:
-        parts.append(RAG_RERANK_LOCAL_TAIL.replace("{n}", str(len(hits))))
+        tail = RAG_RERANK_LOCAL_TAIL_POSITIONAL if positional else RAG_RERANK_LOCAL_TAIL
+        parts.append(tail.replace("{n}", str(len(hits))))
     return "\n\n".join(parts)
 
 
@@ -339,11 +357,26 @@ def _find_scores_object(raw: str) -> dict | None:
     return found[0] if found else None
 
 
-def parse_rerank(raw: str, n: int, *, tolerant: bool = False) -> dict[int, float]:
+def _positional_scores(entries: list, n: int, hint: str) -> dict[int, float]:
+    """Positional contract: exactly n ints in 0..10, nothing partial (a format error otherwise)."""
+    if len(entries) != n:
+        raise AdventError(f"Reranker вернул {len(entries)} оценок вместо {n}.", hint=hint)
+    for value in entries:
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10:
+            raise AdventError(f"Позиционная оценка {value!r} не целое число 0–10.", hint=hint)
+    return {i: float(value) for i, value in enumerate(entries, start=1)}
+
+
+def parse_rerank(
+    raw: str, n: int, *, tolerant: bool = False, positional: bool = False
+) -> dict[int, float]:
     """Scores by 1-based id for the chunks the reranker rated; AdventError if unusable.
 
     tolerant (local aux model only): pull one JSON object out of surrounding prose/fences;
     the cloud path keeps the strict contract.
+    positional (the caller asked for a bare int array): exactly n ints 0..10, whatever else
+    arrives (objects, mixed arrays, bools, floats) is a format error. Without it, a list with
+    no objects is still read positionally and the object format stays tolerant.
     """
     hint = "Повторите вопрос или выключите rag_rerank."
     text = raw.strip()
@@ -359,6 +392,8 @@ def parse_rerank(raw: str, n: int, *, tolerant: bool = False) -> dict[int, float
     entries = data.get("scores") if isinstance(data, dict) else None
     if not isinstance(entries, list):
         raise AdventError("В ответе reranker'а нет списка scores.", hint=hint)
+    if positional or (entries and not any(isinstance(entry, dict) for entry in entries)):
+        return _positional_scores(entries, n, hint)
     scores: dict[int, float] = {}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -506,6 +541,16 @@ def cited_sources(answer: str, sources: Sequence[str]) -> tuple[bool, ...]:
 # --- Day 24: cited answers (SPEC-w05d24.md §2 + §9a) ---
 
 RAG_MIN_QUOTE_CHARS = 12  # after normalisation; shorter is not a quote ("1.5")
+# Day 29, `rag_cite_prompt=local`: shorter and concrete; same grammar, only the text differs.
+# Written without the control questions' wording (tests compare the word sets).
+RAG_CITE_INSTRUCTION_LOCAL = (
+    "Сначала выбери единственный фрагмент, который прямо отвечает на вопрос. Верни JSON "
+    '{"status": "answer" или "unknown", "answer": "...", "sources": [номер], '
+    '"quotes": [{"id": номер, "text": "цитата"}]}. '
+    "Цитату копируй дословно ИЗ ЭТОГО фрагмента, а id — его номер в квадратных скобках "
+    "из заголовка. Цитат не больше двух. Поле answer — простая строка. "
+    'Если фрагменты не подходят — "status": "unknown", остальные поля пустые.'
+)
 RAG_CITE_INSTRUCTION = (
     "Ответь только по фрагментам документации ниже. Верни JSON "
     '{"status": "answer" или "unknown", "answer": "...", "sources": [номера фрагментов], '
@@ -619,7 +664,9 @@ def quote_in(quote: str, chunk_text: str) -> bool:
     return len(needle) >= RAG_MIN_QUOTE_CHARS and needle in quote_norm(chunk_text)
 
 
-def build_cite_prompt(question: str, hits: Sequence[RagHit]) -> str:
+def build_cite_prompt(
+    question: str, hits: Sequence[RagHit], *, instruction: str = RAG_CITE_INSTRUCTION
+) -> str:
     """Cite request: instruction, question, numbered whole chunks, question again."""
     blocks: list[str] = []
     for n, hit in enumerate(hits, start=1):
@@ -628,7 +675,7 @@ def build_cite_prompt(question: str, hits: Sequence[RagHit]) -> str:
             header += f" — {hit.section}"
         blocks.append(header + "\n" + hit.text.strip())
     line = f"{RAG_QUESTION_LABEL} {question}"
-    return "\n\n".join([RAG_CITE_INSTRUCTION, line, *blocks, line])
+    return "\n\n".join([instruction, line, *blocks, line])
 
 
 def _label(hit: RagHit) -> str:

@@ -29,7 +29,8 @@ from advent_core.journal import log_call
 from advent_core.params import GenerationParams
 from advent_core.telemetry import CallResult, Usage
 from week_01.models_bench import PriceTable, call_cost, load_prices, warn_if_prices_stale
-from week_06 import codecheck, ragbench, tasks
+from week_06 import codecheck, profiles, ragbench, tasks, vram
+from week_06 import compare as compare_module
 from week_06 import local_client as lc
 
 WEEK = 6
@@ -110,6 +111,7 @@ def status_command(
     show_all: bool = typer.Option(
         False, "--all", help="Показать и незагруженные модели (по умолчанию только loaded)."
     ),
+    vram_flag: bool = typer.Option(False, "--vram", help="Показать занятую VRAM (nvidia-smi)."),
 ) -> None:
     """Загруженные модели сервера по HTTP; exit 2, если нужная модель не загружена."""
     base = (url or lc.default_url()).rstrip("/")
@@ -127,9 +129,17 @@ def status_command(
     found = lc.check_ready(models, model, base)
     ctx = f", контекст {found.loaded_context_length}" if found.loaded_context_length else ""
     state = found.state or "неизвестно"
+    quant = f", quant {rich_escape(found.quantization)}" if found.quantization else ""
     console.out.print(
-        f"модель {rich_escape(model)}: готова (state: {rich_escape(state)}{ctx})", highlight=False
+        f"модель {rich_escape(model)}: готова (state: {rich_escape(state)}{ctx}{quant})",
+        highlight=False,
     )
+    if vram_flag:
+        sample = vram.query_nvidia_smi()
+        report = (
+            vram.VramReport(*(sample[0], sample[0], sample[1])) if sample else vram.VramReport()
+        )
+        console.out.print(rich_escape(vram.describe(report)), highlight=False)
 
 
 # ---------------------------------------------------------------------------
@@ -739,8 +749,32 @@ def rag_command(
         help="Только отчёт из файла --save (повторяемо: склеивает backend'ы), без сети.",
     ),
     url: str | None = _URL_OPT,
+    profile: str | None = typer.Option(
+        None,
+        "--profile",
+        help="Профиль настроек локальной модели (adventlocal profiles); не baseline — только "
+        "с --backends local.",
+    ),
+    compare: bool = typer.Option(
+        False,
+        "--compare",
+        help="Профили бок о бок из файлов --save (`--compare F1 F2 …`, первый — опорный), "
+        "без сети.",
+    ),
+    files: list[Path] | None = typer.Argument(None, help="Файлы --save для --compare."),
 ) -> None:
     """RAG (rewrite + rerank + cite) в облаке и локально: качество, скорость, стабильность."""
+    if files and not compare:
+        raise ConfigError("Файлы в аргументах нужны только вместе с --compare.")
+    if compare:
+        if save is not None or report or profile:
+            raise ConfigError("--compare не сочетается с --save, --report и --profile.")
+        if not files:
+            raise ConfigError("--compare: укажи файлы --save (первый — опорный).")
+        code = compare_module.run_compare_command(files)
+        if code:
+            raise typer.Exit(code)
+        return
     if report:
         if save is not None:
             raise ConfigError("--report не сочетается с --save: отчёт ничего не запускает.")
@@ -755,9 +789,21 @@ def rag_command(
         unanswerable=unanswerable,
         save=save,
         url=url,
+        profile=profile,
     )
     if code:
         raise typer.Exit(code)
+
+
+@app.command("profiles")
+def profiles_command(
+    names: list[str] | None = typer.Argument(
+        None, help="Какие профили показать (по умолчанию все); baseline есть всегда."
+    ),
+) -> None:
+    """Профили локального RAG: строки — поля, колонки — профили, отличия от baseline выделены."""
+    for table in profiles.profiles_tables(names):
+        console.out.print(table)
 
 
 def main() -> None:

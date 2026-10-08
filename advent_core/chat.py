@@ -424,7 +424,7 @@ def _payload(
     именно им, а вычислять format/schema дважды — плодить второй источник
     истины.
     """
-    extra, skipped = config.params.as_payload(capabilities)
+    extra, skipped = config.params.as_payload(capabilities, local_server=config.is_local)
 
     format_name = config.params.format or "text"
     try:

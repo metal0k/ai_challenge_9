@@ -182,6 +182,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 6 and day == 29:
+        return _demo_steps_w06d29()
     if week == 6 and day == 28:
         return _demo_steps_w06d28()
     if week == 6 and day == 27:
@@ -2296,6 +2298,115 @@ def _rehearsal_steps_w06d28() -> list[Step]:
     ]
 
 
+# Day 29: measurement files are local, gitignored artifacts like day 28's (SPEC-w06d29 3.7).
+# They do not exist until the GPU windows are done; `rag --compare` fails loudly if one is
+# missing, which is also what the rehearsal relies on.
+_W06D29_DIR = "logs/ragbench"
+_W06D29_SCREENING = (
+    "baseline",
+    "sampling",
+    "cap",
+    "noreason",
+    "ctx24k",
+    "positional",
+    "k12",
+    "citelocal",
+    "q4b",
+    "q3",
+    "q5",
+)
+_W06D29_TUNED = "tuned"  # added to week_06/profiles.py only after screening
+_W06D29_SCREENING_FILES = [f"{_W06D29_DIR}/w06d29_{n}_10x1.json" for n in _W06D29_SCREENING]
+_W06D29_FINAL_FILES = [f"{_W06D29_DIR}/w06d29_{n}_13x3.json" for n in ("baseline", _W06D29_TUNED)]
+# Placeholder ids until the screening shows which questions are worth filming live.
+_W06D29_LIVE_QUESTIONS = "1,7,9"
+_W06D29_TIMEOUT = 1800
+
+
+def _demo_steps_w06d29() -> list[Step]:
+    """Day 29 - tuning the local RAG: profiles, screening table, final table, one live run.
+
+    Every command that names a profile also names `--backends local`: a non-baseline profile
+    with any other backend set is a ConfigError. The compare tables are offline.
+    """
+    return [
+        Step(
+            title="1. Что загружено: quant, контекст, VRAM",
+            module="week_06.cli",
+            args=["status", "--vram"],
+            timeout=60,
+        ),
+        Step(
+            title="2. Профили: до и после",
+            module="week_06.cli",
+            args=["profiles", "baseline", _W06D29_TUNED],
+            timeout=60,
+        ),
+        Step(
+            title="3. Скрининг рычагов 10x1, из сохранённых замеров",
+            module="week_06.cli",
+            args=["rag", "--compare", *_W06D29_SCREENING_FILES],
+            timeout=120,
+        ),
+        Step(
+            title="4. Финал 13x3, из сохранённых замеров",
+            module="week_06.cli",
+            args=["rag", "--compare", *_W06D29_FINAL_FILES],
+            timeout=120,
+        ),
+        Step(
+            title="5. Живой прогон «после»",
+            module="week_06.cli",
+            args=[
+                "rag",
+                "--profile",
+                _W06D29_TUNED,
+                "--backends",
+                "local",
+                "--questions",
+                _W06D29_LIVE_QUESTIONS,
+                "--runs",
+                "1",
+                "--no-unanswerable",
+            ],
+            timeout=_W06D29_TIMEOUT,
+        ),
+    ]
+
+
+def _rehearsal_steps_w06d29() -> list[Step]:
+    """Readiness gates and the two offline tables (they prove the measurement files are there)."""
+    return [
+        Step(
+            title="репетиция: status", module="week_06.cli", args=["status", "--vram"], timeout=60
+        ),
+        Step(
+            title="репетиция: локальный RAG-индекс и embedding-модель",
+            module="week_05.cli",
+            args=["check"],
+            timeout=60,
+        ),
+        Step(
+            title="репетиция: профили",
+            module="week_06.cli",
+            args=["profiles", "baseline", _W06D29_TUNED],
+            timeout=60,
+        ),
+        Step(
+            title="репетиция: таблица скрининга из файлов",
+            module="week_06.cli",
+            args=["rag", "--compare", *_W06D29_SCREENING_FILES],
+            timeout=120,
+        ),
+        Step(
+            title="репетиция: таблица финала из файлов",
+            module="week_06.cli",
+            args=["rag", "--compare", *_W06D29_FINAL_FILES],
+            timeout=120,
+        ),
+    ]
+
+
 def _demo_steps_w05d25() -> list[Step]:
     """Day 25 — mini-chat with RAG, sources and task state: the agent's REPL, then chat-eval.
 
@@ -2617,6 +2728,8 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w03d14(session="w03d14-rehearsal")
     if (week, day) == (3, 15):
         return _demo_steps_w03d15(session="w03d15-rehearsal")
+    if (week, day) == (6, 29):
+        return _rehearsal_steps_w06d29()
     if (week, day) == (6, 28):
         return _rehearsal_steps_w06d28()
     if (week, day) == (6, 27):

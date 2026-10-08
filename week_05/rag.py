@@ -87,6 +87,32 @@ LOCAL_RERANK_RESPONSE_FORMAT: dict = {
 }
 
 
+def local_rerank_positional_format(n: int) -> dict:
+    """Grammar for a positional rerank: exactly n ints 0..10 (the length is the grammar's)."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "rerank_positional",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "scores": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 0, "maximum": 10},
+                        "minItems": n,
+                        "maxItems": n,
+                    }
+                },
+                "required": ["scores"],
+            },
+        },
+    }
+
+
+LOCAL_RERANK_POSITIONAL_FORMAT = local_rerank_positional_format
+
+
 def local_rerank_cap(n: int) -> int:
     """Output budget for a reasoning-off local rerank: the JSON only, so a runaway stops early."""
     return max(512, 64 + 24 * n)
@@ -128,6 +154,7 @@ def _aux_call(
     reasoning: bool = True,
     local_cap: int | None = None,
     rerank_schema: bool = False,
+    rerank_wire_format: dict | None = None,
     week: int = RAG_WEEK,
     extra: dict | None = None,
 ) -> CallResult:
@@ -146,6 +173,8 @@ def _aux_call(
     use_json = json_mode and not base.is_local
     # Local rerank: grammar-enforced json_schema (LM Studio) stops the prose-before-JSON runaway.
     wire_format = LOCAL_RERANK_RESPONSE_FORMAT if base.is_local and rerank_schema else None
+    if base.is_local and rerank_schema and rerank_wire_format is not None:
+        wire_format = rerank_wire_format
     if base.is_local:
         if local_cap is not None and not reasoning:
             max_tokens = local_cap  # no chain of thought to pay for: cap at what the JSON needs
@@ -416,10 +445,12 @@ def make_retriever(
                 previous=settings.previous,
             )
             local = aux_config is not None and aux_config.is_local
+            positional = local and settings.rerank_format == "positional"
+            wire = local_rerank_positional_format(len(fused)) if positional else None
             # Local path: one retry on a non-JSON/ambiguous answer, same settings; cloud: none.
             for attempt in range(2 if local else 1):
                 result = _aux_call(
-                    build_rerank_prompt(resolved, fused, local=local),
+                    build_rerank_prompt(resolved, fused, local=local, positional=positional),
                     command="rag_rerank",
                     max_tokens=RERANK_MAX_TOKENS,
                     json_mode=True,
@@ -428,12 +459,15 @@ def make_retriever(
                     reasoning=settings.aux_reasoning,
                     local_cap=local_rerank_cap(len(fused)) if local else None,
                     rerank_schema=True,
+                    rerank_wire_format=wire,
                     **aux_kwargs,
                 )
                 aux_calls.append(result)
                 ledger("rerank", result)
                 try:
-                    scores = parse_rerank(result.text, len(fused), tolerant=local)
+                    scores = parse_rerank(
+                        result.text, len(fused), tolerant=local, positional=positional
+                    )
                     break
                 except AdventError:
                     if attempt == 1 or not local:

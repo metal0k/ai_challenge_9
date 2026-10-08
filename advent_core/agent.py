@@ -72,6 +72,8 @@ from advent_core.params import (
 )
 from advent_core.profiles import messages as profile_messages
 from advent_core.rag import (
+    RAG_CITE_INSTRUCTION,
+    RAG_CITE_INSTRUCTION_LOCAL,
     RAG_CITE_RESPONSE_FORMAT,
     RAG_UNKNOWN_PREFIX,
     CitedAnswer,
@@ -633,6 +635,7 @@ class Agent:
             aux_reasoning=(
                 DEFAULT_RAG_AUX_REASONING if p.rag_aux_reasoning is None else p.rag_aux_reasoning
             ),
+            rerank_format=p.rag_rerank_format or "objects",
         )
 
     # --- предупреждения наверх -------------------------------------------
@@ -1748,7 +1751,15 @@ class Agent:
                     refusal = unknown_answer("empty_context", near)
                 else:
                     cite_hits = rag_ctx.hits
-                    request_input = build_cite_prompt(user_input, cite_hits)
+                    request_input = build_cite_prompt(
+                        user_input,
+                        cite_hits,
+                        instruction=(
+                            RAG_CITE_INSTRUCTION_LOCAL
+                            if self.config.params.rag_cite_prompt == "local"
+                            else RAG_CITE_INSTRUCTION
+                        ),
+                    )
             if refusal is not None:
                 return self._cite_refusal(
                     refusal,

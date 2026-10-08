@@ -119,6 +119,9 @@ NON_CHAT_PARAMS = {
     "rag_aux_reasoning": "adventagent (неделя 06)",
     # Local-server reasoning display (day 27): the agent REPL only.
     "show_thinking": "adventagent (неделя 06)",
+    # Day 29: local RAG levers; top_k is a real payload param (local server only).
+    "rag_cite_prompt": "adventagent и adventlocal (неделя 06)",
+    "rag_rerank_format": "adventagent и adventlocal (неделя 06)",
 }
 
 REPL_COMMANDS = [
@@ -1109,7 +1112,9 @@ def _handle_set(args: list[str], session: Session) -> None:
     # Предупреждаем сразу, а не молча на запросе: иначе непонятно, почему
     # выставленный параметр ни на что не влияет.
     capabilities = session.capabilities
-    _, skipped = session.config.params.as_payload(capabilities)
+    _, skipped = session.config.params.as_payload(
+        capabilities, local_server=session.config.is_local
+    )
     if name in skipped:
         console.warn(f"{session.config.model} не поддерживает {name} — параметр не отправляется")
 
@@ -1155,7 +1160,9 @@ def _handle_model(args: list[str], session: Session) -> None:
     resolved = session.resolved
     console.note(f"модель переключена на {sub}" + (f" → {resolved}" if resolved else ""))
 
-    _, skipped = session.config.params.as_payload(session.capabilities)
+    _, skipped = session.config.params.as_payload(
+        session.capabilities, local_server=session.config.is_local
+    )
     if skipped:
         console.warn(f"{sub} не поддерживает: {', '.join(skipped)} — параметры не отправляются")
 

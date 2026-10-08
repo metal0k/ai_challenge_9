@@ -2254,7 +2254,9 @@ def _switch_model(shell: AgentShell, name: str) -> bool:
 
     resolved = shell.resolved
     console.note(f"модель переключена на {name}" + (f" → {resolved}" if resolved else ""))
-    _, skipped = shell.config.params.as_payload(shell.capabilities)
+    _, skipped = shell.config.params.as_payload(
+        shell.capabilities, local_server=shell.config.is_local
+    )
     if skipped:
         console.warn(f"{name} не поддерживает: {', '.join(skipped)} — параметры не отправляются")
     return False
@@ -2497,7 +2499,9 @@ def _apply_set(shell: AgentShell, name: str, raw: str) -> bool:
         # записи context_limit — та же (SPEC-w02d08.md §4).
         _save_state(shell)
 
-    _, skipped = shell.config.params.as_payload(shell.capabilities)
+    _, skipped = shell.config.params.as_payload(
+        shell.capabilities, local_server=shell.config.is_local
+    )
     if name in skipped:
         console.warn(f"{shell.config.model} не поддерживает {name} — параметр не отправляется")
     return False

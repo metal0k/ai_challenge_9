@@ -32,6 +32,9 @@ CONTEXT_STRATEGY_CHOICES = ("window", "facts", "branch", "summary", "memory")
 # Week 05 day 22: RAG chunking strategies of the index and the default top-k.
 RAG_STRATEGY_CHOICES = ("fixed", "structure")
 DEFAULT_RAG_STRATEGY = "structure"
+# Day 29 levers of the local RAG; None in GenerationParams means the first value.
+RAG_CITE_PROMPT_CHOICES = ("default", "local")
+RAG_RERANK_FORMAT_CHOICES = ("objects", "positional")
 DEFAULT_RAG_K = 5
 # Day 23: second stage (candidates before filtering, reranker score cut-off).
 DEFAULT_RAG_K_BEFORE = 20
@@ -95,6 +98,10 @@ AGENT_PARAMS: tuple[str, ...] = (
     "rag_aux_reasoning",
     # Local-server UX (day 27): reasoning of the main answer, dim on stderr.
     "show_thinking",
+    # Day 29: answer sampling for the local server and the RAG levers screened that day.
+    "top_k",
+    "rag_cite_prompt",
+    "rag_rerank_format",
 )
 
 # Слова, которыми задаётся булев параметр. Оба языка: `/set judge выкл` на
@@ -123,6 +130,9 @@ class Spec:
     # Локальный параметр (формат, диалог, …): в payload API не попадает вообще,
     # это не то же самое, что «срезан по capabilities» — см. as_payload().
     local: bool = False
+    # "local_server": sent only to a local OpenAI-compatible server, never to the Mistral
+    # API (which rejects the key). `local` cannot say this: it means "sent nowhere".
+    backend: str | None = None
     # Значение по умолчанию, своё для каждой команды CLI: `strategy` — direct в
     # chat и all в solve, `judge` — выкл в chat и вкл в solve (SPEC-w01d03.md
     # §4). Держим здесь, а не в сигнатурах typer: иначе одно и то же правило
@@ -444,6 +454,29 @@ SPECS: tuple[Spec, ...] = (
             ]
         },
     ),
+    # Appended last: /set menus address parameters by position.
+    Spec(
+        "top_k",
+        "int",
+        "Top-k sampling: только локальный сервер, в облачный payload не уходит.",
+        1,
+        None,
+        backend="local_server",
+    ),
+    Spec(
+        "rag_cite_prompt",
+        "choice",
+        "RAG cite: текст инструкции — default (общий) или local (короткий, под локальную модель).",
+        choices=RAG_CITE_PROMPT_CHOICES,
+        local=True,
+    ),
+    Spec(
+        "rag_rerank_format",
+        "choice",
+        "RAG --local: формат ответа reranker'а — objects ({id, score}) или positional (массив).",
+        choices=RAG_RERANK_FORMAT_CHOICES,
+        local=True,
+    ),
 )
 
 BY_NAME = {spec.name: spec for spec in SPECS}
@@ -571,6 +604,8 @@ class GenerationParams:
 
     temperature: float | None = None
     top_p: float | None = None
+    # Day 29: local server only (Spec.backend); as_payload drops it for the cloud.
+    top_k: int | None = None
     max_tokens: int | None = None
     random_seed: int | None = None
     stop: list[str] | None = None
@@ -601,6 +636,9 @@ class GenerationParams:
     rag_cite: bool | None = None
     # Day 27: reasoning of local rewrite/rerank calls; None means command default.
     rag_aux_reasoning: bool | None = None
+    # Day 29: cite instruction text and local rerank format; None means "default"/"objects".
+    rag_cite_prompt: str | None = None
+    rag_rerank_format: str | None = None
     # Day 27: show the local model's reasoning; None means command default (on).
     show_thinking: bool | None = None
 
@@ -695,8 +733,14 @@ class GenerationParams:
         setattr(self, name, value)
         return value
 
-    def as_payload(self, capabilities: dict | None = None) -> tuple[dict, list[str]]:
+    def as_payload(
+        self, capabilities: dict | None = None, *, local_server: bool = False
+    ) -> tuple[dict, list[str]]:
         """Payload для API и список параметров, отсеянных по capabilities.
+
+        local_server: the request goes to a local OpenAI-compatible server; params with
+        Spec.backend == "local_server" (top_k) are sent only then. The filter lives here
+        and nowhere else.
 
         Отправлять reasoning_effort модели без reasoning бессмысленно: ответ
         либо проигнорирует его, либо прилетит 422 посреди демо.
@@ -713,6 +757,8 @@ class GenerationParams:
                 # заданном параметре, который сервер бы отклонил или
                 # проигнорировал, а не про параметр, который туда и не должен
                 # был идти.
+                continue
+            if spec.backend == "local_server" and not local_server:
                 continue
             if spec.requires and capabilities is not None and not capabilities.get(spec.requires):
                 skipped.append(spec.name)

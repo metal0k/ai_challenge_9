@@ -64,6 +64,7 @@ class LocalModel:
     loaded_context_length: int | None = None
     quantization: str | None = None
     arch: str | None = None
+    publisher: str | None = None  # LM Studio lists it for some models; None = not offered
 
     @property
     def loaded(self) -> bool:
@@ -170,6 +171,7 @@ def _parse_models(resp: httpx.Response, base: str, *, lm_studio: bool) -> list[L
                 loaded_context_length=item.get("loaded_context_length") if lm_studio else None,
                 quantization=item.get("quantization") if lm_studio else None,
                 arch=item.get("arch") if lm_studio else None,
+                publisher=item.get("publisher") if lm_studio else None,
             )
         )
     # loaded first, stable otherwise
@@ -197,6 +199,14 @@ def check_ready(
             f"Модель {model!r} не загружена (state: {found.state}).", hint=START_HINT
         )
     return found
+
+
+def loaded_model_info(model: str, url: str | None = None) -> LocalModel:
+    """The loaded model's quantization, loaded_context_length, state, arch (/api/v0/models).
+
+    Raises like ensure_ready when the model is missing, not loaded or the server has no state.
+    """
+    return ensure_ready(model, url, require_state=True)
 
 
 def ensure_ready(model: str, url: str | None = None, *, require_state: bool = False) -> LocalModel:
