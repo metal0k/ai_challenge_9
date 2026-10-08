@@ -47,7 +47,7 @@ def test_baseline_is_the_day_28_setup_as_literals():
     assert (b.gguf, b.publisher, b.file_gb) == ("Ornith-1.5-9B-Q4_K_M.gguf", "ornith-ai", 5.78)
 
 
-def test_registry_holds_baseline_and_ten_screening_profiles_and_no_tuned():
+def test_registry_holds_baseline_ten_screening_profiles_and_tuned():
     assert list(profiles.PROFILES) == [
         "baseline",
         "sampling",
@@ -60,8 +60,8 @@ def test_registry_holds_baseline_and_ten_screening_profiles_and_no_tuned():
         "q4b",
         "q3",
         "q5",
+        "tuned",
     ]
-    assert "tuned" not in profiles.PROFILES
 
 
 @pytest.mark.parametrize(
@@ -76,7 +76,7 @@ def test_registry_holds_baseline_and_ten_screening_profiles_and_no_tuned():
         ("citelocal", {"cite_prompt"}),
         ("q4b", {"publisher", "file_gb"}),
         ("q3", {"quant", "gguf", "publisher", "file_gb"}),
-        ("q5", {"quant", "gguf", "publisher", "file_gb"}),
+        ("q5", {"quant", "gguf", "publisher", "file_gb", "context"}),
     ],
 )
 def test_each_screening_profile_differs_from_baseline_in_exactly_the_declared_fields(name, changed):
@@ -108,18 +108,51 @@ def test_profiles_are_frozen():
         profiles.BASELINE.k_before = 1  # type: ignore[misc]
 
 
+def test_tuned_is_baseline_without_answer_reasoning_at_ctx_24576():
+    tuned, base = profiles.PROFILES["tuned"], profiles.BASELINE
+    assert set(profiles.changed_fields(tuned)) == {"answer_reasoning", "context"}
+    assert tuned.answer_reasoning is False and tuned.context == 24576
+    assert tuned.title == "после: без reasoning в ответе, ctx 24576"
+    for f in ("quant", "gguf", "file_gb", "publisher", "answer_temperature", "answer_top_p"):
+        assert getattr(tuned, f) == getattr(base, f)
+    assert (tuned.answer_top_k, tuned.answer_max_tokens, tuned.k_before) == (None, 4096, 20)
+    assert (tuned.rerank_format, tuned.cite_prompt) == ("objects", "default")
+
+
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [
+        ("baseline", "ornith-ai/ornith-1.5-9b"),
+        ("tuned", "ornith-ai/ornith-1.5-9b"),
+        ("ctx24k", "ornith-ai/ornith-1.5-9b"),
+        ("q4b", "bartowski/ornith-1.5-9b@q4_k_m"),
+        ("q3", "ornith-1.5-9b@q3_k_m"),
+        ("q5", "ornith-1.5-9b@q5_k_m"),
+    ],
+)
+def test_lms_key_per_profile(name, key):
+    assert profiles.PROFILES[name].lms_key == key
+
+
+def test_profiles_with_no_names_still_works_and_includes_tuned():
+    tables = profiles.profiles_tables(None)
+    assert tables
+    cols = [str(c.header) for t in tables for c in t.columns]
+    assert "tuned" in cols
+
+
 def test_unknown_profile_is_a_config_error_naming_the_known_ones():
     with pytest.raises(ConfigError) as info:
-        profiles.get_profile("tuned")
+        profiles.get_profile("nope")
     assert "baseline" in str(info.value) and "citelocal" in str(info.value)
 
 
 def test_quant_row_that_moved_the_context_is_labelled_quant_plus_ctx():
     import dataclasses
 
-    assert profiles.axis_label(profiles.PROFILES["q5"]) == "квант"
-    moved = dataclasses.replace(profiles.PROFILES["q5"], context=32768)
-    assert profiles.axis_label(moved) == "квант+ctx"
+    assert profiles.axis_label(profiles.PROFILES["q5"]) == "квант+ctx"
+    same = dataclasses.replace(profiles.PROFILES["q5"], context=40960)
+    assert profiles.axis_label(same) == "квант"
     assert profiles.axis_label(profiles.PROFILES["cap"]) == "—"
 
 

@@ -2307,15 +2307,15 @@ _W06D29_SCREENING = (
     "sampling",
     "cap",
     "noreason",
-    "ctx24k",
     "positional",
     "k12",
     "citelocal",
+    "ctx24k",
     "q4b",
     "q3",
     "q5",
 )
-_W06D29_TUNED = "tuned"  # added to week_06/profiles.py only after screening
+_W06D29_TUNED = "tuned"
 _W06D29_SCREENING_FILES = [f"{_W06D29_DIR}/w06d29_{n}_10x1.json" for n in _W06D29_SCREENING]
 _W06D29_FINAL_FILES = [f"{_W06D29_DIR}/w06d29_{n}_13x3.json" for n in ("baseline", _W06D29_TUNED)]
 # Placeholder ids until the screening shows which questions are worth filming live.

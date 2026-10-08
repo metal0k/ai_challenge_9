@@ -223,7 +223,7 @@ def check_loaded_matches(info: Any, profile: Profile) -> None:
             f"Загружена не та модель для профиля {profile.name}: {'; '.join(problems)}.",
             hint=(
                 f"Загрузи {profile.gguf} ({profile.publisher}) через "
-                f"start-local-llm.ps1 -Context {profile.context}."
+                f"start-local-llm.ps1 -Model {profile.lms_key} -Context {profile.context}."
             ),
         )
 

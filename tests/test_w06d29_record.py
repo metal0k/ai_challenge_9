@@ -37,7 +37,20 @@ def test_screening_table_lists_baseline_first_and_all_ten_levers():
     assert len(files) == 11
     assert files[0] == "logs/ragbench/w06d29_baseline_10x1.json"
     names = [f.removeprefix("logs/ragbench/w06d29_").removesuffix("_10x1.json") for f in files]
-    assert names == list(profiles.PROFILES)
+    assert names == [
+        "baseline",
+        "sampling",
+        "cap",
+        "noreason",
+        "positional",
+        "k12",
+        "citelocal",
+        "ctx24k",
+        "q4b",
+        "q3",
+        "q5",
+    ]
+    assert {*names, "tuned"} == set(profiles.PROFILES)
 
 
 def test_final_table_compares_baseline_with_tuned_13x3():

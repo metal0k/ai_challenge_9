@@ -79,7 +79,7 @@ def test_quant_mismatch_refuses_with_the_load_command_in_the_hint(monkeypatch):
         rb.make_local_backend(_local(), Path("x.sqlite3"), profiles.PROFILES["q3"])
     assert "quant Q4_K_M вместо Q3_K_M" in info.value.message
     assert "Ornith-1.5-9B-Q3_K_M.gguf" in info.value.hint
-    assert "start-local-llm.ps1 -Context 40960" in info.value.hint
+    assert "start-local-llm.ps1 -Model ornith-1.5-9b@q3_k_m -Context 40960" in info.value.hint
 
 
 def test_context_mismatch_refuses_with_the_context_in_the_hint(monkeypatch):
@@ -87,7 +87,7 @@ def test_context_mismatch_refuses_with_the_context_in_the_hint(monkeypatch):
     with pytest.raises(AdventError) as info:
         rb.make_local_backend(_local(), Path("x.sqlite3"), profiles.PROFILES["ctx24k"])
     assert "контекст 40960 вместо 24576" in info.value.message
-    assert "-Context 24576" in info.value.hint
+    assert "-Model ornith-ai/ornith-1.5-9b -Context 24576" in info.value.hint
 
 
 def test_unknown_quant_or_context_is_a_refusal_not_a_pass(monkeypatch):
@@ -325,7 +325,7 @@ def test_a_non_baseline_profile_with_any_other_backend_is_a_config_error(monkeyp
 def test_unknown_profile_is_a_config_error(monkeypatch):
     _wire(monkeypatch)
     with pytest.raises(ConfigError):
-        rb.run_rag_command(backends="local", profile="tuned")
+        rb.run_rag_command(backends="local", profile="nope")
 
 
 def test_baseline_profile_is_allowed_with_both_backends(monkeypatch):

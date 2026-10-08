@@ -1,8 +1,8 @@
 """Day 29: tuning profiles of the local RAG. A profile is a complete, explicit configuration.
 
 `baseline` is exactly the Day 28 setup; every screening profile differs from it in the fields
-it names (one lever, or the build for the quant axis). `tuned` is deliberately absent: it is
-added after screening, by the selection rule of SPEC-w06d29 section 5, not guessed.
+it names (one lever, or the build for the quant axis). `tuned` was added after screening,
+by the selection rule of SPEC-w06d29 section 5, not guessed.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ class Profile:
     gguf: str = "Ornith-1.5-9B-Q4_K_M.gguf"
     file_gb: float = 5.78  # by the HF file listing, not measured here
     publisher: str = OFFICIAL
+    lms_key: str = "ornith-ai/ornith-1.5-9b"  # explicit lms model key; the bare one is ambiguous
 
 
 BASELINE = Profile(name="baseline", title="до: настройки дня 28", quant="Q4_K_M", context=40960)
@@ -71,6 +72,7 @@ _SCREENING = (
         gguf="Ornith-1.5-9B-Q4_K_M.gguf",
         file_gb=5.91,
         publisher=BARTOWSKI,
+        lms_key="bartowski/ornith-1.5-9b@q4_k_m",
     ),
     dataclasses.replace(
         BASELINE,
@@ -80,6 +82,7 @@ _SCREENING = (
         gguf="Ornith-1.5-9B-Q3_K_M.gguf",
         file_gb=4.92,
         publisher=BARTOWSKI,
+        lms_key="ornith-1.5-9b@q3_k_m",
     ),
     # The context may be lowered at measurement time (largest of 40960/32768/24576 that leaves
     # >= 700 MiB free); then the row is labelled "квант+ctx", see axis_label().
@@ -91,10 +94,23 @@ _SCREENING = (
         gguf="Ornith-1.5-9B-Q5_K_M.gguf",
         file_gb=6.85,
         publisher=BARTOWSKI,
+        lms_key="ornith-1.5-9b@q5_k_m",
+        # 40960 does not fit 8 GB with bge-m3 loaded; 24576 is the smallest ctx our 20.5k-token rerank prompt allows  # noqa: E501
+        context=24576,
     ),
 )
 
-PROFILES: dict[str, Profile] = {p.name: p for p in (BASELINE, *_SCREENING)}
+# Chosen by the SPEC section 5 rule from 10x1 screening (noreason, ctx24k passed;
+# sampling/cap/positional/k12/citelocal/q3/q5 did not).
+TUNED = dataclasses.replace(
+    BASELINE,
+    name="tuned",
+    title="после: без reasoning в ответе, ctx 24576",
+    answer_reasoning=False,
+    context=24576,
+)
+
+PROFILES: dict[str, Profile] = {p.name: p for p in (BASELINE, *_SCREENING, TUNED)}
 
 # (field, row label) in display order; the tuple order is also the diff order.
 FIELD_LABELS: tuple[tuple[str, str], ...] = (
