@@ -1393,3 +1393,55 @@ because the tables had appeared only 4 s before the end.
 **`codex exec` in a background shell waits on stdin.** It printed "Reading
 additional input from stdin..." and hung for the whole review; pass
 `< /dev/null`.
+
+**On the local RAG, the speed lever was reasoning in the answer — not
+quantization, sampling or prompt tweaks.** Day 29 screened 10 single-lever
+profiles at 10×1 against gates fixed before the run, then measured 13×3 before
+and after. Results:
+- **Turning reasoning off for the cite answer** (rerank stays
+  grammar-constrained) took the answer from 16.1 s to 5.9 s and the median
+  question from 30.1 s to 20.8 s (p90 60.0 → 26.7 s). Facts went from 38/45 to
+  39/45.
+- **Context 24576** instead of 40960 freed 529 MiB of VRAM at no cost.
+- **Q3_K_M was slower than Q4_K_M,** because it reasoned longer, and it lost
+  facts.
+- **Q5_K_M** does not fit 8 GB at 40960 and sits on the VRAM cliff at 24576.
+- **The model card's sampling** changed nothing.
+- **A completion cap** cut reasoning mid-way and produced errors.
+- **Positional rerank, k=12 and a shorter cite instruction** all lost facts.
+
+A smaller quant is not a faster model when it compensates with more tokens.
+Compare quants within one publisher's build (bartowski Q3/Q4/Q5), never against
+another publisher's Q4.
+
+**A gate of the form "no more than ×N the reference" degenerates at a reference
+of zero.** Day 29's final verdict failed on one reattributed source against
+zero for baseline. The rule was kept as registered and the verdict explained,
+rather than patched after the measurement. Write such a gate with an absolute
+floor next to the ratio.
+
+**Importing a second build of a model makes its bare LM Studio key ambiguous.**
+After bartowski's GGUFs were added, `lms load ornith-1.5-9b` picked Q3. Always
+load by the full key (`ornith-ai/ornith-1.5-9b`). `adventlocal rag --profile`
+checks quant, context and publisher of the loaded model before it measures.
+Unload the `ornith` identifier first, or the load fails with "already exists".
+
+**OBS window capture records black once the window is minimized, and several
+windows with the demo title make it jump between them.** Day 29 lost one take
+to each:
+- three leftover `-NoExit` «AI Advent 9» windows put day 25's demo on screen;
+- a window minimized at 0:32 left two minutes of black.
+
+`verify_capture()` checks only the first frame. Before a take, close every
+window with that title, and run `blackdetect` on the file afterwards.
+
+**A long comparison report has to be split per screen to be watchable.**
+Day 29's full `--compare` scrolled past in a second. `--tables KEYS` prints one
+block per demo step and leaves the default output byte-identical. The closing
+step is the gates screen, the day's headline.
+
+**The local model sometimes ran 2–4× slower while OBS was recording, and the
+cause is unknown.** "x264 eats the CPU" was refuted: a probe during a recording
+was fast. A recorded live run can therefore be slower than the saved
+measurement shown next to it on screen. Keep the measured numbers from saved
+runs and treat the live run as a demonstration, not as the measurement.
