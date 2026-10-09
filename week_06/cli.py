@@ -761,17 +761,26 @@ def rag_command(
         help="Профили бок о бок из файлов --save (`--compare F1 F2 …`, первый — опорный), "
         "без сети.",
     ),
+    tables: str | None = typer.Option(
+        None,
+        "--tables",
+        help="Только с --compare: какие блоки печатать, через запятую: quality, citations, "
+        "speed, resources, tps, build, verdicts (компактные вердикты ворот), gates. "
+        "Без опции - всё.",
+    ),
     files: list[Path] | None = typer.Argument(None, help="Файлы --save для --compare."),
 ) -> None:
     """RAG (rewrite + rerank + cite) в облаке и локально: качество, скорость, стабильность."""
     if files and not compare:
         raise ConfigError("Файлы в аргументах нужны только вместе с --compare.")
+    if tables is not None and not compare:
+        raise ConfigError("--tables нужен только вместе с --compare.")
     if compare:
         if save is not None or report or profile:
             raise ConfigError("--compare не сочетается с --save, --report и --profile.")
         if not files:
             raise ConfigError("--compare: укажи файлы --save (первый — опорный).")
-        code = compare_module.run_compare_command(files)
+        code = compare_module.run_compare_command(files, tables)
         if code:
             raise typer.Exit(code)
         return

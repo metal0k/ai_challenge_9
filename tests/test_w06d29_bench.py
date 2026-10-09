@@ -489,3 +489,26 @@ def test_a_worker_that_outlives_stop_cannot_alter_the_returned_report():
     assert not sampler._thread.is_alive()
     assert report.vram_used_peak == 6000
     assert sampler.stop().vram_used_peak == 6000  # the late 9999 never landed
+
+
+def _report_text(monkeypatch, profile):
+    result = _bench(profile)
+    buf = io.StringIO()
+    monkeypatch.setattr(
+        console, "out", Console(file=buf, width=120, no_color=True, force_terminal=False)
+    )
+    rb.print_report(result)
+    return buf.getvalue()
+
+
+def test_tps_note_says_no_reasoning_when_the_profile_turned_it_off(monkeypatch):
+    text = " ".join(_report_text(monkeypatch, profiles.PROFILES["noreason"]).split())
+    assert "у local без reasoning (профиль)" in text
+    assert "у local внутри reasoning" not in text
+
+
+def test_tps_note_keeps_inside_reasoning_for_baseline_and_day_28(monkeypatch):
+    for profile in (profiles.PROFILES["baseline"], None):
+        text = " ".join(_report_text(monkeypatch, profile).split())
+        assert "у local внутри reasoning" in text
+        assert "без reasoning (профиль)" not in text

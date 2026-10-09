@@ -17,6 +17,7 @@ from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from advent_core import console
+from advent_core.config import ConfigError
 from advent_core.errors import AdventError
 from week_06 import profiles, vram
 from week_06 import ragbench as rb
@@ -613,42 +614,96 @@ def build_tables(files: Sequence[Loaded]) -> list[Table]:
     return [quality, cites, speed, stages, rates, build]
 
 
-def gate_lines(files: Sequence[Loaded]) -> list[str]:
+GateRow = tuple[Loaded, Loaded, list[Check]]
+
+
+def _gate_rows(files: Sequence[Loaded]) -> tuple[str, str, list[GateRow]]:
+    """(title, mode, rows) - the one place that applies the gate rules.
+
+    mode is screening|final|trial.
+    """
     runs = files[0].runs
     screening = runs == 1
     final = not screening and is_day29_final(files)
     if screening:
-        title = "Ворота скрининга:"
+        title, mode = "Ворота скрининга:", "screening"
     elif final:
-        title = "Ворота финала:"
+        title, mode = "Ворота финала:", "final"
     else:
         title = (
             "Пробное сравнение (не финал дня 29: нужны 3 прогона и контрольный набор "
             "10+3) — без вердикта:"
         )
+        mode = "trial"
     gate: Callable[[Loaded, Loaded, Metrics, Metrics], list[Check]] = (
         screening_gate if screening else final_gate
     )
-    lines = [title]
+    rows: list[GateRow] = []
     for item in files[1:]:
         ref = reference_for(item, files)
-        checks = gate(ref, item, compute(ref.cells), compute(item.cells))
+        rows.append((item, ref, gate(ref, item, compute(ref.cells), compute(item.cells))))
+    return title, mode, rows
+
+
+def gate_lines(files: Sequence[Loaded]) -> list[str]:
+    title, mode, rows = _gate_rows(files)
+    lines = [title]
+    for item, ref, checks in rows:
         passed = all(c.ok for c in checks)
         suffix = f" (опорный {ref.label})" if ref is not files[0] else ""
-        if screening:
+        if mode == "screening":
             verdict = "пройден" if passed else "не пройден"
-        elif final:
+        elif mode == "final":
             verdict = "успех" if passed else "не выполнено — это результат дня"
         else:
             verdict = "без вердикта"
         lines.append(f"{item.label}{suffix}: {verdict}")
         lines += [f"  {'✓' if c.ok else ('✗' if c.known else '?')} {c.text}" for c in checks]
-    if screening:
+    if mode == "screening":
         lines.append(f"{SCREENING_NOTE}; {rb.SMALL_SAMPLE}")
     return lines
 
 
-def run_compare_command(paths: Sequence[Path]) -> int:
+def verdict_lines(files: Sequence[Loaded]) -> list[str]:
+    """One line per non-reference profile; failed checks are named, passed ones are not."""
+    _title, mode, rows = _gate_rows(files)
+    good, bad = ("пройден", "не пройден") if mode == "screening" else ("выполнено", "не выполнено")
+    lines: list[str] = []
+    for item, ref, checks in rows:
+        failed = [c.text for c in checks if not c.ok]
+        suffix = f" (опорный {ref.label})" if ref is not files[0] else ""
+        if mode == "trial":
+            verdict = "без вердикта"
+        else:
+            verdict = good if not failed else f"{bad} — {'; '.join(failed)}"
+        lines.append(f"{item.label}{suffix}: {verdict}")
+    return lines
+
+
+TABLE_KEYS = ("quality", "citations", "speed", "resources", "tps", "build")
+ALL_KEYS = (*TABLE_KEYS, "verdicts", "gates")
+
+
+def parse_tables(raw: str | None) -> frozenset[str] | None:
+    """None = everything, as before the option existed."""
+    if raw is None:
+        return None
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    bad = [k for k in keys if k not in ALL_KEYS]
+    if bad or not keys:
+        raise ConfigError(
+            f"--tables: неизвестный ключ {', '.join(bad) or '(пусто)'}; "
+            f"допустимые: {', '.join(ALL_KEYS)}."
+        )
+    return frozenset(keys)
+
+
+def run_compare_command(paths: Sequence[Path], tables: str | None = None) -> int:
+    selected = parse_tables(tables)
+
+    def want(key: str) -> bool:
+        return selected is None or key in selected
+
     files = load_files(paths)
     out = console.out
     out.print(dates_line(files), markup=False, highlight=False)
@@ -659,11 +714,17 @@ def run_compare_command(paths: Sequence[Path]) -> int:
     caveat = sampling_caveat(files)
     if caveat:
         out.print(caveat, markup=False, highlight=False)
-    for f in files:
-        if not f.vram.known:
-            out.print(f"{f.label}: {vram.NO_DATA}", markup=False, highlight=False)
-    for table in build_tables(files):
-        out.print(table)
-    for line in gate_lines(files):
-        out.print(line, markup=False, highlight=False)
+    if want("resources"):
+        for f in files:
+            if not f.vram.known:
+                out.print(f"{f.label}: {vram.NO_DATA}", markup=False, highlight=False)
+    for key, table in zip(TABLE_KEYS, build_tables(files), strict=True):
+        if want(key):
+            out.print(table)
+    if selected is not None and "verdicts" in selected:  # new block: never in the default output
+        for line in verdict_lines(files):
+            out.print(line, markup=False, highlight=False)
+    if want("gates"):
+        for line in gate_lines(files):
+            out.print(line, markup=False, highlight=False)
     return 0

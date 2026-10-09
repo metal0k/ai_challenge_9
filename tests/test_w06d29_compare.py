@@ -624,3 +624,132 @@ def test_rerank_tokens_per_second_is_prompt_tokens_over_rerank_time():
 
 def test_rerank_rate_is_unknown_without_prompt_tokens():
     assert compare.compute([_cell(1)]).rerank_tps is None
+
+
+# --- --tables --------------------------------------------------------------------------------
+
+TITLES = {
+    "quality": "Качество",
+    "citations": "Цитаты и сбои",
+    "speed": "Скорость, на вопрос",
+    "resources": "Ответ и ресурсы",
+    "tps": "Токены в секунду",
+    "build": "Сборка модели",
+}
+
+
+def _run(out, *args):
+    result = CliRunner().invoke(cli.app, ["rag", "--compare", *map(str, args)])
+    assert result.exit_code == 0, result.output
+    text = out.getvalue()
+    out.truncate(0)
+    out.seek(0)
+    return text
+
+
+def _screening_files(tmp_path):
+    a = _write(tmp_path, "a.json", _cells())
+    b = _write(tmp_path, "b.json", _cells(), profile="cap")
+    return a, b
+
+
+def test_tables_option_is_parsed_and_unknown_key_lists_valid_ones(tmp_path, out):
+    a, b = _screening_files(tmp_path)
+    assert compare.parse_tables(None) is None
+    assert compare.parse_tables("speed, gates") == frozenset({"speed", "gates"})
+    with pytest.raises(cli.ConfigError) as err:
+        compare.parse_tables("speeed")
+    for key in compare.ALL_KEYS:
+        assert key in str(err.value)
+    result = CliRunner().invoke(cli.app, ["rag", "--compare", "--tables", "speeed", str(a), str(b)])
+    assert result.exit_code != 0
+    result = CliRunner().invoke(cli.app, ["rag", "--tables", "speed"])
+    assert result.exit_code != 0
+
+
+@pytest.mark.parametrize("key", list(TITLES))
+def test_each_table_key_prints_only_its_block(tmp_path, out, key):
+    a, b = _screening_files(tmp_path)
+    text = _run(out, "--tables", key, a, b)
+    for other, title in TITLES.items():
+        assert text.count(title) == (1 if other == key else 0), (key, title)
+    assert "Ворота" not in text
+    assert text.count("из сохранённых замеров:") == 1
+
+
+def test_speed_only_has_no_quality_title_and_one_speed_title(tmp_path, out):
+    a, b = _screening_files(tmp_path)
+    text = _run(out, "--tables", "speed", a, b)
+    assert text.count("Качество") == 0 and text.count("Скорость") == 1
+
+
+def test_gates_and_verdicts_keys_print_only_their_block(tmp_path, out):
+    a, b = _screening_files(tmp_path)
+    gates = _run(out, "--tables", "gates", a, b)
+    assert gates.count("Ворота скрининга:") == 1 and "Качество" not in gates
+    verdicts = _run(out, "--tables", "verdicts", a, b)
+    assert "Ворота скрининга:" not in verdicts and "Качество" not in verdicts
+    assert verdicts.count("cap: пройден") == 1
+
+
+def test_footnotes_travel_with_their_table(tmp_path, out):
+    a, b = _screening_files(tmp_path)
+    tps = " ".join(_run(out, "--tables", "tps", a, b).split())
+    assert compare.TPS_NOTE in tps
+    speed = " ".join(_run(out, "--tables", "speed", a, b).split())
+    assert compare.TPS_NOTE not in speed
+    assert "медиана и p90" in speed
+
+
+def test_default_output_is_the_old_full_concatenation(tmp_path, out):
+    a, b = _screening_files(tmp_path)
+    files = compare.load_files([a, b])
+    buf = io.StringIO()
+    c = Console(file=buf, width=80, no_color=True, force_terminal=False)
+    for line in (compare.dates_line(files), *compare.reference_lines(files)):
+        c.print(line, markup=False, highlight=False)
+    caveat = compare.sampling_caveat(files)
+    if caveat:
+        c.print(caveat, markup=False, highlight=False)
+    for f in files:
+        if not f.vram.known:
+            c.print(f"{f.label}: {compare.vram.NO_DATA}", markup=False, highlight=False)
+    for table in compare.build_tables(files):
+        c.print(table)
+    for line in compare.gate_lines(files):
+        c.print(line, markup=False, highlight=False)
+    assert _run(out, a, b) == buf.getvalue()
+    keys = ",".join([*TITLES, "gates"])
+    assert _run(out, "--tables", keys, a, b) == buf.getvalue()
+
+
+def test_screening_verdicts_name_the_failed_check_with_the_real_gate_text(tmp_path):
+    ref = [dataclasses.replace(c, facts=(True, True), facts_total=2) for c in _cells()[:3]]
+    ref.append(_cells()[3])
+    worse = list(ref)
+    worse[0] = dataclasses.replace(worse[0], facts=(False, False), correct=False)
+    worse[1] = dataclasses.replace(worse[1], facts=(False, True), correct=False)
+    worse[2] = dataclasses.replace(worse[2], facts=(False, True), correct=False)
+    files = _pair(tmp_path, worse, ref_cells=ref)
+    (line,) = compare.verdict_lines(files)
+    assert line.startswith("cap: не пройден — ")
+    failed = [ln.strip()[2:] for ln in compare.gate_lines(files) if ln.strip().startswith("✗")]
+    assert failed and line == "cap: не пройден — " + "; ".join(failed)
+    assert compare.verdict_lines(_pair(tmp_path, _cells())) == ["cap: пройден"]
+
+
+def test_final_verdicts_use_the_final_gate(tmp_path):
+    fast = [dataclasses.replace(c, wall_ms=6_000) for c in _cells(runs=3)]
+    assert compare.verdict_lines(_final(tmp_path, fast)) == ["tuned: выполнено"]
+    files = _final(tmp_path, _cells(runs=3))
+    (line,) = compare.verdict_lines(files)
+    failed = [ln.strip()[2:] for ln in compare.gate_lines(files) if ln.strip().startswith("✗")]
+    assert failed and line == "tuned: не выполнено — " + "; ".join(failed)
+    assert "парная медиана" in line
+
+
+def test_selected_blocks_render_in_80_columns_without_ellipsis(tmp_path, out):
+    a, b = _screening_files(tmp_path)
+    text = _run(out, "--tables", "quality,speed,resources,verdicts", a, b)
+    assert "…" not in text
+    assert max(cell_len(line) for line in text.splitlines()) <= 80

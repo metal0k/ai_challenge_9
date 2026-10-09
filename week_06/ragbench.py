@@ -72,6 +72,9 @@ LEGACY_NOTE = (
     "время поиска не сохранялось и не домысливается)"
 )
 TPS_NOTE = "tok/s ответа = completion / время ответа; у local внутри reasoning, у cloud — overhead"
+TPS_NOTE_NO_REASONING = (
+    "tok/s ответа = completion / время ответа; у local без reasoning (профиль), у cloud — overhead"
+)
 PROTOCOLS = {
     "local": "rerank: json_schema-грамматика, до 2 попыток, свой cap; aux без reasoning; "
     "ответ с reasoning, cite-JSON по грамматике",
@@ -1138,7 +1141,9 @@ def quality_table(runs: Sequence[BenchRun], backends: Sequence[str]) -> Table:
     return table
 
 
-def speed_table(runs: Sequence[BenchRun], backends: Sequence[str]) -> Table:
+def speed_table(
+    runs: Sequence[BenchRun], backends: Sequence[str], *, local_reasoning: bool = True
+) -> Table:
     table = _backend_table("Скорость", backends)
     rows: list[tuple[str, list[str]]] = [
         (label, [])
@@ -1183,7 +1188,7 @@ def speed_table(runs: Sequence[BenchRun], backends: Sequence[str]) -> Table:
             row[1].append(cell)
     for label, cells in rows:
         table.add_row(label, *cells)
-    notes = [TPS_NOTE, COST_NOTE]
+    notes = [TPS_NOTE if local_reasoning else TPS_NOTE_NO_REASONING, COST_NOTE]
     if any(t.partial for name in backends for t in token_totals(_of(runs, name)).values()):
         notes.append(PARTIAL_NOTE)
     if any(c.embed_search_ms is not None for c in runs if c.backend in backends):
@@ -1340,7 +1345,12 @@ def print_report(result: BenchResult) -> None:
         out.print("")
         for table in (
             quality_table(result.runs, result.backends),
-            speed_table(result.runs, result.backends),
+            speed_table(
+                result.runs,
+                result.backends,
+                local_reasoning=result.settings.get("local", {}).get("answer_reasoning")
+                is not False,
+            ),
             stability_table(result.runs, result.backends),
         ):
             out.print(table)

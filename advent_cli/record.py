@@ -2324,10 +2324,11 @@ _W06D29_TIMEOUT = 1800
 
 
 def _demo_steps_w06d29() -> list[Step]:
-    """Day 29 - tuning the local RAG: profiles, screening table, final table, one live run.
+    """Day 29 - tuning the local RAG: profiles, screening tables, one live run, final tables.
 
     Every command that names a profile also names `--backends local`: a non-baseline profile
-    with any other backend set is a ConfigError. The compare tables are offline.
+    with any other backend set is a ConfigError. The compare tables are offline, one block
+    per step (`--tables`) so each fits a ~30-row terminal; the gates are the closing screen.
     """
     return [
         Step(
@@ -2343,19 +2344,31 @@ def _demo_steps_w06d29() -> list[Step]:
             timeout=60,
         ),
         Step(
-            title="3. Скрининг рычагов 10x1, из сохранённых замеров",
+            title="3. Скрининг 10×1: качество",
             module="week_06.cli",
-            args=["rag", "--compare", *_W06D29_SCREENING_FILES],
+            args=["rag", "--compare", "--tables", "quality", *_W06D29_SCREENING_FILES],
             timeout=120,
         ),
         Step(
-            title="4. Финал 13x3, из сохранённых замеров",
+            title="4. Скрининг 10×1: скорость",
             module="week_06.cli",
-            args=["rag", "--compare", *_W06D29_FINAL_FILES],
+            args=["rag", "--compare", "--tables", "speed", *_W06D29_SCREENING_FILES],
             timeout=120,
         ),
         Step(
-            title="5. Живой прогон «после»",
+            title="5. Скрининг 10×1: ответ и VRAM",
+            module="week_06.cli",
+            args=["rag", "--compare", "--tables", "resources", *_W06D29_SCREENING_FILES],
+            timeout=120,
+        ),
+        Step(
+            title="6. Скрининг: какие рычаги прошли",
+            module="week_06.cli",
+            args=["rag", "--compare", "--tables", "verdicts", *_W06D29_SCREENING_FILES],
+            timeout=120,
+        ),
+        Step(
+            title="7. Живой прогон «после»",
             module="week_06.cli",
             args=[
                 "rag",
@@ -2370,6 +2383,18 @@ def _demo_steps_w06d29() -> list[Step]:
                 "--no-unanswerable",
             ],
             timeout=_W06D29_TIMEOUT,
+        ),
+        Step(
+            title="8. Финал 13×3: до и после",
+            module="week_06.cli",
+            args=["rag", "--compare", "--tables", "quality,speed,resources", *_W06D29_FINAL_FILES],
+            timeout=120,
+        ),
+        Step(
+            title="9. Финал: ворота",
+            module="week_06.cli",
+            args=["rag", "--compare", "--tables", "gates", *_W06D29_FINAL_FILES],
+            timeout=120,
         ),
     ]
 

@@ -21,19 +21,40 @@ def _parse(args: list[str]):
     return sub.make_context(args[0], list(args[1:]))
 
 
+SCREENING_TITLES = [
+    ("3. Скрининг 10×1: качество", "quality"),
+    ("4. Скрининг 10×1: скорость", "speed"),
+    ("5. Скрининг 10×1: ответ и VRAM", "resources"),
+    ("6. Скрининг: какие рычаги прошли", "verdicts"),
+]
+
+
 def test_demo_steps_w06d29_shape():
     steps = record.demo_steps(6, 29)
-    assert [s.module for s in steps] == ["week_06.cli"] * 5
+    assert [s.module for s in steps] == ["week_06.cli"] * 9
     assert steps[0].args == ["status", "--vram"]
     assert steps[1].args == ["profiles", "baseline", "tuned"]
-    assert steps[2].args[:2] == ["rag", "--compare"]
-    assert steps[3].args[:2] == ["rag", "--compare"]
-    assert steps[4].args[0] == "rag"
+    for step, (title, key) in zip(steps[2:6], SCREENING_TITLES, strict=True):
+        assert step.title == title
+        assert step.args[:4] == ["rag", "--compare", "--tables", key]
+    assert steps[6].title == "7. Живой прогон «после»" and steps[6].args[0] == "rag"
+    assert steps[7].title == "8. Финал 13×3: до и после"
+    assert steps[7].args[:4] == ["rag", "--compare", "--tables", "quality,speed,resources"]
+    assert steps[8].title == "9. Финал: ворота"
+    assert steps[8].args[:4] == ["rag", "--compare", "--tables", "gates"]
+
+
+def test_every_compare_step_goes_through_the_real_parser_with_its_tables_value():
+    for step in record.demo_steps(6, 29):
+        if "--compare" in step.args:
+            ctx = _parse(step.args)
+            assert ctx.params["tables"] == step.args[step.args.index("--tables") + 1]
+            assert len(ctx.params["files"]) in (2, 11)
 
 
 def test_screening_table_lists_baseline_first_and_all_ten_levers():
     args = record.demo_steps(6, 29)[2].args
-    files = args[2:]
+    files = args[4:]
     assert len(files) == 11
     assert files[0] == "logs/ragbench/w06d29_baseline_10x1.json"
     names = [f.removeprefix("logs/ragbench/w06d29_").removesuffix("_10x1.json") for f in files]
@@ -54,15 +75,15 @@ def test_screening_table_lists_baseline_first_and_all_ten_levers():
 
 
 def test_final_table_compares_baseline_with_tuned_13x3():
-    args = record.demo_steps(6, 29)[3].args
-    assert args[2:] == [
+    args = record.demo_steps(6, 29)[8].args
+    assert args[4:] == [
         "logs/ragbench/w06d29_baseline_13x3.json",
         "logs/ragbench/w06d29_tuned_13x3.json",
     ]
 
 
 def test_the_live_step_names_the_profile_and_the_local_backend_together():
-    live = record.demo_steps(6, 29)[4]
+    live = record.demo_steps(6, 29)[6]
     args = live.args
     assert args[args.index("--profile") + 1] == "tuned"
     assert args[args.index("--backends") + 1] == "local"
