@@ -182,6 +182,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w03d14()
     if week == 3 and day == 15:
         return _demo_steps_w03d15()
+    if week == 6 and day == 30:
+        return _demo_steps_w06d30()
     if week == 6 and day == 29:
         return _demo_steps_w06d29()
     if week == 6 and day == 28:
@@ -2432,6 +2434,88 @@ def _rehearsal_steps_w06d29() -> list[Step]:
     ]
 
 
+# Day 30 timeouts come from the probe: generation ~8-11 tok/s, prefill ~35 tok/s, queue wait
+# up to 150 s, cold start ~3 s. The wait-for-stopped steps must clear idle_seconds (60) + margin.
+_W06D30_WAIT_STOPPED = "120"
+_W06D30_DEMO_KEY_ENV = "ADVENT_SERVICE_DEMO_KEY"
+_W06D30_Q1 = "Объясни в двух предложениях, что такое квантизация модели."
+_W06D30_Q2 = "А чем она плоха?"
+
+
+def _demo_steps_w06d30() -> list[Step]:
+    """Day 30 - the private LLM service: cold start, queue, rate limit, context limit, unload.
+
+    The web clip is recorded separately and concatenated afterwards. The prep step blocks
+    until the model is unloaded, so the first chat shows a real cold start rather than a
+    promised one; the closing step shows the memory coming back.
+    """
+    return [
+        Step(
+            title="0. Подготовка: ждём, пока модель выгрузится",
+            module="week_06.cli",
+            args=["service", "status", "--wait-stopped", _W06D30_WAIT_STOPPED],
+            timeout=200,
+        ),
+        Step(
+            title="1. Чат с сервисом: первый ответ с cold start, второй без",
+            module="week_06.cli",
+            args=["service", "chat", "--max-tokens", "128"],
+            stdin_lines=[_W06D30_Q1, _W06D30_Q2, "/exit"],
+            timeout=420,
+            line_pause=6.0,
+        ),
+        Step(
+            title="2. Шесть одновременных запросов (ключ owner): очередь и 503",
+            module="week_06.cli",
+            args=["service", "stress", "-n", "6", "--max-tokens", "128"],
+            timeout=480,
+        ),
+        Step(
+            title="3. Четыре запроса ключом demo: rate limit, 429",
+            module="week_06.cli",
+            args=["service", "stress", "-n", "4", "--key-env", _W06D30_DEMO_KEY_ENV],
+            timeout=480,
+        ),
+        Step(
+            title="4. Запрос длиннее контекста: 413 с числами",
+            module="week_06.cli",
+            args=["service", "overflow"],
+            timeout=240,
+        ),
+        Step(
+            title="5. Простой: модель выгружена, память вернулась",
+            module="week_06.cli",
+            args=["service", "status", "--wait-stopped", _W06D30_WAIT_STOPPED],
+            timeout=200,
+        ),
+    ]
+
+
+def _rehearsal_steps_w06d30() -> list[Step]:
+    """Reachability and key gates, plus a Cyrillic round trip through the REPL's stdin."""
+    return [
+        Step(
+            title="репетиция: service status",
+            module="week_06.cli",
+            args=["service", "status"],
+            timeout=60,
+        ),
+        Step(
+            title="репетиция: ключ demo",
+            module="week_06.cli",
+            args=["service", "status", "--key-env", _W06D30_DEMO_KEY_ENV],
+            timeout=60,
+        ),
+        Step(
+            title="репетиция: service chat из stdin",
+            module="week_06.cli",
+            args=["service", "chat", "--max-tokens", "16"],
+            stdin_lines=[_W06D30_Q2, "/exit"],
+            timeout=240,
+        ),
+    ]
+
+
 def _demo_steps_w05d25() -> list[Step]:
     """Day 25 — mini-chat with RAG, sources and task state: the agent's REPL, then chat-eval.
 
@@ -2753,6 +2837,8 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
         return _demo_steps_w03d14(session="w03d14-rehearsal")
     if (week, day) == (3, 15):
         return _demo_steps_w03d15(session="w03d15-rehearsal")
+    if (week, day) == (6, 30):
+        return _rehearsal_steps_w06d30()
     if (week, day) == (6, 29):
         return _rehearsal_steps_w06d29()
     if (week, day) == (6, 28):

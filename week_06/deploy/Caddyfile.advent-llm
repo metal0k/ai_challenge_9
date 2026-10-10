@@ -1,0 +1,13 @@
+# Site block for the day-30 service. NOT pushed by deploy.py: add it to the config mirror of
+# VPS_Manager and push it with its push_config.py (backup, validate, reload, rollback).
+advent-llm.duckdns.org {
+	# DNS-01 via the duckdns API, same as the radio site: HTTP-01 at LE is flaky for duckdns.
+	tls {
+		dns duckdns {env.DUCKDNS_TOKEN}
+		resolvers 1.1.1.1 9.9.9.9
+	}
+	request_body {
+		max_size 64KB
+	}
+	reverse_proxy 127.0.0.1:8790
+}

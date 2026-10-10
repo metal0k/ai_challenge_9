@@ -43,6 +43,8 @@ adventlocal = "week_06.cli:main"
 dev = [
     "ruff>=0.9",
     "pytest>=8.3",
+    "starlette==1.6.0",
+    "uvicorn==0.53.0",
 ]
 
 [build-system]

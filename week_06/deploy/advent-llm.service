@@ -1,0 +1,46 @@
+# Gateway and its llama-server child share this one cgroup: one memory and CPU policy.
+[Unit]
+Description=Advent private LLM gateway (llama.cpp behind an auth/rate-limit proxy)
+After=network.target
+
+[Service]
+Type=simple
+User=advent-llm
+Group=advent-llm
+WorkingDirectory=/opt/advent-llm/current/app
+ExecStart=/opt/advent-llm/current/venv/bin/python -m week_06.gateway --config /opt/advent-llm/current/gateway.json
+Restart=on-failure
+RestartSec=3
+
+# Memory: a hard cap only. Measured peak 664 MB with the mmap cache of the model, so a soft
+# limit below that would evict the model's own pages all the time.
+MemoryMax=780M
+MemorySwapMax=0
+# A child killed by the OOM killer must not take the unit down: the gateway answers 502 and
+# restarts the child on the next request.
+OOMPolicy=continue
+
+# CPU: a preference over the radio, not a ceiling (a ceiling slowed generation, not the radio).
+CPUWeight=20
+Nice=10
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/advent-llm
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

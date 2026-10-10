@@ -124,3 +124,31 @@ def log_internal_call(
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def log_service_call(
+    result: CallResult,
+    messages: list[Message],
+    *,
+    week: int,
+    day: int | None = None,
+    outcome: str,
+    error: str | None = None,
+    path: Path | None = None,
+    extra: dict[str, object] | None = None,
+) -> None:
+    """Journal a call to the private service: `endpoint=private`, plus the real outcome.
+
+    `outcome` ("complete" | "incomplete" | "error") is separate from any HTTP status:
+    a stream answers 200 and can still die mid-way, and a row that only says 200
+    would call that a success.
+    """
+    log_call(
+        result,
+        messages,
+        week=week,
+        day=day,
+        error=error,
+        path=path,
+        extra={**(extra or {}), "endpoint": "private", "outcome": outcome},
+    )

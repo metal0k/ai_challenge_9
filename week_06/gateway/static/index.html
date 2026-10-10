@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Приватный LLM-сервис</title>
+<link rel="stylesheet" href="/chat.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Приватный LLM-сервис</h1>
+    <p class="sub">qwen2.5-0.5b на маленьком VPS. Первый ответ после простоя идёт с холодным стартом.</p>
+  </header>
+
+  <section class="key" aria-label="Ключ">
+    <label for="key">Ключ доступа</label>
+    <div class="row">
+      <input id="key" type="password" autocomplete="off" placeholder="adv_...">
+      <button id="forget" type="button">Забыть ключ</button>
+    </div>
+    <label class="check"><input id="remember" type="checkbox"> запомнить ключ в этом браузере</label>
+  </section>
+
+  <section id="log" aria-live="polite"></section>
+
+  <form id="form" autocomplete="off">
+    <textarea id="input" rows="2" placeholder="Сообщение" required></textarea>
+    <div class="row">
+      <button id="send" type="submit">Отправить</button>
+      <button id="reset" type="button">Новый диалог</button>
+    </div>
+  </form>
+</main>
+<script src="/chat.js" defer></script>
+</body>
+</html>

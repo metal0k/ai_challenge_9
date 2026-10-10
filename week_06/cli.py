@@ -6,6 +6,9 @@ warnings and the model's reasoning go to stderr, as everywhere in this repo.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import math
 import os
 import shutil
 import subprocess
@@ -25,13 +28,14 @@ from advent_core import config as config_module
 from advent_core import console
 from advent_core.config import Config, ConfigError
 from advent_core.errors import AdventError, ConfigurationError
-from advent_core.journal import log_call
+from advent_core.journal import log_call, log_service_call
 from advent_core.params import GenerationParams
 from advent_core.telemetry import CallResult, Usage
 from week_01.models_bench import PriceTable, call_cost, load_prices, warn_if_prices_stale
 from week_06 import codecheck, profiles, ragbench, tasks, vram
 from week_06 import compare as compare_module
 from week_06 import local_client as lc
+from week_06 import service_client as svc
 
 WEEK = 6
 DAY = 26
@@ -813,6 +817,559 @@ def profiles_command(
     """Профили локального RAG: строки — поля, колонки — профили, отличия от baseline выделены."""
     for table in profiles.profiles_tables(names):
         console.out.print(table)
+
+
+# ---------------------------------------------------------------------------
+# service: the private LLM service (day 30)
+# ---------------------------------------------------------------------------
+
+SERVICE_DAY = 30
+STATUS_POLL_SECONDS = 2.0
+STRESS_PROMPT = (
+    "Расскажи подробно, по шагам и не короче двадцати предложений, "
+    "как правильно заваривать чай в чайнике."
+)
+OVERFLOW_TEXT_CHARS = 14_000  # ~3500+ tokens, far below the 64 KB body limit
+BODY_LIMIT_BYTES = 65_536
+
+service_app = typer.Typer(
+    help="Приватный LLM-сервис по HTTPS: статус, чат, нагрузка, переполнение контекста.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(service_app, name="service")
+
+_SVC_URL_OPT = typer.Option(
+    None, "--url", help="Адрес сервиса (по умолчанию ADVENT_SERVICE_URL из .env)."
+)
+_SVC_KEY_ENV_OPT = typer.Option(
+    svc.SERVICE_KEY_ENV,
+    "--key-env",
+    help="ИМЯ переменной окружения с ключом (не сам ключ: он не должен попасть в argv).",
+)
+_SVC_MAX_TOKENS_OPT = typer.Option(
+    svc.DEFAULT_MAX_TOKENS, "--max-tokens", min=1, max=svc.MAX_TOKENS_CEILING, help="Лимит ответа."
+)
+
+
+def _make_client(target: svc.ServiceTarget) -> svc.ServiceClient:
+    """Single seam for the HTTP client (tests substitute a MockTransport one)."""
+    return svc.ServiceClient(target)
+
+
+def _ms(value: float | int | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.0f} мс" if value < 1000 else f"{value / 1000:.1f} с"
+
+
+def _num(value: object, suffix: str = "") -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:g}{suffix}"
+    return f"{value}{suffix}"
+
+
+def _field(data: object, *path: str) -> object:
+    for part in path:
+        data = data.get(part) if isinstance(data, dict) else None
+    return data
+
+
+def _counts(data: object) -> str:
+    if not isinstance(data, dict) or not data:
+        return "—"
+    return " · ".join(f"{k} {v}" for k, v in data.items())
+
+
+def _service_status_table(origin: str, st: svc.ServiceStatus) -> Table:
+    table = Table(title=f"Сервис {origin}", title_justify="left", show_header=True)
+    table.add_column("параметр", overflow="fold")
+    table.add_column("значение", overflow="fold")
+    raw = st.raw
+    queue = (
+        f"ждут {_num(st.queue_waiting)} · активных {_num(st.queue_active)}"
+        f" · максимум ожидающих {_num(st.queue_max)}"
+    )
+    limits = (
+        f"rpm {_num(st.rpm)} · burst {_num(st.burst)} · в bucket сейчас {_num(st.bucket_tokens)}"
+    )
+    tokens = (
+        f"{_num(_field(raw, 'limits', 'max_tokens_default'))} по умолчанию · "
+        f"потолок {_num(_field(raw, 'limits', 'max_tokens_ceiling'))}"
+    )
+    rows = [
+        ("версия", _num(st.version)),
+        ("модель", _num(st.state)),
+        ("имя модели", _num(raw.get("model_id"))),
+        ("RSS процесса", _num(None if st.rss_mb is None else round(st.rss_mb), " МБ")),
+        ("аптайм процесса", _num(st.uptime_s, " с")),
+        ("до выгрузки (idle)", _num(st.idle_unload_s, " с")),
+        ("аптайм gateway", _num(raw.get("gateway_uptime_s"), " с")),
+        ("код выхода модели", _num(raw.get("last_exit_code"))),
+        ("очередь", queue),
+        ("ключ", _num(_field(raw, "key", "name"))),
+        ("лимиты ключа", limits),
+        ("контекст", _num(_field(raw, "limits", "n_ctx"), " токенов")),
+        ("max_tokens", tokens),
+        ("тело запроса", _num(_field(raw, "limits", "body_max_bytes"), " байт")),
+        ("таймаут простоя", _num(_field(raw, "limits", "idle_seconds"), " с")),
+        ("всего в минуту", _num(_field(raw, "limits", "global_per_minute"))),
+        ("ответы по кодам", _counts(raw.get("counters"))),
+        ("исходы", _counts(raw.get("outcomes"))),
+    ]
+    for name, value in rows:
+        table.add_row(name, value)
+    return table
+
+
+def _service_journal(
+    messages: list[dict],
+    *,
+    task: str,
+    result: svc.ServiceResult | None = None,
+    error: AdventError | None = None,
+    extra: dict[str, object] | None = None,
+) -> None:
+    """One `endpoint=private` journal row per service call; the outcome is its own field."""
+    res = result or svc.ServiceResult(status=getattr(error, "status", 0))
+    call = CallResult(
+        text=res.text,
+        model_requested="advent-llm",
+        model_actual=res.model or "advent-llm",
+        usage=res.usage,
+        latency_ms=int(res.wall_ms),
+        stream=res.stream,
+        truncated=res.incomplete,
+        finish_reason=res.finish_reason,
+    )
+    outcome = "error" if error is not None else ("incomplete" if res.incomplete else "complete")
+    log_service_call(
+        call,
+        messages,
+        week=WEEK,
+        day=SERVICE_DAY,
+        outcome=outcome,
+        error=error.message if error else res.incomplete_reason,
+        extra={
+            "backend": "service",
+            "task": task,
+            "http_status": getattr(error, "status", res.status),
+            "error_type": getattr(error, "error_type", None),
+            "queue_wait_ms": res.queue_wait_ms,
+            "cold_start_ms": res.cold_start_ms,
+            "input_tokens": res.input_tokens,
+            **(extra or {}),
+        },
+    )
+
+
+# --- status -----------------------------------------------------------------
+
+
+async def _fetch_status(
+    target: svc.ServiceTarget, wait_stopped: float | None
+) -> tuple[svc.ServiceStatus, bool]:
+    """(status, reached): with --wait-stopped poll until the model is `stopped` or time is up."""
+    async with _make_client(target) as client:
+        st = await client.status()
+        if wait_stopped is None:
+            return st, True
+        deadline = time.monotonic() + wait_stopped
+        while st.state != "stopped" and time.monotonic() < deadline:
+            console.note(f"жду выгрузки модели: сейчас {st.state or '?'}")
+            await asyncio.sleep(min(STATUS_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+            st = await client.status()
+        return st, st.state == "stopped"
+
+
+@service_app.command("status")
+def service_status_command(
+    url: str | None = _SVC_URL_OPT,
+    key_env: str = _SVC_KEY_ENV_OPT,
+    wait_stopped: float | None = typer.Option(
+        None,
+        "--wait-stopped",
+        min=0.0,
+        help="Ждать до N секунд, пока модель не станет stopped (exit 1, если не дождались).",
+    ),
+) -> None:
+    """Состояние сервиса из /v1/status: модель, RSS, очередь, лимиты ключа, счётчики."""
+    target = svc.resolve_target(url, key_env)
+    st, reached = svc.run(_fetch_status(target, wait_stopped))
+    console.out.print(_service_status_table(target.origin, st))
+    if not reached:
+        console.warn(f"модель не остановилась за {wait_stopped:g} с (состояние: {st.state or '?'})")
+        raise typer.Exit(1)
+
+
+# --- chat -------------------------------------------------------------------
+
+
+def _chat_footer(res: svc.ServiceResult) -> None:
+    usage = res.usage
+    if usage.completion_tokens is None:
+        tokens = "tokens ?"
+    else:
+        prompt = "—" if usage.prompt_tokens is None else usage.prompt_tokens
+        tokens = f"tokens {prompt}/{usage.completion_tokens}"
+    tps = res.tokens_per_second
+    parts = [
+        f"cold start {_ms(res.cold_start_ms)}",
+        f"очередь {_ms(res.queue_wait_ms)}",
+        _ms(res.wall_ms),
+        tokens,
+        "tok/s —" if tps is None else f"tok/s {tps:.1f}",
+        f"finish {res.finish_reason or '—'}",
+    ]
+    console.err.print(f"· {'  ·  '.join(parts)}", style="dim", markup=False, highlight=False)
+
+
+async def _chat_once(
+    target: svc.ServiceTarget, messages: list[dict], max_tokens: int, on_content
+) -> svc.ServiceResult:
+    async with _make_client(target) as client:
+        return await client.chat(messages, max_tokens=max_tokens, on_content=on_content)
+
+
+def _chat_turn(
+    target: svc.ServiceTarget, history: list[dict], question: str, max_tokens: int
+) -> svc.ServiceResult | None:
+    """One exchange. The answer goes to stdout, everything else to stderr; an
+    incomplete or failed answer is not kept in `history`."""
+    messages = [*history, {"role": "user", "content": question}]
+    try:
+        res = svc.run(_chat_once(target, messages, max_tokens, console.write_chunk))
+    except AdventError as error:
+        _service_journal(messages, task="chat", error=error)
+        raise
+    if res.text:
+        console.finish_answer()
+    _chat_footer(res)
+    _service_journal(messages, task="chat", result=res)
+    if res.incomplete:
+        console.warn(f"обрыв: {res.incomplete_reason}; ответ неполный и не попадёт в историю")
+        return None
+    history.extend([messages[-1], {"role": "assistant", "content": res.text}])
+    return res
+
+
+def _read_repl_line() -> str | None:
+    console.err.print("вы › ", end="", markup=False, highlight=False)
+    line = sys.stdin.readline()
+    if line == "":
+        console.err.print("")
+        return None
+    text = line.strip()
+    if not sys.stdin.isatty():
+        console.echo_input(text)
+    return text
+
+
+@service_app.command("chat")
+def service_chat_command(
+    question: str | None = typer.Argument(
+        None, help="Один вопрос и выход; без аргумента — REPL (/exit, /new, /status)."
+    ),
+    url: str | None = _SVC_URL_OPT,
+    key_env: str = _SVC_KEY_ENV_OPT,
+    max_tokens: int = _SVC_MAX_TOKENS_OPT,
+) -> None:
+    """Чат с приватным сервисом: stream в stdout, footer (cold start, очередь, tok/s) в stderr."""
+    target = svc.resolve_target(url, key_env)
+    history: list[dict] = []
+    if question is not None and question.strip():
+        _chat_turn(target, history, question.strip(), max_tokens)
+        return
+    console.note(f"сервис {target.origin} · /exit, /new, /status")
+    while True:
+        line = _read_repl_line()
+        if line is None or line in ("/exit", "/quit"):
+            return
+        if not line:
+            continue
+        if line == "/new":
+            history.clear()
+            console.note("история очищена")
+        elif line == "/status":
+            try:
+                st, _ = svc.run(_fetch_status(target, None))
+                console.err.print(_service_status_table(target.origin, st))
+            except AdventError as error:
+                console.warn(error.message)
+        elif line.startswith("/"):
+            console.warn("команды: /exit, /new, /status")
+        else:
+            try:
+                _chat_turn(target, history, line, max_tokens)
+            except AdventError as error:
+                # A refusal (429, 503 ...) must not end the session on camera.
+                console.warn(error.message + (f" ({error.hint})" if error.hint else ""))
+
+
+# --- stress -----------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class StressRow:
+    index: int
+    http_status: int | None  # None = never got an HTTP answer
+    kind: str  # "ok" | "incomplete" | "refused" | "network"
+    queue_wait_ms: int | None = None
+    cold_start_ms: int | None = None
+    wall_ms: float = 0.0
+    tokens: str = "—"
+    detail: str = "—"  # finish_reason, error type or the cut reason
+
+
+def _row_from_result(index: int, res: svc.ServiceResult) -> StressRow:
+    usage = res.usage
+    if usage.completion_tokens is None:
+        tokens = "—"
+    else:
+        prompt = "—" if usage.prompt_tokens is None else usage.prompt_tokens
+        tokens = f"{prompt}/{usage.completion_tokens}"
+    incomplete = res.incomplete
+    return StressRow(
+        index=index,
+        http_status=res.status,
+        kind="incomplete" if incomplete else "ok",
+        queue_wait_ms=res.queue_wait_ms,
+        cold_start_ms=res.cold_start_ms,
+        wall_ms=res.wall_ms,
+        tokens=tokens,
+        detail=f"обрыв: {res.incomplete_reason}" if incomplete else (res.finish_reason or "—"),
+    )
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    """Nearest-rank percentile; None for no data."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+
+
+def _stress_table(rows: list[StressRow]) -> Table:
+    table = Table(title="Нагрузка: N одновременных запросов", title_justify="left")
+    for name in ("#", "статус", "очередь", "cold start", "wall", "tokens", "итог"):
+        table.add_column(name, overflow="fold")
+    for row in sorted(rows, key=lambda r: r.index):
+        table.add_row(
+            str(row.index),
+            "—" if row.http_status is None else str(row.http_status),
+            _ms(row.queue_wait_ms),
+            _ms(row.cold_start_ms),
+            _ms(row.wall_ms),
+            row.tokens,
+            row.detail,
+        )
+    return table
+
+
+def stress_summary(rows: list[StressRow], preconditions: str) -> list[str]:
+    """Plain lines: outcome counts as `<код>: <N>`, then p50/p90 wall of the full answers."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        if row.kind == "network":
+            key = "сеть"
+        elif row.kind == "incomplete":
+            key = "обрыв"
+        else:
+            key = str(row.http_status)
+        counts[key] = counts.get(key, 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: (not item[0].isdigit(), item[0]))
+    walls = [row.wall_ms for row in rows if row.kind == "ok"]
+    p50, p90 = _percentile(walls, 0.5), _percentile(walls, 0.9)
+    return [
+        "Итого: " + ", ".join(f"{key}: {n}" for key, n in ordered),
+        f"wall успешных: p50 {_ms(p50)}, p90 {_ms(p90)}",
+        f"предусловия: {preconditions}",
+    ]
+
+
+async def _stress_preconditions(
+    client: svc.ServiceClient, settle: float
+) -> tuple[bool | None, str]:
+    """Wait (up to `settle` s) for an empty queue and a full bucket.
+
+    True = both proven, False = proven NOT met after the wait, None = status cannot say.
+    """
+    deadline = time.monotonic() + settle
+    while True:
+        st = await client.status()
+        empty, full = st.queue_empty, st.bucket_full
+        if empty and full:
+            return True, "очередь пуста, bucket полон"
+        if empty is None or full is None:
+            return None, "статус не сообщает очередь или bucket — не проверены"
+        if time.monotonic() >= deadline:
+            what = []
+            if not empty:
+                what.append("очередь не пуста")
+            if not full:
+                what.append(f"bucket {_num(st.bucket_tokens)} из {_num(st.burst)}")
+            return False, "не выполнены (" + ", ".join(what) + ")"
+        console.note("жду: очередь пуста и bucket полон")
+        await asyncio.sleep(STATUS_POLL_SECONDS)
+
+
+async def _run_stress(
+    target: svc.ServiceTarget, n: int, max_tokens: int, settle: float
+) -> tuple[list[StressRow], str]:
+    messages = [{"role": "user", "content": STRESS_PROMPT}]
+    rows: list[StressRow] = []
+    async with _make_client(target) as client:
+        proven, precondition = await _stress_preconditions(client, settle)
+        if proven is not True:
+            console.warn(f"предусловия: {precondition}; точные счётчики не гарантируются")
+        opened = await client.warm(n)
+        console.note(f"открыто соединений: {opened}/{n}; отправка по барьеру")
+        ready = 0
+        go = asyncio.Event()
+
+        async def one(index: int) -> None:
+            nonlocal ready
+            ready += 1
+            await go.wait()
+            extra = {"run": index}
+            try:
+                res = await client.chat(messages, max_tokens=max_tokens)
+                row = _row_from_result(index, res)
+                _service_journal(messages, task="stress", result=res, extra=extra)
+            except svc.ServiceError as error:
+                row = StressRow(index, error.status, "refused", detail=error.error_type or "—")
+                _service_journal(messages, task="stress", error=error, extra=extra)
+            except AdventError as error:
+                row = StressRow(index, None, "network", detail="сеть")
+                _service_journal(messages, task="stress", error=error, extra=extra)
+            rows.append(row)
+            console.note(f"  #{index}: {row.http_status or 'сеть'} {row.detail}")
+
+        workers = [asyncio.create_task(one(i + 1)) for i in range(n)]
+        while ready < n:
+            await asyncio.sleep(0)
+        go.set()
+        await asyncio.gather(*workers)
+    return rows, precondition
+
+
+@service_app.command("stress")
+def service_stress_command(
+    n: int = typer.Option(6, "-n", min=1, max=64, help="Сколько одновременных запросов."),
+    url: str | None = _SVC_URL_OPT,
+    key_env: str = _SVC_KEY_ENV_OPT,
+    max_tokens: int = typer.Option(128, "--max-tokens", min=1, max=svc.MAX_TOKENS_CEILING),
+    settle: float = typer.Option(
+        30.0, "--settle", min=0.0, help="Сколько секунд ждать пустую очередь и полный bucket."
+    ),
+) -> None:
+    """N одновременных запросов: таблица по каждому, сколько 200/429/503, p50/p90 wall."""
+    target = svc.resolve_target(url, key_env)
+    rows, precondition = svc.run(_run_stress(target, n, max_tokens, settle))
+    console.out.print(_stress_table(rows))
+    for line in stress_summary(rows, precondition):
+        console.out.print(line, markup=False, highlight=False)
+
+
+# --- overflow ---------------------------------------------------------------
+
+# a word list reads better as prose than as 48 quoted items
+_OVERFLOW_WORDS = tuple(
+    "lantern harbor quartz meadow copper violin thunder orchard saffron glacier "  # noqa: SIM905
+    "compass willow ember prism cobalt thistle marble falcon ribbon cinder velvet "
+    "granite jasmine anchor beacon cypress dolphin elm fjord garnet hollow ivory "
+    "juniper kettle lotus mosaic nectar opal pebble quill raven summit tundra "
+    "umber vortex walnut yarrow zephyr".split()
+)
+
+
+def overflow_text(chars: int = OVERFLOW_TEXT_CHARS) -> str:
+    """Varied text of about `chars` characters. BPE squeezes monotone input to a few tokens
+    (`"а" * 700_000`), so every phrase differs: a number and a word triple that walks the list."""
+    words = _OVERFLOW_WORDS
+    parts: list[str] = []
+    size = 0
+    i = 0
+    while size < chars:
+        phrase = (
+            f"{i * 37 + 11}: {words[i % len(words)]} {words[(i * 7 + 3) % len(words)]}"
+            f" {words[(i * 13 + 5) % len(words)]} {i * i % 9973}."
+        )
+        parts.append(phrase)
+        size += len(phrase) + 1
+        i += 1
+    return " ".join(parts)
+
+
+async def _overflow_once(
+    target: svc.ServiceTarget, messages: list[dict], max_tokens: int
+) -> svc.ServiceResult:
+    async with _make_client(target) as client:
+        return await client.chat(messages, max_tokens=max_tokens, stream=False)
+
+
+@service_app.command("overflow")
+def service_overflow_command(
+    url: str | None = _SVC_URL_OPT,
+    key_env: str = _SVC_KEY_ENV_OPT,
+    max_tokens: int = typer.Option(16, "--max-tokens", min=1, max=svc.MAX_TOKENS_CEILING),
+) -> None:
+    """Запрос длиннее контекста: ожидается 413 context_length_exceeded с числами из ответа."""
+    target = svc.resolve_target(url, key_env)
+    messages = [{"role": "user", "content": overflow_text()}]
+    payload = {"messages": messages, "max_tokens": max_tokens}
+    body_bytes = len(json.dumps(payload).encode("utf-8"))
+    if body_bytes >= BODY_LIMIT_BYTES:
+        raise ConfigError(
+            f"Тело {body_bytes} Б не меньше лимита {BODY_LIMIT_BYTES} Б — проверялся бы другой"
+        )
+    try:
+        res = svc.run(_overflow_once(target, messages, max_tokens))
+    except svc.ServiceError as error:
+        _service_journal(messages, task="overflow", error=error)
+        if error.status != 413 or error.error_type != "context_length_exceeded":
+            raise AdventError(
+                f"ожидался 413 context_length_exceeded, пришло {error.status} "
+                f"{error.error_type or '—'}: {error.message}",
+                hint="числа не печатаются: это не та ошибка",
+            ) from None
+        numbers = error.numbers
+        missing = [k for k in ("input_tokens", "max_tokens", "n_ctx") if k not in numbers]
+        if missing:
+            raise AdventError(
+                f"в ответе 413 context_length_exceeded нет полей: {', '.join(missing)}"
+            ) from None
+    else:
+        _service_journal(messages, task="overflow", result=res)
+        raise AdventError(
+            f"переполнения не случилось: сервис ответил {res.status}",
+            hint="входной текст должен быть больше n_ctx минус max_tokens",
+        )
+    total = numbers["input_tokens"] + numbers["max_tokens"]
+    table = Table(title="Переполнение контекста", title_justify="left")
+    table.add_column("параметр", overflow="fold")
+    table.add_column("значение", overflow="fold")
+    table.add_row("ответ", "413 context_length_exceeded")
+    table.add_row("размер тела", f"{body_bytes} Б (лимит {BODY_LIMIT_BYTES} Б)")
+    table.add_row("input_tokens", str(numbers["input_tokens"]))
+    table.add_row("max_tokens", str(numbers["max_tokens"]))
+    table.add_row("n_ctx", str(numbers["n_ctx"]))
+    table.add_row("сумма", f"{total} > {numbers['n_ctx']}")
+    console.out.print(table)
+
+
+# --- keygen -----------------------------------------------------------------
+
+
+@service_app.command("keygen")
+def service_keygen_command() -> None:
+    """Новый ключ сервиса и его sha256 (в keys.json идёт только хэш)."""
+    key, digest = svc.generate_key()
+    console.out.print(f"ключ: {key}", markup=False, highlight=False)
+    console.out.print(f"sha256: {digest}", markup=False, highlight=False)
+    console.note("ключ показан один раз: положи его в .env, а sha256 — в keys.json на сервере")
 
 
 def main() -> None:

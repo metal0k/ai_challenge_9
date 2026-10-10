@@ -30,7 +30,7 @@ def test_guard_is_off_until_enabled():
     hits: list[httpx.Request] = []
     assert httpx.Client._send_single_request is ORIGINAL_SEND
     assert mock_client(hits).get("https://api.mistral.ai/v1/models").status_code == 200
-    assert offline.counters().attempted == {"local": 0, "cloud": 0}
+    assert offline.counters().attempted == {"local": 0, "private": 0, "cloud": 0}
 
 
 @pytest.mark.allow_cloud_attempts
@@ -44,9 +44,9 @@ def test_cloud_request_is_blocked_before_send_and_names_the_url():
     assert "GET api.mistral.ai" in info.value.message
     assert isinstance(info.value, AdventError) and info.value.exit_code == 2
     snap = offline.counters()
-    assert snap.attempted == {"local": 0, "cloud": 1}
-    assert snap.blocked == {"local": 0, "cloud": 1}
-    assert snap.completed == {"local": 0, "cloud": 0}
+    assert snap.attempted == {"local": 0, "private": 0, "cloud": 1}
+    assert snap.blocked == {"local": 0, "private": 0, "cloud": 1}
+    assert snap.completed == {"local": 0, "private": 0, "cloud": 0}
 
 
 @pytest.mark.parametrize(
@@ -58,9 +58,9 @@ def test_loopback_passes_and_is_counted_as_local(url):
     assert mock_client(hits).get(url).status_code == 200
     assert len(hits) == 1
     snap = offline.counters()
-    assert snap.attempted == {"local": 1, "cloud": 0}
-    assert snap.completed == {"local": 1, "cloud": 0}
-    assert snap.blocked == {"local": 0, "cloud": 0}
+    assert snap.attempted == {"local": 1, "private": 0, "cloud": 0}
+    assert snap.completed == {"local": 1, "private": 0, "cloud": 0}
+    assert snap.blocked == {"local": 0, "private": 0, "cloud": 0}
 
 
 @pytest.mark.allow_cloud_attempts
@@ -144,7 +144,7 @@ def test_reset_counters():
     with pytest.raises(CloudBlockedError):
         mock_client([]).get("https://api.mistral.ai/x")
     offline.reset_counters()
-    assert offline.counters().attempted == {"local": 0, "cloud": 0}
+    assert offline.counters().attempted == {"local": 0, "private": 0, "cloud": 0}
 
 
 @pytest.mark.allow_cloud_attempts
@@ -229,7 +229,7 @@ def test_list_models_ignores_an_env_proxy_for_local_and_offline(monkeypatch):
     config = Config(api_key="stub", base_url="http://127.0.0.1:1234", offline=True)
     assert client_mod.list_models(config) == [{"id": "m"}]
     assert seen == [("ConnectionPool", "http://127.0.0.1:1234/v1/models")]
-    assert offline.counters().attempted == {"local": 1, "cloud": 0}
+    assert offline.counters().attempted == {"local": 1, "private": 0, "cloud": 0}
 
 
 def test_list_models_does_not_follow_redirects_when_local(monkeypatch):
@@ -243,7 +243,7 @@ def test_list_models_does_not_follow_redirects_when_local(monkeypatch):
     config = Config(api_key="stub", base_url="http://127.0.0.1:1234", offline=True)
     with pytest.raises(AdventError):  # the 302 is an error, never followed
         client_mod.list_models(config)
-    assert offline.counters().attempted == {"local": 1, "cloud": 0}
+    assert offline.counters().attempted == {"local": 1, "private": 0, "cloud": 0}
 
 
 def _redirecting_client(hits: list[str], **kw) -> httpx.Client:
@@ -265,8 +265,8 @@ def test_redirect_to_the_cloud_is_blocked_for_a_client_created_before_enable():
         client.get("http://127.0.0.1:1234/start")
     assert hits == ["http://127.0.0.1:1234/start"]  # the cloud hop never reached the transport
     snap = offline.counters()
-    assert snap.attempted == {"local": 1, "cloud": 1}
-    assert snap.blocked == {"local": 0, "cloud": 1}
+    assert snap.attempted == {"local": 1, "private": 0, "cloud": 1}
+    assert snap.blocked == {"local": 0, "private": 0, "cloud": 1}
 
 
 @pytest.mark.allow_cloud_attempts

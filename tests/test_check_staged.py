@@ -117,3 +117,34 @@ def test_clean_tree_passes_with_zero_exit(tmp_path: Path) -> None:
     result = _run(repo)
     assert result.returncode == 0
     assert result.stdout.strip() == "проверено файлов: 1 — личных данных нет"
+
+
+def test_service_key_canary_is_blocked(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _stage(repo, "notes.txt", "KEY=adv_" + "Aa1" * 14 + "\n")
+    result = _run(repo)
+    assert result.returncode == 1
+    assert "похоже на ключ приватного сервиса" in result.stderr
+
+
+def test_service_key_pattern_ignores_identifiers_and_prose(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    _stage(
+        repo,
+        "code.py",
+        'key = "adv_" + secrets.token_urlsafe(32)\n'
+        "adv_service_client_timeout_seconds_default_value = 1\n"
+        "ADV_SERVICE_CLIENT_TIMEOUT_SECONDS_DEFAULT_VALUE = 2\n",
+    )
+    assert _run(repo).returncode == 0
+
+
+def test_env_example_documents_service_keys_with_empty_values() -> None:
+    lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    for name in (
+        "ADVENT_SERVICE_URL",
+        "ADVENT_PRIVATE_ORIGINS",
+        "ADVENT_SERVICE_KEY",
+        "ADVENT_SERVICE_DEMO_KEY",
+    ):
+        assert lines.count(f"{name}=") == 1

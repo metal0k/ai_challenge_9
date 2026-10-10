@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -40,24 +41,32 @@ __all__ = [
     "init_from_env",
     "is_enabled",
     "is_loopback_url",
+    "normalize_origin",
+    "private_origins",
     "reset_counters",
     "validate_loopback_url",
 ]
 
 ENV_FLAG = "ADVENT_OFFLINE"
+PRIVATE_ORIGINS_ENV = "ADVENT_PRIVATE_ORIGINS"
+_ENDPOINTS = ("local", "private", "cloud")
 
 _lock = threading.Lock()
 _enabled = False
 _originals: dict[str, object] = {}
 
 
+def _zeros() -> dict[str, int]:
+    return dict.fromkeys(_ENDPOINTS, 0)
+
+
 @dataclass(slots=True)
 class Counters:
-    """attempted/blocked/completed per endpoint ("local" | "cloud")."""
+    """attempted/blocked/completed per endpoint ("local" | "private" | "cloud")."""
 
-    attempted: dict[str, int] = field(default_factory=lambda: {"local": 0, "cloud": 0})
-    blocked: dict[str, int] = field(default_factory=lambda: {"local": 0, "cloud": 0})
-    completed: dict[str, int] = field(default_factory=lambda: {"local": 0, "cloud": 0})
+    attempted: dict[str, int] = field(default_factory=_zeros)
+    blocked: dict[str, int] = field(default_factory=_zeros)
+    completed: dict[str, int] = field(default_factory=_zeros)
 
     def snapshot(self) -> Counters:
         return Counters(dict(self.attempted), dict(self.blocked), dict(self.completed))
@@ -66,12 +75,62 @@ class Counters:
 _counters = Counters()
 
 
+def _is_mistral_host(host: str) -> bool:
+    return host == "mistral.ai" or host.endswith(".mistral.ai")
+
+
+def normalize_origin(url: object, *, origin_only: bool = False) -> str | None:
+    """`https://host[:port]` (443 dropped) for a well-formed https URL, else None.
+
+    Rejects other schemes, userinfo, a bad port and a Mistral host. With
+    `origin_only` also a path, query or fragment: an allowlist entry is an origin,
+    not a prefix, so `https://x/../` cannot widen what it authorizes.
+    """
+    try:
+        parts = urlsplit(str(url).strip())
+        port = parts.port
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower().rstrip(".")
+    if parts.scheme != "https" or not host or "@" in parts.netloc or _is_mistral_host(host):
+        return None
+    if origin_only and (parts.path not in ("", "/") or parts.query or parts.fragment):
+        return None
+    if port == 0:
+        return None
+    host_part = f"[{host}]" if ":" in host else host
+    return f"https://{host_part}" if port in (None, 443) else f"https://{host_part}:{port}"
+
+
+def private_origins() -> frozenset[str]:
+    """Normalized origins from ADVENT_PRIVATE_ORIGINS (comma/space separated).
+
+    Read on every call, not at import: tests and `.env` loading change it later.
+    A bad entry is dropped rather than failing the process, and it authorizes nothing.
+    """
+    raw = os.environ.get(PRIVATE_ORIGINS_ENV) or ""
+    entries = (normalize_origin(item, origin_only=True) for item in raw.replace(",", " ").split())
+    return frozenset(entry for entry in entries if entry)
+
+
 def endpoint_of(url: object) -> str:
-    """ "local" for loopback hosts, "cloud" for everything else (unknown host too)."""
+    """Endpoint class: "local" (loopback), "private" (allowlisted https origin) or "cloud".
+
+    The URL never authorizes itself: "private" needs an explicit ADVENT_PRIVATE_ORIGINS
+    entry, and an unknown or unparsable host is "cloud".
+    """
     host = getattr(url, "host", None)
     if host is None:
         host = url_host(str(url))
-    return "local" if host and str(host).lower() in LOOPBACK_HOSTS else "cloud"
+    if host and str(host).lower() in LOOPBACK_HOSTS:
+        return "local"
+    origin = normalize_origin(url)
+    return "private" if origin is not None and origin in private_origins() else "cloud"
+
+
+_ALLOWED_HINT = (
+    "разрешены loopback (127.0.0.1, localhost, ::1) и origin'ы из ADVENT_PRIVATE_ORIGINS"
+)
 
 
 def _blocked(url: object, what: str | None) -> CloudBlockedError:
@@ -79,7 +138,7 @@ def _blocked(url: object, what: str | None) -> CloudBlockedError:
     detail = f": {what}" if what else ""
     return CloudBlockedError(
         f"облако отключено (offline): запрос на {shown} заблокирован{detail}",
-        hint="разрешён только loopback (127.0.0.1, localhost, ::1)",
+        hint=_ALLOWED_HINT,
     )
 
 
@@ -166,7 +225,7 @@ def assert_cloud_allowed(what: str) -> None:
             _counters.blocked["cloud"] += 1
         raise CloudBlockedError(
             f"облако отключено (offline): {what}",
-            hint="разрешён только loopback (127.0.0.1, localhost, ::1)",
+            hint=_ALLOWED_HINT,
         )
 
 
@@ -178,6 +237,5 @@ def counters() -> Counters:
 
 def reset_counters() -> None:
     with _lock:
-        _counters.attempted.update(local=0, cloud=0)
-        _counters.blocked.update(local=0, cloud=0)
-        _counters.completed.update(local=0, cloud=0)
+        for table in (_counters.attempted, _counters.blocked, _counters.completed):
+            table.update(_zeros())
