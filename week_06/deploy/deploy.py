@@ -678,7 +678,9 @@ def smoke_steps(
 def _urllib_get(url: str, key: str | None) -> int:
     # httpx, not urllib: the project's offline guard only covers httpx.
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    return httpx.get(url, headers=headers, timeout=20, follow_redirects=False).status_code
+    # trust_env=False: a local HTTPS_PROXY breaks TLS to the VPS
+    with httpx.Client(trust_env=False, follow_redirects=False, timeout=20) as client:
+        return client.get(url, headers=headers).status_code
 
 
 def caddy_note() -> str:

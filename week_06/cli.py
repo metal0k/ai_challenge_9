@@ -883,6 +883,35 @@ def _counts(data: object) -> str:
     return " · ".join(f"{k} {v}" for k, v in data.items())
 
 
+_MODEL_STATE_RU = {
+    "stopped": "выгружена",
+    "starting": "загружается",
+    "ready": "загружена",
+    "failed": "ошибка",
+}
+# gateway's "other" bucket: any status that is neither listed nor >=500 (499 client abort, 4xx)
+_COUNTER_LABEL_RU = {"other": "прочие (не 5xx, напр. 499)"}
+
+
+def _model_state(state: object) -> str:
+    if not isinstance(state, str) or not state:
+        return _num(None)
+    ru = _MODEL_STATE_RU.get(state)
+    return ru if ru else f"неизвестно ({state})"
+
+
+def _status_counts(data: object) -> str:
+    """Non-zero response-code counters only, so the row fits one line at width 80."""
+    if not isinstance(data, dict):
+        return "—"
+    shown = [
+        f"{_COUNTER_LABEL_RU.get(k, k)} {v}"
+        for k, v in data.items()
+        if not (isinstance(v, int | float) and v == 0)
+    ]
+    return " · ".join(shown) if shown else "—"
+
+
 def _service_status_table(origin: str, st: svc.ServiceStatus) -> Table:
     table = Table(title=f"Сервис {origin}", title_justify="left", show_header=True)
     table.add_column("параметр", overflow="fold")
@@ -901,7 +930,7 @@ def _service_status_table(origin: str, st: svc.ServiceStatus) -> Table:
     )
     rows = [
         ("версия", _num(st.version)),
-        ("модель", _num(st.state)),
+        ("модель", _model_state(st.state)),
         ("имя модели", _num(raw.get("model_id"))),
         ("RSS процесса", _num(None if st.rss_mb is None else round(st.rss_mb), " МБ")),
         ("аптайм процесса", _num(st.uptime_s, " с")),
@@ -916,7 +945,7 @@ def _service_status_table(origin: str, st: svc.ServiceStatus) -> Table:
         ("тело запроса", _num(_field(raw, "limits", "body_max_bytes"), " байт")),
         ("таймаут простоя", _num(_field(raw, "limits", "idle_seconds"), " с")),
         ("всего в минуту", _num(_field(raw, "limits", "global_per_minute"))),
-        ("ответы по кодам", _counts(raw.get("counters"))),
+        ("ответы по кодам", _status_counts(raw.get("counters"))),
         ("исходы", _counts(raw.get("outcomes"))),
     ]
     for name, value in rows:
@@ -1021,8 +1050,12 @@ def _chat_footer(res: svc.ServiceResult) -> None:
         _ms(res.wall_ms),
         tokens,
         "tok/s —" if tps is None else f"tok/s {tps:.1f}",
-        f"finish {res.finish_reason or '—'}",
     ]
+    reason = res.finish_reason
+    if reason == "length":
+        parts.append("обрезано по max_tokens")
+    elif reason and reason != "stop":
+        parts.append(f"finish {reason}")
     console.err.print(f"· {'  ·  '.join(parts)}", style="dim", markup=False, highlight=False)
 
 

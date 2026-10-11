@@ -7,6 +7,9 @@ crash with a magic prefix in its last message: `#chunks=5;delay=0.05;crash=2;exc
 More magic keys: hdelay (before response headers), fdelay (after headers, before the first
 chunk), watch=1 (notice a client disconnect while waiting, like llama-server's task cancel),
 lag (seconds the slot stays busy after an abort; models the ~0.5 s cancel lag).
+input_tokens modes (CFG): count_delay (sleep first), count_block_while_processing (wait while a
+generation runs, like a task queued behind the slot), count_drop_first=N (close N connections
+without answering, like a stale keep-alive socket).
 GET /_stats exposes what the backend saw (max concurrency, last headers/body, aborts).
 """
 
@@ -34,7 +37,7 @@ for i, a in enumerate(argv):
 
 LOCK = threading.Lock()
 STATS = {"current": 0, "max_concurrent": 0, "total": 0, "aborted": 0, "completed": 0,
-         "last_headers": {}, "last_body": None, "pid": os.getpid()}  # fmt: skip
+         "count_calls": 0, "last_headers": {}, "last_body": None, "pid": os.getpid()}  # fmt: skip
 PROCESSING = {"n": 0}
 MAGIC = re.compile(r"^#([\w=;.]+)#")
 
@@ -107,6 +110,15 @@ class H(BaseHTTPRequestHandler):
             STATS["last_body"] = body
         msgs = body.get("messages", [])
         if self.path == "/v1/chat/completions/input_tokens":
+            with LOCK:
+                STATS["count_calls"] += 1
+                drop = STATS["count_calls"] <= int(CFG.get("count_drop_first", 0))
+            if drop:
+                self.close_connection = True
+                return
+            time.sleep(CFG.get("count_delay", 0.0))
+            while CFG.get("count_block_while_processing") and PROCESSING["n"] > 0:
+                time.sleep(0.02)
             self._json(200, {"input_tokens": count_tokens(msgs)})
             return
         if self.path != "/v1/chat/completions":

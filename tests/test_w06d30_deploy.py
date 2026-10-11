@@ -612,3 +612,24 @@ def test_model_sha256_default_is_pinned_and_a_mismatch_aborts():
     assert rc == 1 and remote.writes == [] and not any("useradd" in c for c in remote.cmds)
     short = FakeRemote({"stat -c": (0, "123\n", "")})
     assert run_main(["install", "--yes", "--version", "v1"], short)[0] == 1
+
+
+def test_default_external_get_ignores_proxy_env(monkeypatch):
+    seen: dict = {}
+
+    class FakeClient:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, headers=None):
+            return type("R", (), {"status_code": 401})()
+
+    monkeypatch.setattr(deploy.httpx, "Client", FakeClient)
+    assert deploy._urllib_get("https://x/health", None) == 401
+    assert seen["trust_env"] is False and seen["follow_redirects"] is False

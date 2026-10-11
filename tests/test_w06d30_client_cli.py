@@ -148,8 +148,9 @@ def test_one_shot_chat_answer_on_stdout_everything_else_on_stderr(gw):
     result = runner.invoke(cli.app, ["service", "chat", "привет"])
     assert result.exit_code == 0
     assert result.stdout == "Привет, мир\n"
-    for part in ("cold start 2.1 с", "очередь 340 мс", "tokens 12/5", "finish stop"):
+    for part in ("cold start 2.1 с", "очередь 340 мс", "tokens 12/5"):
         assert part in result.stderr
+    assert "finish" not in result.stderr
     assert "Привет, мир" not in result.stderr
     assert gw.requests[0].headers["authorization"] == f"Bearer {KEY}"
     assert gw.chat_bodies()[0]["max_tokens"] == 256
@@ -159,8 +160,8 @@ def test_repl_keeps_history_and_status_goes_to_stderr(gw):
     result = runner.invoke(cli.app, ["service", "chat"], input="один\n/status\n/new\nдва\n/exit\n")
     assert result.exit_code == 0
     assert result.stdout == "Привет, мир\nПривет, мир\n"
-    assert "Сервис" in result.stderr and "ready" in result.stderr
-    assert "ready" not in result.stdout
+    assert "Сервис" in result.stderr and "загружена" in result.stderr
+    assert "загружена" not in result.stdout
     assert [m["role"] for m in gw.chat_bodies()[1]["messages"]] == ["user"]  # after /new
 
 
@@ -252,7 +253,7 @@ def test_status_table_on_stdout_nothing_on_stderr(gw, wide):
     out = wide.getvalue()
     assert "…" not in out
     for line in (
-        "ready",
+        "загружена",
         "qwen2.5-0.5b-instruct",
         "rpm 30 · burst 6 · в bucket сейчас 6",
         "ждут 0 · активных 0 · максимум ожидающих 2",
@@ -278,7 +279,7 @@ def test_wait_stopped_polls_until_stopped(gw, wide):
     result = runner.invoke(cli.app, ["service", "status", "--wait-stopped", "30"])
     assert result.exit_code == 0
     assert result.stderr.count("жду выгрузки модели: сейчас ready") == 2
-    assert "stopped" in wide.getvalue()
+    assert "выгружена" in wide.getvalue()
 
 
 def test_wait_stopped_gives_up_with_exit_1(gw, wide):
@@ -382,3 +383,64 @@ def test_overflow_fails_when_the_service_accepts_the_input(gw, wide):
     )
     result = runner.invoke(cli.app, ["service", "overflow"])
     assert result.exit_code == 1 and wide.getvalue() == ""
+
+
+def _footer_text(monkeypatch, **kw) -> str:
+    buf = io.StringIO()
+    monkeypatch.setattr(
+        console, "err", Console(file=buf, width=200, color_system=None, soft_wrap=True)
+    )
+    res = svc.ServiceResult(
+        usage=svc.Usage(prompt_tokens=43, completion_tokens=112),
+        cold_start_ms=2400,
+        queue_wait_ms=0,
+        wall_ms=14000.0,
+        ttft_ms=3500.0,
+        **kw,
+    )
+    cli._chat_footer(res)
+    return buf.getvalue()
+
+
+def test_footer_one_line_without_finish_on_stop(monkeypatch):
+    out = _footer_text(monkeypatch, finish_reason="stop")
+    assert out == (
+        "· cold start 2.4 с  ·  очередь 0 мс  ·  14.0 с  ·  tokens 43/112  ·  tok/s 10.6\n"
+    )
+
+
+def test_footer_length_appends_truncation_note(monkeypatch):
+    out = _footer_text(monkeypatch, finish_reason="length")
+    assert out == (
+        "· cold start 2.4 с  ·  очередь 0 мс  ·  14.0 с  ·  tokens 43/112  ·  tok/s 10.6"
+        "  ·  обрезано по max_tokens\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "text"),
+    [
+        ("stopped", "выгружена"),
+        ("starting", "загружается"),
+        ("ready", "загружена"),
+        ("failed", "ошибка"),
+        ("weird", "неизвестно (weird)"),
+    ],
+)
+def test_model_state_in_russian(state, text):
+    assert cli._model_state(state) == text
+
+
+def test_counters_row_single_line_at_width_80(gw, wide):
+    gw.status = {
+        **STATUS,
+        "counters": {"200": 15, "401": 4, "413": 0, "429": 0, "503": 0, "5xx": 0, "other": 5},
+    }
+    result = runner.invoke(cli.app, ["service", "status"])
+    assert result.exit_code == 0
+    out = wide.getvalue()
+    assert "…" not in out
+    lines = [ln for ln in out.splitlines() if "ответы по кодам" in ln]
+    assert len(lines) == 1
+    assert "200 15 · 401 4 · прочие (не 5xx, напр. 499) 5" in lines[0]
+    assert "413 0" not in out and "5xx 0" not in out

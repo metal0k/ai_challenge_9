@@ -429,7 +429,8 @@ class Gateway:
             await self.admission.wait_turn(ticket, s.queue_timeout)
             queue_ms = int((time.monotonic() - t_wait) * 1000)
             gen, cold_ms = await m.ensure_ready()
-            input_tokens = await self._count_tokens(req)
+            deadline = asyncio.get_running_loop().time() + s.gen_deadline  # cold start excluded
+            input_tokens = await self._count_tokens(req, deadline)
             if input_tokens + req.max_tokens > s.n_ctx:
                 raise self._context_error(input_tokens, req.max_tokens)
             headers = {
@@ -456,21 +457,44 @@ class Gateway:
             extra={"input_tokens": input_tokens, "max_tokens": max_tokens, "n_ctx": s.n_ctx},
         )  # fmt: skip
 
-    async def _count_tokens(self, req: ChatRequest) -> int:
-        try:
-            r = await self.manager.client.post(
-                "/v1/chat/completions/input_tokens", json=req.counting_payload(), timeout=10.0
-            )
-            r.raise_for_status()
-            n = r.json()["input_tokens"]
-            if not isinstance(n, int) or isinstance(n, bool):
-                raise ValueError("input_tokens is not an int")
-            return n
-        except (httpx.HTTPError, ValueError, KeyError, TypeError):
-            raise ApiError(
-                502, "token_count_failed", "Не удалось посчитать токены запроса.",
-                type_="server_error",
-            ) from None  # fmt: skip
+    async def _count_tokens(self, req: ChatRequest, deadline: float) -> int:
+        """Runs only while this request holds the admission; bounded by the request deadline."""
+        loop = asyncio.get_running_loop()
+        t0 = time.monotonic()
+        failure: BaseException | None = None
+        for attempt in (1, 2):
+            remaining = deadline - loop.time()
+            try:
+                if remaining <= 0:
+                    raise TimeoutError
+                async with asyncio.timeout(remaining):
+                    r = await self.manager.client.post(
+                        "/v1/chat/completions/input_tokens",
+                        json=req.counting_payload(),
+                        timeout=httpx.Timeout(remaining, connect=min(3.0, remaining)),
+                    )
+                r.raise_for_status()
+                n = r.json()["input_tokens"]
+                if not isinstance(n, int) or isinstance(n, bool):
+                    raise ValueError("input_tokens is not an int")
+                return n
+            except (httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
+                failure = e  # transient (e.g. a stale keep-alive socket): one retry
+                if attempt == 1:
+                    continue
+                break
+            except (TimeoutError, httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+                failure = e  # a timeout is never retried
+                break
+        log.warning(
+            "token_count_failed error=%s elapsed_ms=%d",
+            type(failure).__name__,
+            int((time.monotonic() - t0) * 1000),
+        )  # type and timing only: never message content
+        raise ApiError(
+            502, "token_count_failed", "Не удалось посчитать токены запроса.",
+            type_="server_error",
+        ) from None  # fmt: skip
 
     def _upstream_error(self, resp: httpx.Response, req: ChatRequest) -> ApiError:
         """Map an upstream non-200 (body already read) to our error."""
