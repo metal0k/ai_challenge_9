@@ -98,10 +98,12 @@ class Stats:
         self.started = time.time()
         self.status: Counter[str] = Counter()
         self.outcomes: Counter[str] = Counter()
+        self.by_code: Counter[str] = Counter()
 
     def count_status(self, code: int) -> None:
         key = str(code) if str(code) in STATUS_BUCKETS else ("5xx" if code >= 500 else "other")
         self.status[key] += 1
+        self.by_code[str(code)] += 1  # exact codes; the buckets stay for older clients
 
     def snapshot(self) -> dict:
         snap = {k: self.status.get(k, 0) for k in STATUS_BUCKETS}
@@ -337,6 +339,7 @@ class Gateway:
                 "tokens_left": round(self.limiter.left(rec.name), 2),
             },
             "counters": self.stats.snapshot(),
+            "by_code": dict(self.stats.by_code),
             "outcomes": dict(self.stats.outcomes),
         }
         return JSONResponse(body, headers={"Cache-Control": "no-store"})

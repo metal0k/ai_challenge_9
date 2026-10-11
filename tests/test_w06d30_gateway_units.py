@@ -390,3 +390,15 @@ def test_html_has_no_inline_script_or_handlers():
     assert not re.search(r"\son\w+\s*=", html)
     assert "<style" not in html
     assert 'name="viewport"' in html and "remember" in html and "forget" in html
+
+
+def test_stats_counts_exact_codes_alongside_buckets():
+    from week_06.gateway.app import Stats
+
+    s = Stats()
+    for code in (200, 200, 404, 404, 404, 499, 503, 401):
+        s.count_status(code)
+    assert dict(s.by_code) == {"200": 2, "404": 3, "499": 1, "503": 1, "401": 1}
+    snap = s.snapshot()
+    assert snap["200"] == 2 and snap["401"] == 1 and snap["503"] == 1
+    assert snap["other"] == 4  # 404 x3 + 499, bucket keys unchanged

@@ -66,6 +66,7 @@ def test_health_does_not_wake_model_and_status_reports_literal_counters(live):
     assert st["model"] == "ready"
     assert st["counters"]["401"] == 1
     assert st["counters"]["200"] == 2  # /health and the chat
+    assert st["by_code"]["401"] == 1 and st["by_code"]["200"] == 2
     assert st["key"]["name"] == "owner"
     assert st["limits"]["n_ctx"] == 2048
     assert st["queue"] == {"active": 0, "waiting": 0, "max": 2}

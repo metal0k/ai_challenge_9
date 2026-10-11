@@ -871,6 +871,43 @@ def _num(value: object, suffix: str = "") -> str:
     return f"{value}{suffix}"
 
 
+def _dur(value: object) -> str:
+    """Seconds -> «42 с» / «12 мин 5 с» / «1 ч 18 мин»; non-numbers fall back to _num."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return _num(value)
+    s = max(0, int(value))
+    if s < 60:
+        return f"{s} с"
+    if s < 3600:
+        return f"{s // 60} мин {s % 60} с"
+    return f"{s // 3600} ч {s % 3600 // 60} мин"
+
+
+_CODES_CELL_WIDTH = 44  # 80 minus borders and the label column
+
+
+def _codes_by_code(by_code: dict) -> str:
+    """Exact codes, sorted, non-zero; packed into lines so no item is split by wrapping."""
+    items = sorted(
+        (str(k), v)
+        for k, v in by_code.items()
+        if isinstance(v, int | float) and not isinstance(v, bool) and v > 0
+    )
+    if not items:
+        return "—"
+    lines: list[str] = []
+    cur = ""
+    for k, v in items:
+        item = f"{k} {v}"
+        if cur and len(cur) + 3 + len(item) > _CODES_CELL_WIDTH:
+            lines.append(cur)
+            cur = item
+        else:
+            cur = f"{cur} · {item}" if cur else item
+    lines.append(cur)
+    return "\n".join(lines)
+
+
 def _field(data: object, *path: str) -> object:
     for part in path:
         data = data.get(part) if isinstance(data, dict) else None
@@ -933,9 +970,9 @@ def _service_status_table(origin: str, st: svc.ServiceStatus) -> Table:
         ("модель", _model_state(st.state)),
         ("имя модели", _num(raw.get("model_id"))),
         ("RSS процесса", _num(None if st.rss_mb is None else round(st.rss_mb), " МБ")),
-        ("аптайм процесса", _num(st.uptime_s, " с")),
-        ("до выгрузки (idle)", _num(st.idle_unload_s, " с")),
-        ("аптайм gateway", _num(raw.get("gateway_uptime_s"), " с")),
+        ("аптайм процесса", _dur(st.uptime_s)),
+        ("до выгрузки (idle)", _dur(st.idle_unload_s)),
+        ("аптайм gateway", _dur(raw.get("gateway_uptime_s"))),
         ("код выхода модели", _num(raw.get("last_exit_code"))),
         ("очередь", queue),
         ("ключ", _num(_field(raw, "key", "name"))),
@@ -945,7 +982,12 @@ def _service_status_table(origin: str, st: svc.ServiceStatus) -> Table:
         ("тело запроса", _num(_field(raw, "limits", "body_max_bytes"), " байт")),
         ("таймаут простоя", _num(_field(raw, "limits", "idle_seconds"), " с")),
         ("всего в минуту", _num(_field(raw, "limits", "global_per_minute"))),
-        ("ответы по кодам", _status_counts(raw.get("counters"))),
+        (
+            "ответы с запуска gateway",
+            _codes_by_code(raw["by_code"])
+            if isinstance(raw.get("by_code"), dict)
+            else _status_counts(raw.get("counters")),
+        ),
         ("исходы", _counts(raw.get("outcomes"))),
     ]
     for name, value in rows:

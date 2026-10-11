@@ -261,8 +261,8 @@ def test_status_table_on_stdout_nothing_on_stderr(gw, wide):
         "2048",
         "65536",
         "до выгрузки (idle)",
-        "17.5 с",
-        "42.5 с",
+        "17 с",
+        "42 с",
         "owner",
     ):
         assert out.count(line) == 1, line
@@ -440,7 +440,73 @@ def test_counters_row_single_line_at_width_80(gw, wide):
     assert result.exit_code == 0
     out = wide.getvalue()
     assert "…" not in out
-    lines = [ln for ln in out.splitlines() if "ответы по кодам" in ln]
+    lines = [ln for ln in out.splitlines() if "ответы с запуска gateway" in ln]
     assert len(lines) == 1
     assert "200 15 · 401 4 · прочие (не 5xx, напр. 499) 5" in lines[0]
     assert "413 0" not in out and "5xx 0" not in out
+
+
+def test_codes_row_from_by_code_sorted_nonzero(gw, wide):
+    gw.status = {**STATUS, "by_code": {"503": 9, "200": 40, "404": 39, "401": 1, "429": 0}}
+    result = runner.invoke(cli.app, ["service", "status"])
+    assert result.exit_code == 0
+    out = wide.getvalue()
+    assert "200 40 · 401 1 · 404 39 · 503 9" in out
+    assert "429 0" not in out and "прочие" not in out
+
+
+def test_codes_row_large_counts_never_split_an_item_at_width_80(gw, wide):
+    by_code = {
+        "200": 123456,
+        "401": 10234,
+        "404": 98765,
+        "429": 4321,
+        "499": 5432,
+        "500": 321,
+        "503": 76543,
+    }
+    gw.status = {**STATUS, "by_code": by_code}
+    result = runner.invoke(cli.app, ["service", "status"])
+    assert result.exit_code == 0
+    out = wide.getvalue()
+    assert "…" not in out
+    for code, n in by_code.items():
+        assert out.count(f"{code} {n}") == 1, code
+    assert max(len(ln) for ln in out.splitlines()) <= 80
+
+
+def test_codes_by_code_empty_and_packing():
+    assert cli._codes_by_code({}) == "—"
+    assert cli._codes_by_code({"200": 0}) == "—"
+    assert cli._codes_by_code({"404": 2, "200": 1}) == "200 1 · 404 2"
+    packed = cli._codes_by_code({str(c): 1000000 + c for c in range(200, 210)})
+    assert all(len(ln) <= cli._CODES_CELL_WIDTH for ln in packed.splitlines())
+    assert len(packed.splitlines()) > 1
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (0, "0 с"),
+        (42.5, "42 с"),
+        (59.9, "59 с"),
+        (60, "1 мин 0 с"),
+        (725, "12 мин 5 с"),
+        (3599, "59 мин 59 с"),
+        (3600.0, "1 ч 0 мин"),
+        (4731.6, "1 ч 18 мин"),
+        (None, "—"),
+    ],
+)
+def test_dur_human_readable(value, text):
+    assert cli._dur(value) == text
+
+
+def test_status_table_shows_human_durations(gw, wide):
+    gw.status = {**STATUS, "gateway_uptime_s": 4731.6}
+    result = runner.invoke(cli.app, ["service", "status"])
+    assert result.exit_code == 0
+    out = wide.getvalue()
+    assert "1 ч 18 мин" in out
+    assert "17 с" in out
+    assert "4731" not in out
