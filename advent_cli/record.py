@@ -85,6 +85,8 @@ MODULE_COMMANDS = {
     "week_05.cli": "adventrag",
     # Week 06 (local LLM) is its own entry point as well.
     "week_06.cli": "adventlocal",
+    # Week 07 day 31: docs assistant, own entry point (not `advent w07`).
+    "adventassistant.cli": "adventassistant",
     # День 07 показывает файл сессии глазами — подпись в кадре должна
     # соответствовать тому, что зритель может повторить.
     "json.tool": "python -m json.tool",
@@ -222,6 +224,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w01d02()
     if week == 1 and day == 1:
         return _demo_steps_w01d01(week)
+    if week == 7 and day == 31:
+        return _demo_steps_w07d31()
     raise AdventError(
         f"Сценария демо для недели {week}, дня {day} нет.",
         hint="Добавь _demo_steps_wNNdDD() и ветку в demo_steps() — записывать нечего.",
@@ -2553,6 +2557,39 @@ def _demo_steps_w05d25() -> list[Step]:
     ]
 
 
+# Step 4 is the hand-in frame: hold it longer than STEP_PAUSE (record._play).
+_W07D31_HOLD = 8.0
+
+
+def _demo_steps_w07d31() -> list[Step]:
+    """Four separate `python -m adventassistant.cli help` processes (SPEC-w07d31.md §9)."""
+    module = "adventassistant.cli"
+    questions = (
+        ("1. На какой ветке сейчас репозиторий?", "На какой ветке сейчас репозиторий?", None),
+        ("2. Что изменилось в рабочей копии?", "Что изменилось в рабочей копии?", None),
+        ("3. Как сварить борщ?", "Как сварить борщ?", None),
+        (
+            "4. Из каких трёх слоёв состоит репозиторий?",
+            "Из каких трёх слоёв состоит репозиторий?",
+            _W07D31_HOLD,
+        ),
+    )
+    return [
+        Step(title=title, module=module, args=["help", question], line_pause=pause)
+        for title, question, pause in questions
+    ]
+
+
+def _prepare_w07d31(week: int, day: int) -> None:
+    """Day 31 preflight: the docs index already exists. Building it on camera is paid."""
+    if (week, day) != (7, 31):
+        return
+    # Import inside the call so a test can point INDEX_PATH at a temp file.
+    from adventassistant.corpus import INDEX_PATH, require_index
+
+    require_index(INDEX_PATH)
+
+
 def _prepare_w04d20(week: int, day: int) -> None:
     """Day 20 preflight: drop the previous fs-written file, warm the npx cache.
 
@@ -2868,6 +2905,22 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
             ),
             rehearsal_step(5),
         ]
+    if (week, day) == (7, 31):
+        # `advent w07 chat` does not exist. A missing index fails before any paid call,
+        # and the Cyrillic question still goes through the pipe.
+        return [
+            Step(
+                title="репетиция",
+                module="adventassistant.cli",
+                args=[
+                    "help",
+                    "Как сварить борщ?",
+                    "--db",
+                    "logs/w07d31-rehearsal-missing.sqlite3",
+                ],
+                expect_failure=True,
+            )
+        ]
     return [rehearsal_step(week)]
 
 
@@ -2905,6 +2958,7 @@ def record(
     _warn_if_scheduler_idle(week, day)
     _prepare_w04d20(week, day)
     _prepare_w05d25(week, day)
+    _prepare_w07d31(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")
