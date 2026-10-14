@@ -1,4 +1,4 @@
-"""Entry point `adventassistant`: index the docs corpus, answer one question, REPL.
+"""Entry point `adventassistant`: index the docs corpus, review a diff, answer one question, REPL.
 
 `python -m adventassistant.cli` is how `advent record` launches a step.
 The product (answer or tool text, index summary) is stdout. Branch, MCP,
@@ -19,6 +19,9 @@ from advent_core.config import PROJECT_ROOT, ConfigError
 from advent_core.errors import AdventError, translate
 from adventassistant.corpus import INDEX_PATH, build_index
 from adventassistant.pipeline import run_help
+from adventassistant.review import run_review
+from adventassistant.review_index import REVIEW_INDEX_PATH, build_review_index
+from adventassistant.watcher import run_watch
 
 app = typer.Typer(
     add_completion=False,
@@ -114,6 +117,61 @@ def help_command(
         raise AdventError("Пустой вопрос.")
     path = Path(db) if db else INDEX_PATH
     write_stdout(run_help(question, db_path=path, complete=chat_core.complete))
+
+
+@app.command("index-review")
+def index_review_command(
+    rev: str = typer.Option("HEAD", "--rev", help="Ревизия git, с которой читается корпус."),
+    db: str | None = typer.Option(None, "--db", help="Путь к индексу ревью (для тестов)."),
+) -> None:
+    """Собрать корпус ревью и записать индекс дня 32."""
+    path = Path(db) if db else REVIEW_INDEX_PATH
+    write_stdout(build_review_index(PROJECT_ROOT, rev=rev, db_path=path))
+
+
+@app.command("review")
+def review_command(
+    base: str = typer.Option(..., "--base", help="База трёхточечного диапазона."),
+    head: str = typer.Option(..., "--head", help="Голова трёхточечного диапазона."),
+    db: str | None = typer.Option(None, "--db", help="Путь к индексу ревью (для тестов)."),
+    pr: int | None = typer.Option(None, "--pr", help="Номер PR: записать комментарий после ревью."),
+    diff_only: bool = typer.Option(False, "--diff-only", help="Напечатать diff и выйти."),
+) -> None:
+    """Ревью диапазона base...head: баги, архитектура, рекомендации."""
+    path = Path(db) if db else REVIEW_INDEX_PATH
+    run_review(
+        PROJECT_ROOT,
+        base=base,
+        head=head,
+        db_path=path,
+        pr=pr,
+        diff_only=diff_only,
+        complete=chat_core.complete,
+    )
+
+
+@app.command("watch-pr")
+def watch_pr_command(
+    interval: int = typer.Option(60, "--interval", help="Пауза между проходами, секунды (от 5)."),
+    once: bool = typer.Option(False, "--once", help="Один проход и выход."),
+    pr: int | None = typer.Option(None, "--pr", help="Смотреть только этот PR."),
+    post: bool = typer.Option(True, "--post/--no-post", help="Записывать комментарий после ревью."),
+    state: str | None = typer.Option(None, "--state", help="Файл state watcher."),
+    cache_dir: str | None = typer.Option(None, "--cache-dir", help="Каталог кэша индексов."),
+) -> None:
+    """Следить за открытыми PR репозитория: новое ревью на каждую пару base/head."""
+    code = run_watch(
+        PROJECT_ROOT,
+        complete=chat_core.complete,
+        interval=interval,
+        once=once,
+        pr=pr,
+        post=post,
+        state_path=Path(state) if state else None,
+        cache_dir=Path(cache_dir) if cache_dir else None,
+    )
+    if code:
+        raise typer.Exit(code)
 
 
 def main() -> None:

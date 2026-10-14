@@ -1,0 +1,62 @@
+{
+  "title": "review",
+  "description": "Ревью диапазона: баги, архитектурные проблемы и рекомендации.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["bugs", "architecture", "recommendations"],
+  "properties": {
+    "bugs": {
+      "type": "array",
+      "description": "Ошибки в изменённом коде. Пустой массив, если опоры нет.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "text"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Путь из списка изменений."
+          },
+          "text": {
+            "type": "string",
+            "description": "Одно предложение: что сломано."
+          }
+        }
+      }
+    },
+    "architecture": {
+      "type": "array",
+      "description": "Нарушения границы. Пустой массив, если опоры нет.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "text"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Путь из списка изменений."
+          },
+          "text": {
+            "type": "string",
+            "description": "Одно предложение: какая граница нарушена."
+          }
+        }
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "description": "Что изменить. Пустой массив, если опоры нет.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text"],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Одно предложение: что изменить."
+          }
+        }
+      }
+    }
+  }
+}

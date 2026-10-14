@@ -27,6 +27,7 @@ def clean_env(monkeypatch):
         "MISTRAL_STOP",
         "MISTRAL_REASONING_EFFORT",
         "GITHUB_TOKEN",
+        "GH_TOKEN",
         "ADVENT_SYSTEM_PROMPT",
         "ADVENT_BASE_URL",
     ):
@@ -113,6 +114,17 @@ def test_configured_secrets_returns_all_long_secret_key_values(monkeypatch):
     monkeypatch.setenv("OBS_WS_PASSWORD", "short")
 
     assert configured_secrets() == ("mistral-secret", "github-secret")
+
+
+def test_gh_token_alias_is_configured_and_redacted(monkeypatch):
+    # Synthetic value: gh errors pass through redact() and the Action sets GH_TOKEN.
+    secret = "synthetic-gh-alias-value"
+    monkeypatch.setenv("GH_TOKEN", secret)
+
+    assert configured_secrets() == (secret,)
+    masked = redact(f"gh: HTTP 401 token={secret}")
+    assert secret not in masked
+    assert masked == "gh: HTTP 401 token=***"
 
 
 def test_generation_params_come_from_env(monkeypatch):

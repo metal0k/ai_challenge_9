@@ -73,6 +73,9 @@ uv run advent w01 bench                    # один запрос на лест
 - `advent_cli/` — команды `advent`, включая запись демо и отправку дня
 
 Пакет `adventassistant/` отвечает на вопросы по документации и текущей ветке.
+Команда `review` разбирает диапазон `base...head`.
+Локальный `watch-pr` следит за открытыми PR, запускает ревью новой ревизии
+и публикует результат в комментарии; GitHub Actions не нужен.
 Подробная карта — в [`docs/structure.md`](docs/structure.md).
 
 Неделя — явная подкоманда (`advent w01 …`), поэтому команды прошлых недель
@@ -90,6 +93,8 @@ uv run advent w01 bench                    # один запрос на лест
 | `advent w01 bench` | Один запрос на лестнице моделей: точность, latency, токены, цена |
 | `advent record --day 1` | Записать демо через OBS и положить как `WWDD.mp4` |
 | `advent submit --day 1` | Проверить тег и видео, напечатать комментарий для таблицы |
+| `adventassistant review --base REF --head REF` | Ревью диапазона `base...head` |
+| `adventassistant watch-pr` | Локальное автоматическое ревью новых ревизий PR |
 
 Полезные флаги `chat`: `--model`, `--system`, `--temperature`, `--top-p`,
 `--max-tokens`, `--seed`, `--stop`, `--reasoning-effort`, `--no-stream`,

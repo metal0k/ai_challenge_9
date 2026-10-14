@@ -226,6 +226,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w01d01(week)
     if week == 7 and day == 31:
         return _demo_steps_w07d31()
+    if week == 7 and day == 32:
+        return _demo_steps_w07d32()
     raise AdventError(
         f"Сценария демо для недели {week}, дня {day} нет.",
         hint="Добавь _demo_steps_wNNdDD() и ветку в demo_steps() — записывать нечего.",
@@ -2590,6 +2592,95 @@ def _prepare_w07d31(week: int, day: int) -> None:
     require_index(INDEX_PATH)
 
 
+# The take reviews a real open PR, so its number is an input, never a default.
+_W07D32_PR_ENV = "ADVENT_DEMO_PR"
+# The last step is the hand-in frame: hold it longer than STEP_PAUSE.
+_W07D32_HOLD = 8.0
+# The paid review runs inside one process; the shared STEP_TIMEOUT is too tight for it.
+_W07D32_REVIEW_TIMEOUT = 600
+
+
+def _w07d32_pr_number() -> int:
+    """PR number from the environment; no fallback, a silent one would film the old scenario."""
+    raw = os.environ.get(_W07D32_PR_ENV)
+    hint = f"Задай {_W07D32_PR_ENV}=<номер открытого PR> перед записью."
+    if raw is None or not raw.strip():
+        raise AdventError(f"{_W07D32_PR_ENV} не задан.", hint=hint)
+    text = raw.strip()
+    if not (text.isascii() and text.isdigit()) or int(text) <= 0:
+        raise AdventError(
+            f"{_W07D32_PR_ENV} должен быть положительным целым, сейчас {raw!r}.", hint=hint
+        )
+    return int(text)
+
+
+def _demo_steps_w07d32() -> list[Step]:
+    """Diff-only review, then the same `watch-pr --once` twice on one state file."""
+    module = "adventassistant.cli"
+    pr = _w07d32_pr_number()
+    # One state per scenario: the repeat must see the first pass, and a real
+    # data/review/watcher.json must never be read or overwritten by the take.
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    state = f"logs/demo/w07d32/{stamp}/watcher.json"
+    watch = ["watch-pr", "--once", "--pr", str(pr), "--state", state]
+    return [
+        Step(
+            title="1. Diff одного файла: остаток меньше на единицу и токен в URL",
+            module=module,
+            args=["review", "--base", "main", "--head", "HEAD", "--diff-only"],
+        ),
+        Step(
+            title=f"2. day32 · local watcher · live Mistral: ревью PR #{pr} и комментарий",
+            module=module,
+            args=list(watch),
+            timeout=_W07D32_REVIEW_TIMEOUT,
+        ),
+        Step(
+            title="3. day32 · local watcher · тот же state: уже обработан, live Mistral не зовём",
+            module=module,
+            args=list(watch),
+            line_pause=_W07D32_HOLD,
+        ),
+    ]
+
+
+def _prepare_w07d32(week: int, day: int) -> None:
+    """Day 32 preflight. Git stays here; `check_demo_range` is the pure gate.
+
+    The selected PR is read from GitHub before OBS starts: a take of a closed,
+    forked or stale PR is only discovered afterwards otherwise.
+    """
+    if (week, day) != (7, 32):
+        return
+    number = _w07d32_pr_number()
+    from adventassistant.github import GithubClient
+    from adventassistant.review import check_demo_range, collect_demo_facts, resolve_rev
+
+    facts = collect_demo_facts(PROJECT_ROOT)
+    check_demo_range(facts)
+    head_sha = resolve_rev(PROJECT_ROOT, "HEAD")
+    client = GithubClient.from_project(PROJECT_ROOT)
+    try:
+        pull = client.get_pull(number)
+    finally:
+        client.close()
+    if pull.state != "open":
+        raise AdventError(f"PR #{number} не открыт (state={pull.state!r}).")
+    if not pull.is_same_repo:
+        raise AdventError(
+            f"PR #{number} из форка: watcher смотрит только PR из того же репозитория."
+        )
+    if pull.base_sha != facts.base_sha:
+        raise AdventError(
+            f"База PR #{number} ({pull.base_sha[:12]}) не равна main ({facts.base_sha[:12]})."
+        )
+    if pull.head_sha != head_sha:
+        raise AdventError(
+            f"Head PR #{number} ({pull.head_sha[:12]}) не равен HEAD ({head_sha[:12]}): "
+            "запушь ветку или переключись на неё."
+        )
+
+
 def _prepare_w04d20(week: int, day: int) -> None:
     """Day 20 preflight: drop the previous fs-written file, warm the npx cache.
 
@@ -2921,6 +3012,17 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
                 expect_failure=True,
             )
         ]
+    if (week, day) == (7, 32):
+        # `rehearsal_step(7)` would launch `advent w07 chat`, which does not exist.
+        # A missing base fails before any paid call.
+        return [
+            Step(
+                title="репетиция",
+                module="adventassistant.cli",
+                args=["review", "--diff-only", "--base", "нет-такой-базы", "--head", "HEAD"],
+                expect_failure=True,
+            )
+        ]
     return [rehearsal_step(week)]
 
 
@@ -2959,6 +3061,7 @@ def record(
     _prepare_w04d20(week, day)
     _prepare_w05d25(week, day)
     _prepare_w07d31(week, day)
+    _prepare_w07d32(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")

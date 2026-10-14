@@ -20,3 +20,12 @@
 Индекс ассистента читает только `README.md`, файлы `docs/**/*.md` и JSON-схемы
 из `advent_core/schemas/` и `week_01/schemas/`. Код недель и реестр MCP в этот
 индекс не входят.
+
+Команда `index` по-прежнему индексирует только `README.md`, `docs/` и схемы.
+Команда `index-review` индексирует те же файлы плюс production Python четырёх
+деревьев `advent_core/`, `advent_cli/`, `adventassistant/` и `week_*/`, без
+`tests/`.
+
+Локальный watcher PR находится в `adventassistant/watcher.py`, GitHub API
+клиент — в `adventassistant/github.py`. Он читает объекты Git без переключения
+ветки и запуска кода PR. Кэш индекса, состояние и отчёты лежат в `data/review/`.
