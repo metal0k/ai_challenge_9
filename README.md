@@ -63,6 +63,7 @@ uv run advent w01 bench                    # один запрос на лест
 | 03 | 15 | Контролируемые переходы состояний | [`w03d15`](https://github.com/metal0k/ai_challenge_9/tree/w03d15) | [Yandex Disk](https://yadi.sk/i/35I1oYnE2emgOA) |
 | 04 | 16 | Подключение MCP | [`w04d16`](https://github.com/metal0k/ai_challenge_9/tree/w04d16) | [Yandex Disk](https://yadi.sk/i/rmFbB4QmtGj1Fw) |
 | 07 | 31 | Ассистент разработчика | [`w07d31`](https://github.com/metal0k/ai_challenge_9/tree/w07d31) | [Yandex Disk](https://yadi.sk/i/oEFzAyKelzmMrw) |
+| 07 | 32 | Автоматическое ревью PR: локальный watcher | [`w07d32`](https://github.com/metal0k/ai_challenge_9/tree/w07d32) | [Yandex Disk](https://yadi.sk/i/H0_iA2p-RWCVGg) |
 
 ## Структура
 
