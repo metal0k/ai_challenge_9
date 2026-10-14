@@ -87,6 +87,8 @@ MODULE_COMMANDS = {
     "week_06.cli": "adventlocal",
     # Week 07 day 31: docs assistant, own entry point (not `advent w07`).
     "adventassistant.cli": "adventassistant",
+    # Day 33: guarded demonstration of the expected scoped-MCP denial.
+    "adventassistant.support_demo": "python -m adventassistant.support_demo",
     # День 07 показывает файл сессии глазами — подпись в кадре должна
     # соответствовать тому, что зритель может повторить.
     "json.tool": "python -m json.tool",
@@ -228,6 +230,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w07d31()
     if week == 7 and day == 32:
         return _demo_steps_w07d32()
+    if week == 7 and day == 33:
+        return _demo_steps_w07d33()
     raise AdventError(
         f"Сценария демо для недели {week}, дня {day} нет.",
         hint="Добавь _demo_steps_wNNdDD() и ветку в demo_steps() — записывать нечего.",
@@ -2582,6 +2586,67 @@ def _demo_steps_w07d31() -> list[Step]:
     ]
 
 
+_W07D33_HOLD = 8.0
+_W07D33_QUESTION = "Почему не работает авторизация?"
+
+
+def _demo_steps_w07d33() -> list[Step]:
+    """Live support answers, unknown-topic refusal, and a guarded MCP denial."""
+    module = "adventassistant.cli"
+    demo = "adventassistant.support_demo"
+    return [
+        Step(
+            title="Day 33 · Учебный кабинет",
+            note=(
+                "FAQ через RAG + профиль и тикет через настоящий read-only stdio MCP. "
+                "Все пользователи и обращения в кадре — вымышленные."
+            ),
+        ),
+        Step(
+            title="1. Один вопрос · demo-a · AUTH-101 · ссылка истекла",
+            module=module,
+            args=["support", _W07D33_QUESTION, "--user", "demo-a", "--ticket", "AUTH-101"],
+            timeout=300,
+            line_pause=5.0,
+        ),
+        Step(
+            title="2. Тот же вопрос · demo-b · AUTH-102 · блокировка после попыток",
+            module=module,
+            args=["support", _W07D33_QUESTION, "--user", "demo-b", "--ticket", "AUTH-102"],
+            timeout=300,
+            line_pause=5.0,
+        ),
+        Step(
+            title="3. Вне справки: честная передача оператору",
+            module=module,
+            args=[
+                "support",
+                "Где находится ближайший офис поддержки в Казани?",
+                "--user",
+                "demo-a",
+            ],
+            timeout=180,
+            line_pause=5.0,
+        ),
+        Step(
+            title="4. MCP отклоняет чужой тикет до платных вызовов",
+            module=demo,
+            args=["--owner-error"],
+            line_pause=4.0,
+        ),
+        Step(
+            title="Итог · разные причины → разные шаги · неизвестное → оператор",
+            note=(
+                "AUTH-101: одноразовая ссылка живёт 15 минут. AUTH-102: после пяти "
+                "ошибок блокировка длится 30 минут. Каждый ответ опирается на "
+                "показанные источники; чужой тикет отклонён, неизвестная тема "
+                "передана оператору. Сервис только объясняет — ничего не меняет."
+            ),
+            line_pause=_W07D33_HOLD,
+        ),
+    ]
+
+
 def _prepare_w07d31(week: int, day: int) -> None:
     """Day 31 preflight: the docs index already exists. Building it on camera is paid."""
     if (week, day) != (7, 31):
@@ -2590,6 +2655,17 @@ def _prepare_w07d31(week: int, day: int) -> None:
     from adventassistant.corpus import INDEX_PATH, require_index
 
     require_index(INDEX_PATH)
+
+
+def _prepare_w07d33(week: int, day: int) -> None:
+    """Day 33 requires its existing isolated index; never embed during recording."""
+    if (week, day) != (7, 33):
+        return
+    # Import lazily so other days do not depend on the support package, and so
+    # the recorder test can redirect the path before requiring the index.
+    from adventassistant.support_index import SUPPORT_INDEX_PATH, require_support_index
+
+    require_support_index(SUPPORT_INDEX_PATH)
 
 
 # The take reviews a real open PR, so its number is an input, never a default.
@@ -3023,6 +3099,15 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
                 expect_failure=True,
             )
         ]
+    if (week, day) == (7, 33):
+        return [
+            Step(
+                title="репетиция: настоящий stdio MCP · две области и ожидаемый отказ",
+                module="adventassistant.support_demo",
+                args=["--preflight"],
+                timeout=60,
+            )
+        ]
     return [rehearsal_step(week)]
 
 
@@ -3062,6 +3147,7 @@ def record(
     _prepare_w05d25(week, day)
     _prepare_w07d31(week, day)
     _prepare_w07d32(week, day)
+    _prepare_w07d33(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")
@@ -3122,7 +3208,7 @@ def _play(steps: list[Step]) -> None:
             # subprocess — args пуст, текст ссылается на уже показанный
             # экран, а не на новый вызов API.
             console.out.print(rich_escape(step.note))
-            time.sleep(TITLE_PAUSE + STEP_PAUSE)
+            time.sleep(step.line_pause if step.line_pause is not None else TITLE_PAUSE + STEP_PAUSE)
             continue
         # rich_escape: с дня 03 в args подставляется условие задачи из банка,
         # а условие пишет человек. Квадратные скобки в нём («последовательности

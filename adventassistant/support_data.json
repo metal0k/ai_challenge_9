@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "users": [
+    {"id": "demo-a", "display_name": "Алексей", "plan": "free", "account_status": "active", "locale": "ru"},
+    {"id": "demo-b", "display_name": "Мария", "plan": "pro", "account_status": "locked", "locale": "ru"}
+  ],
+  "tickets": [
+    {"id": "AUTH-101", "user_id": "demo-a", "subject": "Не открывается ссылка для входа", "status": "open", "category": "auth", "facts": {"cause": "expired_magic_link", "link_age_minutes": "22"}, "messages": ["Ссылка из письма больше не открывается."]},
+    {"id": "AUTH-102", "user_id": "demo-b", "subject": "Не удаётся войти после нескольких попыток", "status": "open", "category": "auth", "facts": {"cause": "locked_after_failed_attempts", "failed_attempts": "5"}, "messages": ["После нескольких неверных паролей вход заблокировался."]}
+  ]
+}

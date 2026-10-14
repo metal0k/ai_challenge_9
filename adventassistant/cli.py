@@ -21,6 +21,8 @@ from adventassistant.corpus import INDEX_PATH, build_index
 from adventassistant.pipeline import run_help
 from adventassistant.review import run_review
 from adventassistant.review_index import REVIEW_INDEX_PATH, build_review_index
+from adventassistant.support_index import SUPPORT_INDEX_PATH, build_support_index
+from adventassistant.support_pipeline import run_support
 from adventassistant.watcher import run_watch
 
 app = typer.Typer(
@@ -127,6 +129,34 @@ def index_review_command(
     """Собрать корпус ревью и записать индекс дня 32."""
     path = Path(db) if db else REVIEW_INDEX_PATH
     write_stdout(build_review_index(PROJECT_ROOT, rev=rev, db_path=path))
+
+
+@app.command("index-support")
+def index_support_command(
+    db: str | None = typer.Option(None, "--db", help="Путь к индексу поддержки (для тестов)."),
+) -> None:
+    """Собрать фиксированный FAQ-индекс дня 33."""
+    write_stdout(build_support_index(db_path=Path(db) if db else SUPPORT_INDEX_PATH))
+
+
+@app.command("support")
+def support_command(
+    question: str = typer.Argument(..., help="Вопрос пользователя."),
+    user: str = typer.Option(..., "--user", help="ID пользователя из локальной fixture."),
+    ticket: str | None = typer.Option(None, "--ticket", help="Необязательный ID тикета."),
+    db: str | None = typer.Option(None, "--db", help="Путь к индексу (для тестов)."),
+) -> None:
+    """Ответить на вопрос по FAQ с контекстом одного пользователя и тикета."""
+    path = Path(db) if db else SUPPORT_INDEX_PATH
+    write_stdout(
+        run_support(
+            question,
+            user_id=user,
+            ticket_id=ticket,
+            db_path=path,
+            complete=chat_core.complete,
+        )
+    )
 
 
 @app.command("review")
