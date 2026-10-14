@@ -27,7 +27,13 @@ from advent_core.embeddings import embed_texts as embed_texts_fn
 from advent_core.errors import AdventError, translate
 from advent_core.journal import log_call
 from advent_core.params import GenerationParams
-from advent_core.rag import RagHit, apply_rerank, build_rerank_prompt, parse_rerank
+from advent_core.rag import (
+    RagHit,
+    apply_rerank,
+    build_rerank_prompt,
+    order_by_rerank,
+    parse_rerank,
+)
 from advent_core.telemetry import CallResult
 from adventassistant.corpus import cloud_config
 from adventassistant.review_index import (
@@ -196,6 +202,24 @@ def _search_review_candidates(db_path: Path, query_vec: np.ndarray) -> tuple[Rag
     unique = {hit.chunk.chunk_id: hit for hit in found}
     combined = sorted(unique.values(), key=lambda hit: (-hit.score, hit.chunk.chunk_id))[:SEARCH_K]
     return _to_hits(combined)
+
+
+def _retain_relevant_doc(
+    hits: Sequence[RagHit], scores: dict[int, float], kept: tuple[RagHit, ...]
+) -> tuple[RagHit, ...]:
+    """Keep the strongest passing documentation hit in the answer context."""
+    if not kept or any(hit.source.endswith(DOC_SUFFIXES) for hit in kept):
+        return kept
+    passing_docs = [
+        hit
+        for hit in order_by_rerank(hits, scores)
+        if hit.source.endswith(DOC_SUFFIXES) and hit.rerank is not None and hit.rerank >= THRESHOLD
+    ]
+    if not passing_docs:
+        return kept
+    selected = [*kept[:-1], passing_docs[0]]
+    selected.sort(key=lambda hit: (-(hit.rerank or 0), hit.rank or 0))
+    return tuple(selected)
 
 
 def embed_query(text: str) -> np.ndarray:
@@ -431,6 +455,7 @@ def run_review(
         _log(reranked, messages, "review_rerank")
         scores = parse_rerank(reranked.text, len(hits))
         kept, passed = apply_rerank(hits, scores, THRESHOLD, ANSWER_K)
+        kept = _retain_relevant_doc(hits, scores, kept)
     answer_messages = _answer_messages(file_list, shown, kept)
     answered = _complete(complete, _answer_config(), answer_messages)
     _log(answered, answer_messages, "review_answer")

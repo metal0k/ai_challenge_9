@@ -473,6 +473,23 @@ def test_sixteen_candidates_all_reach_rerank_and_the_answer_keeps_four(
     assert err.count("источник:") == 4
 
 
+@pytest.mark.parametrize(("doc_score", "expected_docs"), [(6, 1), (4, 0)])
+def test_answer_reserves_a_passing_doc_but_excludes_below_threshold_docs(
+    tmp_path: Path, monkeypatch, doc_score: int, expected_docs: int
+) -> None:
+    repo, base, head = _pair(tmp_path)
+    db = tmp_path / "index.sqlite3"
+    _write_review_index(db, corpus_rev=base, n=16)
+    _patch_embed(monkeypatch, review)
+    # The first eight candidates are code and outrank the docs; docs either pass at 6 or
+    # fail the existing threshold at 4.
+    complete = _Complete(scores=[10] * 8 + [doc_score] * 8)
+    run_review(repo, base=base, head=head, db_path=db, complete=complete)
+    answer_user = _system_calls(complete)[0][1][1]["content"]
+    assert answer_user.count("docs/f") == expected_docs
+    assert answer_user.count("adventassistant/f") == review.ANSWER_K - expected_docs
+
+
 def test_render_prints_three_headers_empty_and_outside(
     tmp_path: Path, monkeypatch, err_text
 ) -> None:
