@@ -553,8 +553,19 @@ def check_comparable(runs: dict[str, RunInfo], strategies: list[str]) -> None:
         )
 
 
-def search(db_path: Path | None, strategy: str, query_vec: np.ndarray, k: int = 5) -> list[Hit]:
-    """Top-k by cosine (= dot on L2-normalized vectors), full scan (SPEC §5)."""
+def search(
+    db_path: Path | None,
+    strategy: str,
+    query_vec: np.ndarray,
+    k: int = 5,
+    *,
+    source_suffixes: tuple[str, ...] | None = None,
+) -> list[Hit]:
+    """Top-k by cosine (= dot on L2-normalized vectors), full scan (SPEC §5).
+
+    `source_suffixes` optionally limits the candidate pool by repository file type;
+    ranking within that pool remains the same as an unfiltered search.
+    """
     path = db_path or DEFAULT_DB
     with _sqlite_errors(path):
         conn = _connect_ro(path)
@@ -564,6 +575,8 @@ def search(db_path: Path | None, strategy: str, query_vec: np.ndarray, k: int = 
             ).fetchall()
         finally:
             conn.close()
+    if source_suffixes is not None:
+        rows = [row for row in rows if row["source"].endswith(source_suffixes)]
     if not rows:
         return []
 

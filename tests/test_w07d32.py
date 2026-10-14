@@ -132,10 +132,10 @@ def err_text(monkeypatch):
     return buf
 
 
-def _chunk(i: int):
+def _chunk(i: int, *, source: str | None = None):
     from week_05.chunking import Chunk
 
-    source = f"docs/f{i}.md"
+    source = source or f"docs/f{i}.md"
     return Chunk(
         chunk_id=f"review:{source}#0",
         strategy="review",
@@ -162,7 +162,14 @@ def _write_review_index(
     query_prefix: str = "",
     model: str = DEFAULT_EMBED_MODEL,
 ) -> None:
-    chunks = [_chunk(i) for i in range(n)]
+    doc_count = (n + 1) // 2
+    chunks = [
+        _chunk(
+            i,
+            source=(f"docs/f{i}.md" if i < doc_count else f"adventassistant/f{i}.py"),
+        )
+        for i in range(n)
+    ]
     vectors = np.zeros((n, 4), dtype=np.float32)
     vectors[:, 0] = 1.0
     embedded = EmbedResult(vectors=vectors, model=model, prompt_tokens=n, requests=1, latency_ms=1)
@@ -454,12 +461,13 @@ def test_sixteen_candidates_all_reach_rerank_and_the_answer_keeps_four(
     rerank_prompt = complete.calls[0][1][0]["content"]
     assert complete.calls[0][1][0]["role"] == "user"
     assert "для всех 16 фрагментов" in rerank_prompt
+    assert rerank_prompt.count("docs/f") == review.DOC_SEARCH_K
+    assert rerank_prompt.count("adventassistant/f") == review.SEARCH_K - review.DOC_SEARCH_K
     for number in range(1, 17):
-        assert f"[{number}] docs/f" in rerank_prompt
+        assert f"[{number}] " in rerank_prompt
     answer_user = _system_calls(complete)[0][1][1]["content"]
-    assert answer_user.count("— раздел") == review.ANSWER_K == 4
-    assert "[4] docs/f" in answer_user
-    assert "[5] docs/f" not in answer_user
+    assert answer_user.count("— раздел") == review.ANSWER_K
+    assert "[5] " not in answer_user
     err = err_text.getvalue()
     assert "порог: 6/16" in err
     assert err.count("источник:") == 4

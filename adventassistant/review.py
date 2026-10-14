@@ -46,6 +46,9 @@ from week_05.rag import RAG_AUX_MODEL, RERANK_MAX_TOKENS
 
 ANSWER_MODEL = "ministral-14b-latest"
 SEARCH_K = 16
+DOC_SEARCH_K = SEARCH_K // 2
+DOC_SUFFIXES = (".md", ".json")
+CODE_SUFFIXES = (".py",)
 ANSWER_K = 4
 THRESHOLD = 5
 DIFF_CHAR_CAP = 24000
@@ -169,6 +172,30 @@ def _to_hits(found: Sequence[object]) -> tuple[RagHit, ...]:
         )
         for position, hit in enumerate(found, start=1)
     )
+
+
+def _search_review_candidates(db_path: Path, query_vec: np.ndarray) -> tuple[RagHit, ...]:
+    """Reserve half the rerank pool for docs, then rank the combined candidates together."""
+    found = [
+        *search(
+            db_path,
+            STRATEGY,
+            query_vec,
+            k=DOC_SEARCH_K,
+            source_suffixes=DOC_SUFFIXES,
+        ),
+        *search(
+            db_path,
+            STRATEGY,
+            query_vec,
+            k=SEARCH_K - DOC_SEARCH_K,
+            source_suffixes=CODE_SUFFIXES,
+        ),
+    ]
+    # Keep the strongest match if overlapping retrieval branches ever return one chunk twice.
+    unique = {hit.chunk.chunk_id: hit for hit in found}
+    combined = sorted(unique.values(), key=lambda hit: (-hit.score, hit.chunk.chunk_id))[:SEARCH_K]
+    return _to_hits(combined)
 
 
 def embed_query(text: str) -> np.ndarray:
@@ -393,7 +420,7 @@ def run_review(
     path = require_review_index(db_path, base_sha)
     file_list = format_file_list(entries)
     query = _query_text(file_list, shown)
-    hits = _to_hits(search(path, STRATEGY, embed_query(query), k=SEARCH_K))
+    hits = _search_review_candidates(path, embed_query(query))
     candidates = len(hits)
     passed = 0
     kept: tuple[RagHit, ...] = ()
