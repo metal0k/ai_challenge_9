@@ -89,6 +89,8 @@ MODULE_COMMANDS = {
     "adventassistant.cli": "adventassistant",
     # Day 33: guarded demonstration of the expected scoped-MCP denial.
     "adventassistant.support_demo": "python -m adventassistant.support_demo",
+    # Day 34: run id carried between steps and the guarded second files-apply.
+    "adventassistant.files_demo": "python -m adventassistant.files_demo",
     # День 07 показывает файл сессии глазами — подпись в кадре должна
     # соответствовать тому, что зритель может повторить.
     "json.tool": "python -m json.tool",
@@ -232,6 +234,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w07d32()
     if week == 7 and day == 33:
         return _demo_steps_w07d33()
+    if week == 7 and day == 34:
+        return _demo_steps_w07d34()
     raise AdventError(
         f"Сценария демо для недели {week}, дня {day} нет.",
         hint="Добавь _demo_steps_wNNdDD() и ветку в demo_steps() — записывать нечего.",
@@ -2647,6 +2651,75 @@ def _demo_steps_w07d33() -> list[Step]:
     ]
 
 
+_W07D34_HOLD = 8.0
+# Each scenario step is a paid multi-round agent run (~60 s measured); leave headroom.
+_W07D34_SCENARIO_TIMEOUT = 300
+
+
+def _demo_steps_w07d34() -> list[Step]:
+    """Two file scenarios, apply of the saved changeset, and the guarded repeat."""
+    from adventassistant.files_demo import GOAL_README, GOAL_SEARCH
+
+    module = "adventassistant.cli"
+    demo = "adventassistant.files_demo"
+    return [
+        Step(
+            title="Day 34 · Файловый ассистент",
+            note=(
+                "Ассистент сам ищет и читает файлы репозитория через MCP, а правки только "
+                "готовит: diff на экране, запись в рабочее дерево — отдельной командой."
+            ),
+        ),
+        Step(
+            title="1. Поиск по коду: где вызывается call_tool_once",
+            module=module,
+            args=["files", GOAL_SEARCH],
+            timeout=_W07D34_SCENARIO_TIMEOUT,
+            line_pause=5.0,
+        ),
+        Step(
+            title="2. README недели 7: чтение файлов, write_file, diff",
+            module=demo,
+            args=["--run", GOAL_README],
+            timeout=_W07D34_SCENARIO_TIMEOUT,
+            line_pause=5.0,
+        ),
+        Step(
+            title="3. files-apply: записан ровно показанный diff",
+            module=demo,
+            args=["--apply"],
+            timeout=60,
+            line_pause=4.0,
+        ),
+        Step(
+            title="4. Повторный files-apply: отказ, exit 12 «уже применён»",
+            module=demo,
+            args=["--apply-again"],
+            timeout=60,
+            line_pause=4.0,
+        ),
+        Step(
+            title="Итог · поиск с path:line · README из прочитанных файлов · запись по команде",
+            note=(
+                "Сценарий 1: ответ со ссылками path:line по нескольким файлам. "
+                "Сценарий 2: README собран из прочитанных файлов, diff показан до записи. "
+                "Запись — только files-apply и ровно показанный changeset; "
+                "повторное применение отклонено."
+            ),
+            line_pause=_W07D34_HOLD,
+        ),
+    ]
+
+
+def _prepare_w07d34(week: int, day: int) -> None:
+    """Day 34 preflight: a rehearsal's week_07/README.md must not leak into the take."""
+    if (week, day) != (7, 34):
+        return
+    from adventassistant.files_demo import check_readme_absent
+
+    check_readme_absent(PROJECT_ROOT)
+
+
 def _prepare_w07d31(week: int, day: int) -> None:
     """Day 31 preflight: the docs index already exists. Building it on camera is paid."""
     if (week, day) != (7, 31):
@@ -3108,6 +3181,15 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
                 timeout=60,
             )
         ]
+    if (week, day) == (7, 34):
+        return [
+            Step(
+                title="репетиция: week_07/README.md отсутствует",
+                module="adventassistant.files_demo",
+                args=["--preflight"],
+                timeout=60,
+            )
+        ]
     return [rehearsal_step(week)]
 
 
@@ -3148,6 +3230,7 @@ def record(
     _prepare_w07d31(week, day)
     _prepare_w07d32(week, day)
     _prepare_w07d33(week, day)
+    _prepare_w07d34(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")

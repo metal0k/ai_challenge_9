@@ -732,9 +732,9 @@ def test_demo_steps_day_31_and_prepare(tmp_path: Path, monkeypatch) -> None:
         assert step.module == "adventassistant.cli"
         assert step.args == ["help", question]
     assert [step.line_pause for step in steps] == [None, None, None, 8.0]
-    # Day 32 has its own scenario. An unknown pair must still fail.
+    # Day 32 and Day 33 have their own scenarios. An unknown day must still fail.
     with pytest.raises(AdventError):
-        record.demo_steps(7, 33)
+        record.demo_steps(7, 99)
     assert any("models" in step.args for step in record.demo_steps(1, 1))
 
     rehearsal = record.rehearsal_steps(7, 31)

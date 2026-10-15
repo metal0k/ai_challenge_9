@@ -804,7 +804,7 @@ def test_demo_steps_day_32_and_the_pure_range_check(monkeypatch: pytest.MonkeyPa
     assert steps[2].line_pause == 8.0
     assert (steps[0].line_pause or record.STEP_PAUSE) < steps[2].line_pause
     with pytest.raises(AdventError):
-        record.demo_steps(7, 33)
+        record.demo_steps(7, 99)
 
     rehearsal = record.rehearsal_steps(7, 32)
     assert len(rehearsal) == 1

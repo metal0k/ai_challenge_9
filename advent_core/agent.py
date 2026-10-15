@@ -179,6 +179,7 @@ INTERRUPT_NOTE = "[ответ прерван пользователем и ос�
 # arguments (n=100 → error → n=20), but a misbehaving one must not loop: every
 # round is a paid call.
 MAX_TOOL_ROUNDS = 3
+TOOL_LIMIT_TEXT = "лимит вызовов инструментов исчерпан"
 
 
 @dataclass(slots=True, frozen=True)
@@ -382,6 +383,8 @@ class AgentReply:
     model_called: bool = True
     # Set only when a cite refusal's follow-up passed the refused question to the rewrite step.
     rag_previous: str | None = None
+    # Day 34: "rounds" / "calls" when the tool loop stopped on a limit, else None.
+    tool_limit_hit: str | None = None
 
 
 def marker_instruction(kind: str, needle: str) -> str:
@@ -499,6 +502,8 @@ class Agent:
         retrieve: RetrieveFn | None = None,
         mcp_enabled: bool = False,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
+        on_tool_call: Callable[[ToolCallLog], None] | None = None,
+        max_tool_calls: int | None = None,
     ) -> None:
         self.config = config
         self._complete = complete
@@ -559,6 +564,11 @@ class Agent:
         # Per-agent so registry mode (day 20) can allow a longer flow while
         # days 17-19 keep the module default.
         self.max_tool_rounds = max_tool_rounds
+        # Day 34: free telemetry hook per tool call, and a cap on calls across
+        # all rounds of one ask(). Both off by default.
+        self._on_tool_call = on_tool_call
+        self.max_tool_calls = max_tool_calls
+        self.tool_limit_hit: str | None = None
         # 1-based round whose tool calls are running now; 0 outside the tool
         # loop. The router reads it to label its trace lines.
         self.tool_round = 0
@@ -992,6 +1002,15 @@ class Agent:
         self.pending_tool_rounds = []
         return pending
 
+    def _emit_tool_log(self, logs: list[ToolCallLog], log: ToolCallLog) -> None:
+        logs.append(log)
+        if self._on_tool_call is None:
+            return
+        try:
+            self._on_tool_call(log)
+        except Exception as error:  # telemetry never takes down the turn
+            self._warn(f"on_tool_call упал: {error}")
+
     def _run_tool_loop(
         self, messages: list[dict[str, Any]]
     ) -> tuple[CallResult, list[ToolCallLog]]:
@@ -1010,12 +1029,16 @@ class Agent:
         local_messages: list[dict[str, Any]] = list(messages)
         logs: list[ToolCallLog] = []
         result: CallResult | None = None
+        self.tool_limit_hit = None
+        calls_made = 0
         for _round in range(self.max_tool_rounds):
             self.tool_round = _round + 1
             with self._ticking("tools"):
                 result = self._complete(
                     self.config,
-                    local_messages,
+                    # Snapshot: CallResult.sent_messages may alias this list
+                    # and later rounds keep appending to it (day 17).
+                    list(local_messages),
                     self.capabilities,
                     tools=self.tools,
                     tool_choice="auto",
@@ -1046,6 +1069,21 @@ class Agent:
                 }
             )
             for call in result.tool_calls:
+                if self.max_tool_calls is not None and calls_made >= self.max_tool_calls:
+                    # Not executed, but the assistant/tool pairing stays valid.
+                    text = TOOL_LIMIT_TEXT
+                    self._emit_tool_log(logs, ToolCallLog(call.name, {}, text, True))
+                    self.tool_limit_hit = "calls"
+                    local_messages.append(
+                        {
+                            "role": "tool",
+                            "content": text,
+                            "tool_call_id": call.id,
+                            "name": call.name,
+                        }
+                    )
+                    continue
+                calls_made += 1
                 try:
                     arguments = _parse_tool_arguments(call.arguments)
                 except (ValueError, TypeError) as error:
@@ -1053,11 +1091,13 @@ class Agent:
                     # crash: feed it back as a tool error and let the same
                     # retry path the day is built on handle it.
                     text = f"аргументы вызова не разобрать как JSON-объект: {error}"
-                    logs.append(ToolCallLog(call.name, {}, text, True))
+                    self._emit_tool_log(logs, ToolCallLog(call.name, {}, text, True))
                 else:
                     outcome = self._call_tool(call.name, arguments)  # never raises, by contract
                     text = outcome.text
-                    logs.append(ToolCallLog(call.name, arguments, text, outcome.is_error))
+                    self._emit_tool_log(
+                        logs, ToolCallLog(call.name, arguments, text, outcome.is_error)
+                    )
                 local_messages.append(
                     {
                         "role": "tool",
@@ -1066,7 +1106,15 @@ class Agent:
                         "name": call.name,
                     }
                 )
+            if self.tool_limit_hit == "calls":
+                self.tool_round = 0
+                self._warn(
+                    f"лимит вызовов инструментов ({self.max_tool_calls}) исчерпан, "
+                    "финального ответа модель не дала"
+                )
+                return result, logs
         self.tool_round = 0
+        self.tool_limit_hit = "rounds"
         self._warn(
             f"лимит раундов инструментов ({self.max_tool_rounds}) исчерпан, "
             "финального ответа модель не дала"
@@ -2177,6 +2225,7 @@ class Agent:
             cited=cited,
             display_text=display_text,
             rag_previous=rag_previous,
+            tool_limit_hit=self.tool_limit_hit if tool_messages_sent else None,
         )
 
     # --- cite mode (day 24) --------------------------------------------------

@@ -17,7 +17,9 @@ from advent_core import chat as chat_core
 from advent_core import console
 from advent_core.config import PROJECT_ROOT, ConfigError
 from advent_core.errors import AdventError, translate
+from adventassistant import files_store
 from adventassistant.corpus import INDEX_PATH, build_index
+from adventassistant.files_pipeline import DEFAULT_MAX_CALLS, DEFAULT_MAX_ROUNDS, run_files
 from adventassistant.pipeline import run_help
 from adventassistant.review import run_review
 from adventassistant.review_index import REVIEW_INDEX_PATH, build_review_index
@@ -202,6 +204,43 @@ def watch_pr_command(
     )
     if code:
         raise typer.Exit(code)
+
+
+@app.command("files")
+def files_command(
+    goal: str = typer.Argument(..., help="Цель на уровне задачи; файлы ассистент выбирает сам."),
+    max_rounds: int = typer.Option(
+        DEFAULT_MAX_ROUNDS, "--max-rounds", min=1, max=15, help="Раунды модели (1..15)."
+    ),
+    max_calls: int = typer.Option(
+        DEFAULT_MAX_CALLS,
+        "--max-calls",
+        min=1,
+        max=60,
+        help="Вызовы инструментов за прогон (1..60).",
+    ),
+) -> None:
+    """Агент работает с файлами через MCP: ответ и diff, запись только через files-apply."""
+    run_files(
+        goal,
+        max_rounds=max_rounds,
+        max_calls=max_calls,
+        complete=chat_core.complete,
+        root=PROJECT_ROOT,
+    )
+
+
+@app.command("files-apply")
+def files_apply_command(
+    run_id: str = typer.Argument(..., help="Идентификатор прогона из строки `run:`."),
+) -> None:
+    """Применить сохранённый changeset прогона (без сети и модели)."""
+    result = files_store.apply_run(run_id, PROJECT_ROOT)
+    for path in result.written:
+        console.err.print(f"записано: {path}", markup=False, highlight=False)
+    status = files_store.git_status_short(result.written, PROJECT_ROOT)
+    if status:
+        console.err.print(status, markup=False, highlight=False)
 
 
 def main() -> None:
