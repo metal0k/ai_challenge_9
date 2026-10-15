@@ -65,6 +65,7 @@ uv run advent w01 bench                    # один запрос на лест
 | 07 | 31 | Ассистент разработчика | [`w07d31`](https://github.com/metal0k/ai_challenge_9/tree/w07d31) | [Yandex Disk](https://yadi.sk/i/oEFzAyKelzmMrw) |
 | 07 | 32 | Автоматическое ревью PR: локальный watcher | [`w07d32`](https://github.com/metal0k/ai_challenge_9/tree/w07d32) | [Yandex Disk](https://yadi.sk/i/H0_iA2p-RWCVGg) |
 | 07 | 33 | Ассистент поддержки пользователей | [`w07d33`](https://github.com/metal0k/ai_challenge_9/tree/w07d33) | [Yandex Disk](https://yadi.sk/i/MRfYRTNwLoBlKA) |
+| 07 | 34 | Ассистент для работы с файлами проекта | [`w07d34`](https://github.com/metal0k/ai_challenge_9/tree/w07d34) | [Yandex Disk](https://yadi.sk/i/0nLCXplj7jtdGw) |
 
 ## Структура
 

@@ -50,4 +50,4 @@
 - Для работы с GitHub PR (`watch-pr`) необходимы переменные окружения:
   `GITHUB_URL`, `GITHUB_TOKEN`, `MISTRAL_API_KEY`.
 
-- Все команды, кроме `help`, требуют предварительной индексации (`index`, `index-review`, `index-support`).
+- Индекс нужен трём командам: `help` — после `index`, `review` — после `index-review`, `support` — после `index-support`. `watch-pr` строит индекс ревью сам, в своём кэше; `files` и `files-apply` индекса не требуют.
