@@ -1,7 +1,8 @@
 """LLM stages: describe, commit message, report draft. The model writes text; code validates it.
 
 The model is reached only through `ctx.complete`. Prompt inputs are limited to the task text,
-`git diff --stat` and file names (the report additionally gets public stage facts).
+the day's commit subjects, `git diff --stat` and file names of `base..HEAD`
+(the report additionally gets public stage facts).
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from pathlib import Path
 from advent_core.config import DEFAULT_MODEL, Config, ConfigError, configured_secrets, redact
 from advent_core.journal import log_call
 from adventship.ctx import EXIT_CONFIG, EXIT_TRUNCATED, ShipContext, ShipError, StageResult
-from adventship.gitutil import changed_paths, git
+from adventship.gitutil import day_changes, git
 from adventship.state import STAGES
 
 PROMPTS = Path(__file__).parent / "prompts"
@@ -234,15 +235,36 @@ def _task_text(ctx: ShipContext) -> str:
     return ctx.task.text
 
 
-def gather_inputs(ctx: ShipContext, files: list[str] | None = None) -> str:
-    """The whole LLM-visible input: task text, `git diff --stat`, changed file names."""
-    stat = git(ctx, "diff", "--stat", "HEAD").stdout.strip()
-    names = files if files is not None else changed_paths(ctx)
-    block = (
-        f"ЗАДАНИЕ:\n{_task_text(ctx).strip()}\n\n"
-        f"ИЗМЕНЕНИЯ (git diff --stat):\n{stat or '(нет изменений в отслеживаемых файлах)'}\n\n"
-        "ФАЙЛЫ:\n" + ("\n".join(names) if names else "(нет)")
-    )
+INPUT_LIST_MAX = 60
+INPUT_STAT_MAX = 3000
+_TOKEN_STOP = frozenset(
+    [
+        "test",
+        "tests",
+        "init",
+        "main",
+        "docs",
+        "spec",
+        "specs",
+        "feat",
+        "fix",
+        "chore",
+        "refactor",
+        "perf",
+        "style",
+        "readme",
+        "prompts",
+        "prompt",
+        "week",
+        "data",
+        "json",
+        "yaml",
+        "toml",
+    ]
+)
+
+
+def _checked(block: str, ctx: ShipContext) -> str:
     block = scrub(block, ctx.env)
     reasons = find_leaks(block, ctx.env)
     if reasons:
@@ -251,6 +273,59 @@ def gather_inputs(ctx: ShipContext, files: list[str] | None = None) -> str:
             hint="Убери это из задания, имён файлов или diff --stat: наружу такое не уходит.",
         )
     return block
+
+
+def gather_inputs(ctx: ShipContext, files: list[str] | None = None) -> str:
+    """LLM-visible input. With `files` (commit stage, work not yet committed): working-tree
+    stat and names. Without: the day's commit range, never the working tree."""
+    if files is not None:
+        stat = git(ctx, "diff", "--stat", "HEAD").stdout.strip()
+        block = (
+            f"ЗАДАНИЕ:\n{_task_text(ctx).strip()}\n\n"
+            f"ИЗМЕНЕНИЯ (git diff --stat):\n{stat or '(нет изменений в отслеживаемых файлах)'}\n\n"
+            "ФАЙЛЫ:\n" + ("\n".join(files) if files else "(нет)")
+        )
+        return _checked(block, ctx)
+    changes = day_changes(ctx)
+    commits = "\n".join(changes.commits[:INPUT_LIST_MAX])
+    names = "\n".join(changes.files[:INPUT_LIST_MAX])
+    stat = changes.stat[:INPUT_STAT_MAX]
+    block = (
+        f"ЗАДАНИЕ:\n{_task_text(ctx).strip()}\n\n"
+        f"КОММИТЫ ДНЯ ({changes.range}):\n{commits or '(нет)'}\n\n"
+        f"ИЗМЕНЕНИЯ (git diff --stat {changes.range}):\n{stat or '(нет)'}\n\n"
+        f"ФАЙЛЫ:\n{names or '(нет)'}"
+    )
+    if changes.dirty_tracked:  # describe/review run before commit: tracked edits count too
+        listed = "\n".join(changes.dirty_tracked[:INPUT_LIST_MAX])
+        block += f"\n\nЕЩЁ НЕ ЗАКОММИЧЕНО (отслеживаемые файлы):\n{listed}"
+    return _checked(block, ctx)
+
+
+def grounding_tokens(files: list[str], commits: list[str]) -> set[str]:
+    """Distinctive lowercase tokens: path segments and file stems, words of commit subjects."""
+    tokens: set[str] = set()
+    for path in files:
+        for part in re.split(r"[/\._\-\s]+", path.lower()):
+            tokens.add(part)
+    for subject in commits:
+        body = subject.split("): ", 1)[-1].lower()
+        tokens.update(re.split(r"[^\w]+", body))
+    return {t for t in tokens if len(t) >= 4 and not t.isdigit() and t not in _TOKEN_STOP}
+
+
+def check_grounded(text: str, files: list[str], commits: list[str]) -> None:
+    """The description must mention at least one token of what was actually changed."""
+    tokens = grounding_tokens(files, commits)
+    if not tokens:
+        return
+    low = text.lower()
+    if not any(token in low for token in tokens):
+        raise ShipError(
+            "описание не опирается на изменения",
+            exit_code=EXIT_TRUNCATED,
+            hint="В тексте нет ни одного имени из файлов или коммитов дня; повтори стадию.",
+        )
 
 
 # --------------------------------------------------------------------- stages
@@ -265,6 +340,8 @@ def run_describe(ctx: ShipContext) -> StageResult:
         max_tokens=700,
         validate=lambda t: validate_description(t, ctx.env),
     )
+    changes = day_changes(ctx)
+    check_grounded(text, changes.files + changes.dirty_tracked, changes.commits)
     line = comment_line(text)
     return StageResult(
         data={"description": text, "comment_line": line},

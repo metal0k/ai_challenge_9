@@ -239,9 +239,9 @@ def test_recheck_commit_detects_moved_head_and_dirty_tree(harness, tmp_path):
     dirty_repo(harness)
     ctx.state.mark("commit", "done", at="t", data=gitops.run_commit(ctx).data)
     assert gitops.recheck_commit(ctx) is True
-    (harness.repo / "z.py").write_text("z", encoding="utf-8")
+    (harness.repo / "a.py").write_text("z", encoding="utf-8")
     assert gitops.recheck_commit(ctx) is False
-    (harness.repo / "z.py").unlink()
+    sh(harness.repo, "checkout", "--", "a.py")
     sh(harness.repo, "commit", "-q", "--allow-empty", "-m", "later")
     assert gitops.recheck_commit(ctx) is False
 
@@ -283,6 +283,36 @@ def test_tag_pushes_with_ephemeral_header_and_verifies_remote(harness, tmp_path)
     assert not any("--force" in part or part.startswith("+") for part in argv)
     assert harness.push_envs == [{"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"}]
     assert TOKEN not in sh(harness.repo, "config", "--list", "--local")
+
+
+def test_tag_ignores_untracked_files_and_warns_with_a_count(harness, tmp_path):
+    ctx = committed_ctx(harness, tmp_path)
+    (harness.repo / "AGENTS.md").write_text("n\n", encoding="utf-8")
+    (harness.repo / "secret_draft.txt").write_text("n\n", encoding="utf-8")
+    result = gitops.run_tag(ctx)
+    assert result.data["warning"] == "untracked: 2"
+    assert "AGENTS" not in str(result.data) and "secret_draft" not in str(result.data)
+
+
+def test_tag_without_untracked_files_has_no_warning(harness, tmp_path):
+    ctx = committed_ctx(harness, tmp_path)
+    assert "warning" not in gitops.run_tag(ctx).data
+
+
+def test_tag_blocked_by_modified_tracked_file_even_with_untracked(harness, tmp_path):
+    ctx = committed_ctx(harness, tmp_path)
+    (harness.repo / "AGENTS.md").write_text("n\n", encoding="utf-8")
+    (harness.repo / "a.py").write_text("print(3)\n", encoding="utf-8")
+    with pytest.raises(ShipError, match="рабочее дерево не чистое: a.py"):
+        gitops.run_tag(ctx)
+
+
+def test_recheck_commit_ignores_untracked_files(harness, tmp_path):
+    ctx = committed_ctx(harness, tmp_path)
+    (harness.repo / "AGENTS.md").write_text("n\n", encoding="utf-8")
+    assert gitops.recheck_commit(ctx) is True
+    (harness.repo / "a.py").write_text("print(4)\n", encoding="utf-8")
+    assert gitops.recheck_commit(ctx) is False
 
 
 def test_tag_checks_extraheader_after_push(harness, tmp_path):
@@ -385,10 +415,10 @@ def test_tag_requires_head_at_recorded_commit(harness, tmp_path):
 
 def test_tag_requires_clean_tree_and_main_branch(harness, tmp_path):
     ctx = committed_ctx(harness, tmp_path)
-    (harness.repo / "stray.py").write_text("s", encoding="utf-8")
+    (harness.repo / "a.py").write_text("s", encoding="utf-8")
     with pytest.raises(ShipError, match="не чистое"):
         gitops.run_tag(ctx)
-    (harness.repo / "stray.py").unlink()
+    sh(harness.repo, "checkout", "--", "a.py")
     sh(harness.repo, "checkout", "-q", "-b", "side")
     with pytest.raises(ShipError, match="main"):
         gitops.run_tag(ctx)
@@ -418,3 +448,28 @@ def test_recheck_tag_false_when_main_moved(harness, tmp_path):
     assert gitops.recheck_tag(ctx) is False
     harness.remote.pop("heads/main")
     assert gitops.recheck_tag(ctx) is False
+
+
+def test_commit_reuses_head_when_work_is_committed_and_only_untracked_files_remain(
+    harness, tmp_path
+):
+    ctx = make_ctx(harness, tmp_path)
+    dirty_repo(harness)
+    first = gitops.run_commit(ctx)
+    (harness.repo / "AGENTS.md").write_text("owner file\n", encoding="utf-8")  # untracked
+    head = sh(harness.repo, "rev-parse", "HEAD")
+    again = gitops.run_commit(ctx)
+    assert again.data["sha"] == first.data["sha"] == head
+    assert again.data["reused"] is True
+    assert sh(harness.repo, "rev-parse", "HEAD") == head
+    assert sh(harness.repo, "ls-files", "AGENTS.md") == ""
+
+
+def test_commit_does_not_reuse_head_when_a_tracked_file_is_dirty(harness, tmp_path):
+    ctx = make_ctx(harness, tmp_path)
+    dirty_repo(harness)
+    first = gitops.run_commit(ctx)
+    (harness.repo / "a.py").write_text("print(3)\n", encoding="utf-8")
+    second = gitops.run_commit(ctx)
+    assert second.data["sha"] != first.data["sha"]
+    assert "reused" not in second.data

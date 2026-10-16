@@ -22,7 +22,7 @@ from adventship.ctx import (
     StageResult,
 )
 from adventship.gates import confirm
-from adventship.gitutil import changed_paths, git
+from adventship.gitutil import changed_paths, dirty_tracked_paths, git
 from adventship.llm import generate_commit_message, scrub, validate_commit_message
 
 BRANCH = "main"
@@ -40,8 +40,13 @@ def _head(ctx: ShipContext) -> str:
 
 
 def _dirty(ctx: ShipContext) -> list[str]:
-    """Paths still dirty in the worktree (empty list = clean)."""
-    return changed_paths(ctx)
+    """Tracked paths still dirty (empty list = clean); untracked files never block."""
+    return dirty_tracked_paths(ctx)
+
+
+def _untracked_count(ctx: ShipContext) -> int:
+    out = git(ctx, "ls-files", "--others", "--exclude-standard").stdout
+    return len([line for line in out.splitlines() if line.strip()])
 
 
 def _is_junk(path: str) -> bool:
@@ -105,7 +110,8 @@ def _mask_push_secrets(text: str, token: str) -> str:
 
 def run_commit(ctx: ShipContext) -> StageResult:
     paths = changed_paths(ctx)
-    if not paths:
+    # Work already committed: untracked files are never the day's change set, so HEAD is reused.
+    if not paths or (not dirty_tracked_paths(ctx) and _head_is_days_commit(ctx)):
         return _reuse_head_commit(ctx)
     junk = [p for p in paths if _is_junk(p)]
     if junk:
@@ -148,6 +154,11 @@ def run_commit(ctx: ShipContext) -> StageResult:
 
 
 _SUBJECT = re.compile(r"^(?:feat|fix|docs|test|refactor|chore|perf|style)\((w\d{2}d\d{2})\): ")
+
+
+def _head_is_days_commit(ctx: ShipContext) -> bool:
+    match = _SUBJECT.match(git(ctx, "log", "-1", "--format=%s").stdout.strip())
+    return bool(match) and match.group(1) == ctx.tag
 
 
 def _reuse_head_commit(ctx: ShipContext) -> StageResult:
@@ -207,6 +218,7 @@ def run_tag(ctx: ShipContext) -> StageResult:
     dirty = _dirty(ctx)
     if dirty:
         raise ShipError("рабочее дерево не чистое: " + ", ".join(dirty[:10]))
+    untracked = _untracked_count(ctx)
     branch = git(ctx, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if branch != BRANCH:
         raise ShipError(f"тег ставится из ветки {BRANCH}, сейчас {branch}")
@@ -237,13 +249,16 @@ def run_tag(ctx: ShipContext) -> StageResult:
         )
         _push(ctx, token, tag)
     _verify_remote(ctx, sha)
+    data: dict = {
+        "tag": tag,
+        "sha": sha,
+        "code_url": tag_url(github_url, tag),
+        "remote_verified": True,
+    }
+    if untracked:
+        data["warning"] = f"untracked: {untracked}"  # count only, never names
     return StageResult(
-        data={
-            "tag": tag,
-            "sha": sha,
-            "code_url": tag_url(github_url, tag),
-            "remote_verified": True,
-        },
+        data=data,
         summary=f"{tag} -> {sha[:8]} проверен через GitHub API",
     )
 

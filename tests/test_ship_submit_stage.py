@@ -39,8 +39,18 @@ def make_ctx(tmp_path, runner, **env):
 
 
 class Runner:
-    def __init__(self, *, head="abc", dirty="", duration="42.5", record_writes=None, record_rc=0):
+    def __init__(
+        self,
+        *,
+        head="abc",
+        dirty="",
+        untracked="",
+        duration="42.5",
+        record_writes=None,
+        record_rc=0,
+    ):
         self.head, self.dirty, self.duration = head, dirty, duration
+        self.untracked = untracked
         self.record_writes, self.record_rc = record_writes, record_rc
         self.calls: list[list[str]] = []
 
@@ -51,6 +61,8 @@ class Runner:
             out = self.head
         elif argv[:2] == ["git", "status"]:
             out = self.dirty
+        elif argv[:2] == ["git", "ls-files"]:
+            out = self.untracked
         elif argv[0] == "ffprobe":
             out = self.duration
         elif argv[:3] == ["uv", "run", "advent"]:
@@ -100,6 +112,28 @@ def test_record_runs_and_verifies_new_video(tmp_path):
     result = submit_stage.run_record(make_ctx(tmp_path, runner))
     assert runner.recorded()
     assert "skipped" not in result.data and result.data["size"] == 100
+
+
+def test_record_ignores_untracked_files_and_warns_with_a_count(tmp_path):
+    runner = Runner(untracked="AGENTS.md\nnotes.txt", record_writes=lambda: write_video(tmp_path))
+    result = submit_stage.run_record(make_ctx(tmp_path, runner))
+    assert runner.recorded()
+    assert result.data["warning"] == "untracked: 2"
+    assert "AGENTS" not in str(result.data) and "notes" not in str(result.data)
+    status = [c for c in runner.calls if c[:2] == ["git", "status"]]
+    assert status == [["git", "status", "--porcelain", "--untracked-files=no"]]
+
+
+def test_record_without_untracked_files_has_no_warning(tmp_path):
+    runner = Runner(record_writes=lambda: write_video(tmp_path))
+    assert "warning" not in submit_stage.run_record(make_ctx(tmp_path, runner)).data
+
+
+def test_record_blocked_by_modified_tracked_file(tmp_path):
+    runner = Runner(dirty="M a.py", untracked="AGENTS.md")
+    with pytest.raises(ShipError, match="не чистое"):
+        submit_stage.run_record(make_ctx(tmp_path, runner))
+    assert not runner.recorded()
 
 
 def test_record_failure_and_missing_file(tmp_path):

@@ -39,13 +39,47 @@ class FakeCodex:
         return subprocess.CompletedProcess(argv, self.returncode, stdout, self.stderr)
 
 
-def make_ctx(tmp_path, run, env=None):
-    workdir = tmp_path / "logs" / "ship" / "w07d35"
+def _git(repo, *argv):
+    subprocess.run(["git", *argv], cwd=repo, check=True, capture_output=True)
+
+
+def git_repo(tmp_path, *, dirty=False):
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "a.py").write_text("1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "init")
+    _git(repo, "tag", "w07d34")
+    (repo / "b.py").write_text("2\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feat(w07d35): add b")
+    (repo / "AGENTS.md").write_text("owner file\n", encoding="utf-8")  # untracked
+    if dirty:
+        (repo / "a.py").write_text("changed\n", encoding="utf-8")
+    return repo
+
+
+def make_ctx(tmp_path, codex, env=None, *, dirty=False):
+    repo = git_repo(tmp_path, dirty=dirty)
+
+    def run(argv, *, timeout, input=None, env=None):
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=repo, capture_output=True, text=True, encoding="utf-8")
+        return codex(argv, timeout=timeout, input=input, env=env)
+
+    return _ctx(tmp_path, repo, run, env)
+
+
+def _ctx(tmp_path, repo, run, env=None):
+    workdir = repo / "logs" / "ship" / "w07d35"
     return ShipContext(
         week=7,
         day=35,
         tag="w07d35",
-        root=tmp_path,
+        root=repo,
         workdir=workdir,
         env=env or {"CODEX_BIN": "codex"},
         state=ShipState.load(workdir / "state.json"),
@@ -68,6 +102,7 @@ def test_pass_verdict_writes_review_file(tmp_path):
         "verdict": "PASS",
         "blockers": 0,
         "review_file": "logs/ship/w07d35/review.md",
+        "range": "w07d34..HEAD",
     }
     assert "VERDICT: PASS" in (ctx.workdir / "review.md").read_text(encoding="utf-8")
 
@@ -154,3 +189,33 @@ def test_review_text_is_scrubbed_of_env_secrets(tmp_path):
 def test_last_verdict_line_wins():
     assert review.parse_verdict("VERDICT: FAIL\nисправлено\nVERDICT: PASS") == ("PASS", 0)
     assert review.parse_verdict("**VERDICT: FAIL**") == ("FAIL", 0)
+
+
+def test_review_prompt_names_the_commit_range_and_never_untracked_files(tmp_path):
+    codex = FakeCodex("VERDICT: PASS")
+    review.run_review(make_ctx(tmp_path, codex))
+    prompt = codex.calls[0]["input"]
+    assert "ДИАПАЗОН: w07d34..HEAD" in prompt
+    assert "git diff <диапазон>" in prompt
+    assert "AGENTS.md" not in prompt
+
+
+def test_review_records_dirty_tracked_files_as_a_warning(tmp_path):
+    ctx = make_ctx(tmp_path, FakeCodex("VERDICT: PASS"), dirty=True)
+    data = review.run_review(ctx).data
+    assert data["range"] == "w07d34..HEAD"
+    assert data["warning"] == "незакоммиченные отслеживаемые файлы: a.py"
+
+
+def test_review_has_no_warning_when_only_untracked_files_exist(tmp_path):
+    data = review.run_review(make_ctx(tmp_path, FakeCodex("VERDICT: PASS"))).data
+    assert "warning" not in data
+
+
+def test_review_refuses_an_empty_range(tmp_path):
+    ctx = make_ctx(tmp_path, FakeCodex("VERDICT: PASS"))
+    _git(ctx.root, "tag", "w07d36")
+    ctx.tag = "w07d37"  # base becomes w07d36 == HEAD: nothing to review
+    with pytest.raises(ShipError, match="нет коммитов") as caught:
+        review.run_review(ctx)
+    assert caught.value.exit_code == EXIT_STAGE_FAILED

@@ -110,11 +110,14 @@ def run_record(ctx: ShipContext) -> StageResult:
             f"HEAD не совпадает с тегом {ctx.tag}: запись только с запушенного тега",
             hint=f"git checkout {ctx.tag} или вернись на коммит тега.",
         )
-    if _git(ctx, "status", "--porcelain"):
+    if _git(ctx, "status", "--porcelain", "--untracked-files=no"):
         raise ShipError(
             "рабочее дерево не чистое: запись только с тега без правок",
             hint="Закоммить или убери изменения и повтори.",
         )
+
+    others = _git(ctx, "ls-files", "--others", "--exclude-standard")
+    untracked = len([line for line in others.splitlines() if line.strip()])
 
     result = ctx.run(
         ["uv", "run", "advent", "record", "--day", str(ctx.day), "--week", str(ctx.week)],
@@ -128,7 +131,8 @@ def run_record(ctx: ShipContext) -> StageResult:
     problem, duration = _video_problem(ctx, path)
     if problem is not None:
         raise ShipError(f"запись не прошла проверку: {problem}")
-    return _record_result(path, duration)
+    extra = {"warning": f"untracked: {untracked}"} if untracked else {}
+    return _record_result(path, duration, **extra)
 
 
 def recheck_record(ctx: ShipContext) -> bool:

@@ -17,8 +17,9 @@ LOCAL_PATH = "D" + ":\\Dev\\secret"
 TOKEN = "gh" + "p_" + "a" * 30
 DESCRIPTION = (
     "Автоматизируем сдачу учебного дня: пайплайн проводит проверки, review, commit и тег. "
-    "Модель пишет тексты, а решения принимает код."
+    "Модель пишет тексты, а решения принимает код. Код лежит в пакете adventship."
 )
+GENERIC = "Автоматизация проверок релиза в магазине приложений: пайплайн сам готовит сдачу работы."
 
 
 class FakeComplete:
@@ -47,8 +48,16 @@ def repo(tmp_path):
     (root / "a.py").write_text("print(1)\n", encoding="utf-8")
     sh(root, "add", ".")
     sh(root, "commit", "-q", "-m", "init")
+    sh(root, "tag", "w07d33")
+    (root / "old.py").write_text("y = 1\n", encoding="utf-8")
+    sh(root, "add", ".")
+    sh(root, "commit", "-q", "-m", "feat(w07d34): previous day")
+    sh(root, "tag", "w07d34")
     (root / "a.py").write_text("print(2)  # SECRETBODY\n", encoding="utf-8")
-    (root / "new_module.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "adventship_core.py").write_text("x = 1\n", encoding="utf-8")
+    sh(root, "add", ".")
+    sh(root, "commit", "-q", "-m", "feat(w07d35): add adventship pipeline core")
+    (root / "owner_notes.md").write_text("private\n", encoding="utf-8")  # untracked
     return root
 
 
@@ -113,8 +122,49 @@ def test_describe_prompt_has_only_task_stat_and_names(repo):
     llm.run_describe(ctx)
     sent = "\n".join(m["content"] for m in complete.calls[0])
     assert "Автоматизировать сдачу" in sent
-    assert "a.py" in sent and "new_module.py" in sent
+    assert "a.py" in sent and "adventship_core.py" in sent
     assert "SECRETBODY" not in sent  # file contents never leave the machine
+
+
+def test_describe_input_is_the_commit_range_not_the_working_tree(repo):
+    complete = FakeComplete(DESCRIPTION)
+    llm.run_describe(make_ctx(repo, complete))
+    sent = complete.calls[0][1]["content"]
+    assert "КОММИТЫ ДНЯ (w07d34..HEAD)" in sent
+    assert "feat(w07d35): add adventship pipeline core" in sent
+    assert "feat(w07d34): previous day" not in sent
+    assert "old.py" not in sent
+    assert "owner_notes.md" not in sent
+    assert "ЕЩЁ НЕ ЗАКОММИЧЕНО" not in sent
+
+
+def test_describe_input_lists_dirty_tracked_files_separately(repo):
+    (repo / "a.py").write_text("print(3)\n", encoding="utf-8")
+    complete = FakeComplete(DESCRIPTION)
+    llm.run_describe(make_ctx(repo, complete))
+    sent = complete.calls[0][1]["content"]
+    assert "ЕЩЁ НЕ ЗАКОММИЧЕНО (отслеживаемые файлы):\na.py" in sent
+    assert "owner_notes.md" not in sent
+
+
+def test_describe_rejects_generic_paraphrase_of_the_task(repo):
+    ctx = make_ctx(repo, FakeComplete(GENERIC))
+    with pytest.raises(ShipError, match="описание не опирается на изменения") as caught:
+        llm.run_describe(ctx)
+    assert caught.value.exit_code == EXIT_TRUNCATED
+
+
+def test_describe_accepts_description_naming_a_changed_stem(repo):
+    text = "Собран конвейер сдачи: ядро и проверки лежат в adventship_core, модель пишет текст."
+    assert llm.run_describe(make_ctx(repo, FakeComplete(text))).data["description"] == text
+
+
+def test_grounding_tokens_come_from_names_and_subjects():
+    tokens = llm.grounding_tokens(
+        ["adventship/gitutil.py", "tests/test_ship_x.py"], ["feat(w07d35): add range helper"]
+    )
+    assert {"adventship", "gitutil", "range", "helper"} <= tokens
+    assert "tests" not in tokens and "py" not in tokens
 
 
 def test_describe_is_journaled_with_kind_and_day(repo):

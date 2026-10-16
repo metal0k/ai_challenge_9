@@ -1,4 +1,4 @@
-"""Stage `review`: an external Codex review of the working tree; the verdict is read by code."""
+"""Stage `review`: external Codex review of the day's commit range; the verdict is read by code."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from adventship.ctx import (
     ShipError,
     StageResult,
 )
+from adventship.gitutil import day_changes
 from adventship.llm import load_prompt, scrub
 
 REVIEW_TIMEOUT = 1500.0
@@ -33,9 +34,9 @@ def parse_verdict(text: str) -> tuple[str, int]:
     return verdicts[-1].upper(), len(_BLOCKER.findall(text))
 
 
-def build_prompt(ctx: ShipContext) -> str:
+def build_prompt(ctx: ShipContext, rng: str) -> str:
     task = ctx.task.text.strip() if ctx.task is not None else "(задание не прочитано)"
-    return f"{load_prompt('review')}\n{scrub(task, ctx.env)}\n"
+    return f"{load_prompt('review')}\n{scrub(task, ctx.env)}\n\nДИАПАЗОН: {rng}\n"
 
 
 def _relative(root: Path, path: Path) -> str:
@@ -50,6 +51,13 @@ def _codex_bin(ctx: ShipContext) -> str:
 
 
 def run_review(ctx: ShipContext) -> StageResult:
+    changes = day_changes(ctx)
+    if not changes.commits and not changes.dirty_tracked:
+        raise ShipError(
+            f"в диапазоне {changes.range} нет коммитов и нет правок отслеживаемых файлов",
+            exit_code=EXIT_STAGE_FAILED,
+            hint="Сначала стадия commit.",
+        )
     ctx.workdir.mkdir(parents=True, exist_ok=True)
     out_file = ctx.workdir / "review.md"
     last_message = ctx.workdir / "review.last.md"
@@ -69,7 +77,7 @@ def run_review(ctx: ShipContext) -> StageResult:
         "-",
     ]
     try:
-        result = ctx.run(argv, timeout=REVIEW_TIMEOUT, input=build_prompt(ctx))
+        result = ctx.run(argv, timeout=REVIEW_TIMEOUT, input=build_prompt(ctx, changes.range))
     except FileNotFoundError as error:
         raise ShipError(
             "codex не найден",
@@ -98,7 +106,17 @@ def run_review(ctx: ShipContext) -> StageResult:
             exit_code=EXIT_REVIEW_FAIL,
             hint=f"Полный текст: {relative}",
         )
+    data: dict = {
+        "verdict": verdict,
+        "blockers": blockers,
+        "review_file": relative,
+        "range": changes.range,
+    }
+    if changes.dirty_tracked:
+        data["warning"] = "незакоммиченные отслеживаемые файлы: " + ", ".join(
+            changes.dirty_tracked[:10]
+        )
     return StageResult(
-        data={"verdict": verdict, "blockers": blockers, "review_file": relative},
+        data=data,
         summary=f"VERDICT {verdict}",
     )
