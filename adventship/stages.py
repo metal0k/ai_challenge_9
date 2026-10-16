@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from advent_core import console, journal
 from advent_core.config import redact
 from adventship.ctx import EXIT_CONFIG, ShipContext, ShipError, StageResult
-from adventship.state import STAGES, ShipState
+from adventship.state import FINGERPRINTED, STAGES, ShipState
 
 StageFn = Callable[[ShipContext], StageResult]
 RecheckFn = Callable[[ShipContext], bool]
@@ -123,6 +123,19 @@ def _run_intake(ctx: ShipContext, registry: Mapping[str, StageFn] | None) -> Non
     console.note(f"intake: {result.summary}")
 
 
+def load_fingerprint(ctx: ShipContext, *, tolerant: bool = False) -> None:
+    """Compute the code fingerprint once per run and hand it to the state (explicit provider)."""
+    if ctx.fingerprint is None or ctx.state.extra_inputs:
+        return
+    try:
+        value = ctx.fingerprint(ctx)
+    except Exception:
+        if tolerant:
+            return
+        raise
+    ctx.state.extra_inputs = {stage: value for stage in FINGERPRINTED}
+
+
 def require_prerequisites(ctx: ShipContext, stage: str) -> None:
     for earlier in STAGES[: STAGES.index(stage)]:
         if not ctx.state.is_valid(earlier):
@@ -158,6 +171,12 @@ def run_pipeline(
     if only == "intake":
         return executed
 
+    wanted = [only] if only else STAGES[1:]
+    if only:
+        wanted = STAGES[: STAGES.index(only) + 1]
+    if any(stage in FINGERPRINTED and stage not in skip for stage in wanted):
+        load_fingerprint(ctx)
+
     if only:
         require_prerequisites(ctx, only)
         order = [only]
@@ -177,6 +196,8 @@ def run_pipeline(
                 console.note(f"{stage}: уже сделано")
                 continue
             console.warn(f"{stage}: внешнее состояние разошлось со state, повтор")
+        if ctx.state.code_changed(stage):
+            console.warn(f"{stage}: код изменился с прошлого запуска, повтор")
         if ctx.dry_run and stage not in LIVE_IN_DRY_RUN:
             console.note(f"[dry-run] {stage}: {PLANS.get(stage, 'план')}")
             continue
@@ -200,6 +221,6 @@ def status_rows(state: ShipState, stages: list[str] | None = None) -> list[tuple
             continue
         status = entry["status"]
         if status in ("done", "skipped") and not state.is_valid(stage):
-            status = "stale"
+            status = "stale (код изменился)" if state.code_changed(stage) else "stale"
         rows.append((stage, status, entry.get("at", "")))
     return rows

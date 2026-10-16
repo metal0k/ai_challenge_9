@@ -88,6 +88,8 @@ class ShipContext:
     dry_run: bool = False
     no_record: bool = False
     journal_path: Path | None = None
+    # Code fingerprint provider (cli wires gitutil.code_fingerprint); None = not tracked.
+    fingerprint: Callable[[ShipContext], str] | None = None
 
 
 def kill_tree(pid: int) -> None:

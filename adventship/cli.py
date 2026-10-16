@@ -17,9 +17,10 @@ from advent_core import chat as chat_core
 from advent_core import console
 from advent_core.config import PROJECT_ROOT, ConfigError, load_env
 from advent_core.errors import AdventError
+from adventship import gitutil
 from adventship.ctx import ShipContext, ShipError, run_command
 from adventship.gates import tty_gate
-from adventship.stages import run_pipeline, status_rows
+from adventship.stages import load_fingerprint, run_pipeline, status_rows
 from adventship.state import STAGES, ShipState
 
 DEFAULT_WEEK = 7
@@ -87,10 +88,12 @@ def build_context(
         task_file=task_file,
         dry_run=dry_run,
         no_record=no_record,
+        fingerprint=gitutil.code_fingerprint,
     )
 
 
 def _print_status(ctx: ShipContext) -> None:
+    load_fingerprint(ctx, tolerant=True)
     table = Table(title=f"adventship: {ctx.tag}", show_header=True)
     for column in ("стадия", "статус", "когда"):
         table.add_column(column)

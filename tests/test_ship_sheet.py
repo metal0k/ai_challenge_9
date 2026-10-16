@@ -227,7 +227,7 @@ def test_recheck_sheet(tmp_path):
 def test_playwright_driver_refuses_write_without_probed_cell(tmp_path):
     driver = PlaywrightDriver.from_env({"COURSE_SHEET_URL": SHEET_URL}, tmp_path)
     for cell in (None, "", "not a cell"):
-        with pytest.raises(ShipError, match="run sheet-probe first"):
+        with pytest.raises(ShipError, match="сначала запусти sheet-probe"):
             driver.add_comment(cell, "x")
     assert driver.profile_dir == (tmp_path / "data" / "ship" / "chrome-profile").resolve()
 

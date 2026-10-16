@@ -39,6 +39,8 @@ DEPENDENTS: dict[str, list[str]] = {
     "sheet": ["report"],
     "report": [],
 }
+# Pre-commit stages that read the working tree / commit range: their inputs include the code.
+FINGERPRINTED = ("checks", "describe", "review")
 UPSTREAM: dict[str, list[str]] = {
     stage: [other for other in STAGES if stage in DEPENDENTS[other]] for stage in STAGES
 }
@@ -68,6 +70,8 @@ def data_digest(data: dict[str, Any]) -> str:
 class ShipState:
     def __init__(self, path: Path, doc: dict[str, Any] | None = None) -> None:
         self.path = path
+        # stage -> code fingerprint mixed into inputs_hash; set by the runner per run.
+        self.extra_inputs: dict[str, str] = {}
         self.doc: dict[str, Any] = doc or {
             "version": STATE_VERSION,
             "task_hash": None,
@@ -135,8 +139,21 @@ class ShipState:
             for name in UPSTREAM[stage]
             if self.entry(name) is not None
         ]
-        blob = json.dumps([self.task_hash, stage, upstream], ensure_ascii=False)
+        parts: list[Any] = [self.task_hash, stage, upstream]
+        if stage in self.extra_inputs:
+            parts.append(self.extra_inputs[stage])
+        blob = json.dumps(parts, ensure_ascii=False)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def code_changed(self, stage: str) -> bool:
+        """A done stage whose recorded code fingerprint differs from the current one."""
+        entry = self.entry(stage)
+        return bool(
+            entry
+            and stage in self.extra_inputs
+            and entry["status"] in ("done", "skipped")
+            and entry.get("fp") != self.extra_inputs[stage]
+        )
 
     def is_valid(self, stage: str) -> bool:
         """`done` (or `skipped`) with inputs that still match."""
@@ -173,6 +190,8 @@ class ShipState:
             "data": new_data,
             "inputs_hash": self.inputs_hash(stage),
         }
+        if stage in self.extra_inputs:
+            self.doc["stages"][stage]["fp"] = self.extra_inputs[stage]
         if output_changed:
             for dependent in DEPENDENTS[stage]:
                 self.doc["stages"].pop(dependent, None)

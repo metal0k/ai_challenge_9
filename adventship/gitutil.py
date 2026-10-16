@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -17,10 +19,14 @@ def git(
     timeout: float = GIT_TIMEOUT,
     check: bool = True,
     env: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run `git <args>` in the repo; a non-zero exit raises unless `check=False`."""
     try:
-        result = ctx.run(["git", *args], timeout=timeout, env=env)
+        if input_text is None:
+            result = ctx.run(["git", *args], timeout=timeout, env=env)
+        else:
+            result = ctx.run(["git", *args], timeout=timeout, env=env, input=input_text)
     except OSError as error:
         raise ShipError(f"git не запустился: {error}") from error
     if check and result.returncode != 0:
@@ -105,3 +111,30 @@ def day_changes(ctx: ShipContext, tag: str | None = None) -> DayChanges:
         stat=git(ctx, "diff", "--stat", rng).stdout.strip(),
         dirty_tracked=dirty_tracked_paths(ctx),
     )
+
+
+def code_fingerprint(ctx: ShipContext) -> str:
+    """sha256 of (path, blob hash) of every tracked file as it is in the WORKING TREE.
+
+    Equal before and after committing the same content (blob hashes, not commit ids);
+    untracked files are excluded. The day's range base is mixed in: describe/review read it.
+    """
+    listed = git(ctx, "ls-files", "-z").stdout.split("\0")
+    paths = sorted({p for p in listed if p})
+    present = [p for p in paths if os.path.isfile(ctx.root / p) or os.path.islink(ctx.root / p)]
+    hashes: dict[str, str] = {}
+    if present:
+        out = git(ctx, "hash-object", "--stdin-paths", input_text="\n".join(present) + "\n")
+        lines = out.stdout.split()
+        if len(lines) != len(present):
+            raise ShipError("git hash-object вернул неожиданное число хешей")
+        hashes = dict(zip(present, lines, strict=True))
+    try:
+        base = day_range(ctx)[0]
+    except ShipError:
+        base = "no-base"
+    digest = hashlib.sha256()
+    digest.update(f"base\0{base}\n".encode())
+    for path in paths:
+        digest.update(f"{path}\0{hashes.get(path, 'deleted')}\n".encode())
+    return digest.hexdigest()

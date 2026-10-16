@@ -387,5 +387,7 @@ class PlaywrightDriver:
     def _check_cell(cell: str | None) -> None:
         if not cell or not CELL_RE.match(cell):
             raise ShipError(
-                "run sheet-probe first", exit_code=EXIT_CONFIG, hint="adventship sheet-probe"
+                "сначала запусти sheet-probe: ячейка комментария не определена",
+                exit_code=EXIT_CONFIG,
+                hint="adventship sheet-probe",
             )

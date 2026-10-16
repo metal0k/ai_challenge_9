@@ -114,3 +114,29 @@ def test_empty_repository_is_an_error(tmp_path):
     sh(root, "init", "-q", "-b", "main")
     with pytest.raises(ShipError):
         gitutil.day_range(make_ctx(root))
+
+
+def test_fingerprint_equal_before_and_after_commit_of_same_content(repo):
+    ctx = make_ctx(repo)
+    (repo / "d35.py").write_text("edited\n", encoding="utf-8")
+    before = gitutil.code_fingerprint(ctx)
+    sh(repo, "add", "d35.py")
+    sh(repo, "commit", "-q", "-m", "feat(w07d35): edit")
+    assert gitutil.code_fingerprint(ctx) == before
+
+
+def test_fingerprint_changes_when_tracked_file_edited_or_deleted(repo):
+    ctx = make_ctx(repo)
+    base = gitutil.code_fingerprint(ctx)
+    (repo / "d35.py").write_text("changed\n", encoding="utf-8")
+    edited = gitutil.code_fingerprint(ctx)
+    assert edited != base
+    (repo / "d35.py").unlink()
+    assert gitutil.code_fingerprint(ctx) not in (base, edited)
+
+
+def test_fingerprint_ignores_untracked_files(repo):
+    ctx = make_ctx(repo)
+    base = gitutil.code_fingerprint(ctx)
+    (repo / "scratch.txt").write_text("new\n", encoding="utf-8")
+    assert gitutil.code_fingerprint(ctx) == base

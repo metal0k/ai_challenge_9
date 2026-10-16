@@ -317,3 +317,42 @@ def test_dry_run_keeps_failed_entry_of_planned_stage(tmp_path, fakes):
     run_pipeline(dry, registry=fakes.registry(), rechecks={})
     assert fakes.calls == ["intake"]
     assert dry.state.status("commit") == "failed"
+
+
+def _fp_ctx(tmp_path, holder):
+    return make_ctx(tmp_path, fingerprint=lambda c: holder["fp"])
+
+
+def test_unchanged_fingerprint_reuses_pre_commit_stages(tmp_path, fakes):
+    holder = {"fp": "code-1"}
+    run_pipeline(_fp_ctx(tmp_path, holder), registry=fakes.registry(), rechecks={})
+    fakes.calls.clear()
+    ctx = _fp_ctx(tmp_path, holder)
+    run_pipeline(ctx, registry=fakes.registry(), rechecks={})
+    assert fakes.calls == ["intake"]
+
+
+def test_changed_fingerprint_reruns_checks_describe_review_and_dependents(tmp_path, fakes):
+    holder = {"fp": "code-1"}
+    run_pipeline(_fp_ctx(tmp_path, holder), registry=fakes.registry(), rechecks={})
+    fakes.calls.clear()
+    holder["fp"] = "code-2"
+    ctx = _fp_ctx(tmp_path, holder)
+    rows = None
+    run_pipeline(ctx, registry=fakes.registry(), rechecks={})
+    assert fakes.calls[:4] == ["intake", "checks", "describe", "review"]
+    assert fakes.calls[4:] == ["commit", "tag", "record", "submit", "sheet", "report"]
+    rows = dict((s, st) for s, st, _ in status_rows(ctx.state))
+    assert set(rows.values()) == {"done"}
+
+
+def test_status_row_names_code_change_as_the_reason(tmp_path, fakes):
+    holder = {"fp": "code-1"}
+    run_pipeline(_fp_ctx(tmp_path, holder), registry=fakes.registry(), rechecks={})
+    holder["fp"] = "code-2"
+    ctx = _fp_ctx(tmp_path, holder)
+    ctx.state.extra_inputs = {s: "code-2" for s in ("checks", "describe", "review")}
+    rows = dict((s, st) for s, st, _ in status_rows(ctx.state))
+    assert rows["checks"] == "stale (код изменился)"
+    assert rows["describe"] == "stale (код изменился)"
+    assert rows["commit"] == "done"  # its own upstream data is unchanged
