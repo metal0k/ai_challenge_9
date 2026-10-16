@@ -681,7 +681,11 @@ def test_compare_local_embeds_questions_locally_and_prints_the_tables(
     assert offline.is_enabled()
     assert calls[0]["texts"] == ["search_query: Строка 3"]
     assert "Качество поиска" in result.output
-    assert result.output.count("MRR@5") == 1
+    # Two legitimate mentions: the table's column header and the verdict line under it
+    # (one question, both strategies tie). Assert each by its own label, not a bare count.
+    assert result.output.count("MRR@5") == 2
+    assert "Ничья по MRR@5" in result.output
+    assert result.output.count("Качество поиска") == 1
 
 
 def test_compare_local_refuses_a_cloud_index(monkeypatch, tmp_path, small_corpus):
