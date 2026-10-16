@@ -8,7 +8,7 @@ import pytest
 
 from advent_core.telemetry import CallResult
 from adventship import llm
-from adventship.ctx import EXIT_TRUNCATED, ShipContext, ShipError, TaskSpec
+from adventship.ctx import EXIT_TRUNCATED, ShipContext, ShipError, StageResult, TaskSpec
 from adventship.state import ShipState
 
 TAG = "w07d35"
@@ -17,7 +17,7 @@ LOCAL_PATH = "D" + ":\\Dev\\secret"
 TOKEN = "gh" + "p_" + "a" * 30
 DESCRIPTION = (
     "Автоматизируем сдачу учебного дня: пайплайн проводит проверки, review, commit и тег. "
-    "Модель пишет тексты, а решения принимает код. Код лежит в пакете adventship."
+    "Модель пишет тексты, а решения принимает код. Код лежит в пакете adventship, модуль core."
 )
 GENERIC = "Автоматизация проверок релиза в магазине приложений: пайплайн сам готовит сдачу работы."
 
@@ -361,3 +361,115 @@ def test_gather_inputs_refuses_leaky_file_name(repo):
     bad = "C:" + chr(92) + "Users" + chr(92) + "bob" + chr(92) + "x.py"
     with pytest.raises(ShipError, match="во входе для модели"):
         llm.gather_inputs(ctx, [bad])
+
+
+BODY_MSG = (
+    "feat(w07d35): add adventship pipeline core\n\n"
+    "Orchestrator with human gates: intake, checks, describe, review, commit, tag, record, "
+    "submit, sheet comment via Playwright, report."
+)
+
+
+def _body_commit(repo):
+    (repo / "extra.py").write_text("z = 1\n", encoding="utf-8")
+    sh(repo, "add", ".")
+    sh(repo, "commit", "-q", "-m", BODY_MSG)
+
+
+def test_describe_input_carries_commit_bodies(repo):
+    _body_commit(repo)
+    complete = FakeComplete(DESCRIPTION)
+    llm.run_describe(make_ctx(repo, complete))
+    sent = complete.calls[0][1]["content"]
+    assert "sheet comment via Playwright" in sent
+    assert "feat(w07d35): add adventship pipeline core" in sent
+
+
+def test_grounding_rejects_generic_text_naming_only_the_package():
+    text = "Формат ежедневных результатов в стиле адвент-календаря, пакет adventship."
+    with pytest.raises(ShipError, match="не опирается"):
+        llm.check_grounded(
+            text, ["adventship/llm.py"], ["feat(w07d35): add adventship pipeline"], []
+        )
+
+
+def test_grounding_accepts_text_citing_stages_from_the_body():
+    text = "Конвейер проходит review, затем record и публикует комментарий в sheet."
+    llm.check_grounded(
+        text,
+        ["adventship/llm.py"],
+        ["feat(w07d35): add adventship pipeline"],
+        ["Orchestrator: review, record, sheet comment"],
+    )
+
+
+def _override(ctx, text):
+    ctx.workdir.mkdir(parents=True, exist_ok=True)
+    (ctx.workdir / "description.override.txt").write_text(text, encoding="utf-8")
+
+
+def test_override_replaces_the_model_call(repo):
+    complete = FakeComplete(DESCRIPTION)
+    ctx = make_ctx(repo, complete)
+    _override(ctx, "Описание от автора: добавлен конвейер сдачи дня.\n")
+    result = llm.run_describe(ctx)
+    assert complete.calls == []
+    assert result.data["source"] == "override"
+    assert result.data["description"] == "Описание от автора: добавлен конвейер сдачи дня."
+    assert result.data["comment_line"].startswith("Описание от автора")
+
+
+def test_empty_override_is_ignored(repo):
+    complete = FakeComplete(DESCRIPTION)
+    ctx = make_ctx(repo, complete)
+    _override(ctx, "  \n")
+    result = llm.run_describe(ctx)
+    assert len(complete.calls) == 1
+    assert result.data["source"] == "llm"
+
+
+def test_override_with_local_path_is_rejected(repo):
+    complete = FakeComplete(DESCRIPTION)
+    ctx = make_ctx(repo, complete)
+    _override(ctx, f"Файл лежит в {LOCAL_PATH} и содержит настройки.")
+    with pytest.raises(ShipError, match="локальный путь"):
+        llm.run_describe(ctx)
+    assert complete.calls == []
+
+
+def test_override_hash_follows_the_content(repo):
+    ctx = make_ctx(repo, FakeComplete(DESCRIPTION))
+    _override(ctx, "Первый текст описания дня.")
+    first = llm.run_describe(ctx).data
+    _override(ctx, "Второй текст описания дня.")
+    second = llm.run_describe(ctx).data
+    assert first["override_sha256"] != second["override_sha256"]
+
+
+def _describe_only(ctx):
+    """Run the whole pipeline with fake stages and the real describe; return executed ids."""
+    from adventship.stages import run_pipeline
+    from adventship.state import STAGES
+
+    ctx.fingerprint = lambda c: "fp"
+    ctx.state.extra_inputs = {}  # a real run builds a fresh ctx each time
+    registry = {st: (lambda c: StageResult(data={}, summary="ok")) for st in STAGES}
+    registry["describe"] = llm.run_describe
+    return run_pipeline(ctx, registry=registry, rechecks={})
+
+
+def test_override_edit_reruns_describe_removal_goes_back_to_the_model(repo):
+    complete = FakeComplete(DESCRIPTION)
+    ctx = make_ctx(repo, complete)
+    _override(ctx, "Первый текст автора про конвейер.")
+    assert "describe" in _describe_only(ctx)
+    assert "describe" not in _describe_only(ctx)  # unchanged: reused
+    _override(ctx, "Второй текст автора про конвейер.")
+    assert "describe" in _describe_only(ctx)
+    assert ctx.state.data("describe")["description"].startswith("Второй")
+    assert ctx.state.data("describe")["source"] == "override"
+    assert complete.calls == []
+    (ctx.workdir / "description.override.txt").unlink()
+    assert "describe" in _describe_only(ctx)
+    assert ctx.state.data("describe")["source"] == "llm"
+    assert len(complete.calls) == 1

@@ -170,7 +170,12 @@ def run_sheet(ctx: ShipContext) -> StageResult:
             hint="Ничего не записано. Реши руками; ожидаемый текст в comment.txt.",
         )
 
-    confirm(ctx, "Отправить комментарий в таблицу?", f"Ячейка: {cell}\n\n{text}")
+    try:
+        override = (ctx.workdir / "description.override.txt").relative_to(ctx.root).as_posix()
+    except ValueError:
+        override = f"{ctx.workdir.name}/description.override.txt"
+    hint = f"Описание можно поправить: {override}; затем повтори adventship run"
+    confirm(ctx, "Отправить комментарий в таблицу?", f"Ячейка: {cell}\n\n{text}\n\n{hint}")
 
     ctx.state.doc["sheet_pending"] = {"cell": cell, "comment_sha256": base["comment_sha256"]}
     ctx.state.save()

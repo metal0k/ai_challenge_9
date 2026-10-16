@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import time
@@ -123,17 +124,34 @@ def _run_intake(ctx: ShipContext, registry: Mapping[str, StageFn] | None) -> Non
     console.note(f"intake: {result.summary}")
 
 
-def load_fingerprint(ctx: ShipContext, *, tolerant: bool = False) -> None:
-    """Compute the code fingerprint once per run and hand it to the state (explicit provider)."""
-    if ctx.fingerprint is None or ctx.state.extra_inputs:
-        return
+def override_hash(ctx: ShipContext) -> str:
+    """sha256 of the non-empty description override, else 'none'."""
+    path = ctx.workdir / "description.override.txt"
     try:
-        value = ctx.fingerprint(ctx)
-    except Exception:
-        if tolerant:
-            return
-        raise
-    ctx.state.extra_inputs = {stage: value for stage in FINGERPRINTED}
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "none"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() if text else "none"
+
+
+def load_fingerprint(ctx: ShipContext, *, tolerant: bool = False) -> None:
+    """Compute the code fingerprint once per run and hand it to the state (explicit provider).
+
+    describe additionally mixes in the override file hash, so editing it reruns describe.
+    """
+    if ctx.state.extra_inputs:
+        return
+    value: str | None = None
+    if ctx.fingerprint is not None:
+        try:
+            value = ctx.fingerprint(ctx)
+        except Exception:
+            if not tolerant:
+                raise
+    inputs = {stage: value for stage in FINGERPRINTED} if value is not None else {}
+    if value is not None or ctx.fingerprint is None:
+        inputs["describe"] = f"{value or ''}|override:{override_hash(ctx)}"
+    ctx.state.extra_inputs = inputs
 
 
 def require_prerequisites(ctx: ShipContext, stage: str) -> None:

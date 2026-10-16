@@ -356,3 +356,34 @@ def test_status_row_names_code_change_as_the_reason(tmp_path, fakes):
     assert rows["checks"] == "stale (код изменился)"
     assert rows["describe"] == "stale (код изменился)"
     assert rows["commit"] == "done"  # its own upstream data is unchanged
+
+
+def _override_file(ctx, text):
+    ctx.workdir.mkdir(parents=True, exist_ok=True)
+    (ctx.workdir / "description.override.txt").write_text(text, encoding="utf-8")
+
+
+def test_editing_override_reruns_describe_and_dependents(tmp_path, fakes):
+    holder = {"fp": "code-1"}
+    ctx = _fp_ctx(tmp_path, holder)
+    _override_file(ctx, "Первая версия.")
+    run_pipeline(ctx, registry=fakes.registry(), rechecks={})
+    fakes.calls.clear()
+    run_pipeline(_fp_ctx(tmp_path, holder), registry=fakes.registry(), rechecks={})
+    assert fakes.calls == ["intake"]  # unchanged override: everything reused
+    fakes.calls.clear()
+    _override_file(ctx, "Вторая версия.")
+    run_pipeline(_fp_ctx(tmp_path, holder), registry=fakes.registry(), rechecks={})
+    assert fakes.calls[:3] == ["intake", "describe", "review"] or "describe" in fakes.calls
+    assert "describe" in fakes.calls and "commit" in fakes.calls
+
+
+def test_removing_override_reruns_describe(tmp_path, fakes):
+    holder = {"fp": "code-1"}
+    ctx = _fp_ctx(tmp_path, holder)
+    _override_file(ctx, "Текст автора.")
+    run_pipeline(ctx, registry=fakes.registry(), rechecks={})
+    fakes.calls.clear()
+    (ctx.workdir / "description.override.txt").unlink()
+    run_pipeline(_fp_ctx(tmp_path, holder), registry=fakes.registry(), rechecks={})
+    assert "describe" in fakes.calls

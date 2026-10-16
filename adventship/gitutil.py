@@ -71,6 +71,7 @@ class DayChanges:
     base: str
     range: str
     commits: list[str] = field(default_factory=list)
+    bodies: list[str] = field(default_factory=list)  # aligned with `commits`, total capped
     files: list[str] = field(default_factory=list)
     stat: str = ""
     dirty_tracked: list[str] = field(default_factory=list)
@@ -100,6 +101,26 @@ def day_range(ctx: ShipContext, tag: str | None = None) -> tuple[str, str]:
     return base, f"{base}..HEAD"
 
 
+BODIES_MAX = 2500
+_REC = chr(0x1E)  # record separator between commit messages
+
+
+def _commit_bodies(ctx: ShipContext, rng: str) -> list[str]:
+    """Body of each commit in `rng` (same order as `%s`), total length capped at BODIES_MAX."""
+    out = git(ctx, "log", f"--format=%B{_REC}", rng).stdout
+    bodies = []
+    budget = BODIES_MAX
+    for record in out.split(_REC):
+        if not record.strip():
+            continue
+        lines = record.strip().splitlines()
+        body = " ".join(ln.strip() for ln in lines[1:] if ln.strip())  # line 1 is the subject
+        body = body[: max(budget, 0)]
+        budget -= len(body)
+        bodies.append(body)
+    return bodies
+
+
 def day_changes(ctx: ShipContext, tag: str | None = None) -> DayChanges:
     """The day's change set: commits in `base..HEAD`. Untracked files are never part of it."""
     base, rng = day_range(ctx, tag)
@@ -107,6 +128,7 @@ def day_changes(ctx: ShipContext, tag: str | None = None) -> DayChanges:
         base=base,
         range=rng,
         commits=git(ctx, "log", "--format=%s", rng).stdout.splitlines(),
+        bodies=_commit_bodies(ctx, rng),
         files=git(ctx, "diff", "--name-only", rng).stdout.splitlines(),
         stat=git(ctx, "diff", "--stat", rng).stdout.strip(),
         dirty_tracked=dirty_tracked_paths(ctx),

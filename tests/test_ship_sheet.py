@@ -252,3 +252,14 @@ def test_playwright_driver_owner_from_github_url_and_override(tmp_path):
     assert PlaywrightDriver.from_env(env, tmp_path, 35).owner == "fakeowner"
     assert PlaywrightDriver.from_env(env, tmp_path, 35).day == 35
     assert PlaywrightDriver.from_env({**env, "SHEET_OWNER": "other"}, tmp_path).owner == "other"
+
+
+def test_gate_text_names_the_override_file_by_relative_path(tmp_path):
+    ctx = make_ctx(tmp_path, FakeDriver())
+    sheet.run_probe(ctx)
+    sheet.run_sheet(ctx)
+    question, details = ctx.asked[0]
+    text = question + details
+    assert "description.override.txt" in details
+    assert "ship/description.override.txt" in details
+    assert str(tmp_path) not in text

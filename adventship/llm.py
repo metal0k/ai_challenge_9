@@ -7,6 +7,7 @@ the day's commit subjects, `git diff --stat` and file names of `base..HEAD`
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -287,7 +288,11 @@ def gather_inputs(ctx: ShipContext, files: list[str] | None = None) -> str:
         )
         return _checked(block, ctx)
     changes = day_changes(ctx)
-    commits = "\n".join(changes.commits[:INPUT_LIST_MAX])
+    bodies = changes.bodies + [""] * len(changes.commits)
+    commits = "\n".join(
+        subject + (f"\n  {body}" if body else "")
+        for subject, body in zip(changes.commits[:INPUT_LIST_MAX], bodies, strict=False)
+    )
     names = "\n".join(changes.files[:INPUT_LIST_MAX])
     stat = changes.stat[:INPUT_STAT_MAX]
     block = (
@@ -302,8 +307,10 @@ def gather_inputs(ctx: ShipContext, files: list[str] | None = None) -> str:
     return _checked(block, ctx)
 
 
-def grounding_tokens(files: list[str], commits: list[str]) -> set[str]:
-    """Distinctive lowercase tokens: path segments and file stems, words of commit subjects."""
+def grounding_tokens(
+    files: list[str], commits: list[str], bodies: list[str] | None = None
+) -> set[str]:
+    """Distinctive lowercase tokens: path segments, file stems, words of subjects and bodies."""
     tokens: set[str] = set()
     for path in files:
         for part in re.split(r"[/\._\-\s]+", path.lower()):
@@ -311,27 +318,66 @@ def grounding_tokens(files: list[str], commits: list[str]) -> set[str]:
     for subject in commits:
         body = subject.split("): ", 1)[-1].lower()
         tokens.update(re.split(r"[^\w]+", body))
+    for text in bodies or []:
+        tokens.update(re.split(r"[^\w]+", text.lower()))
     return {t for t in tokens if len(t) >= 4 and not t.isdigit() and t not in _TOKEN_STOP}
 
 
-def check_grounded(text: str, files: list[str], commits: list[str]) -> None:
-    """The description must mention at least one token of what was actually changed."""
-    tokens = grounding_tokens(files, commits)
+PACKAGE_NAME = "adventship"
+LONG_TOKEN = 8
+
+
+def check_grounded(
+    text: str, files: list[str], commits: list[str], bodies: list[str] | None = None
+) -> None:
+    """The description must hit two distinct tokens of the change, or one long non-package one."""
+    tokens = grounding_tokens(files, commits, bodies)
     if not tokens:
         return
     low = text.lower()
-    if not any(token in low for token in tokens):
-        raise ShipError(
-            "описание не опирается на изменения",
-            exit_code=EXIT_TRUNCATED,
-            hint="В тексте нет ни одного имени из файлов или коммитов дня; повтори стадию.",
-        )
+    hits = {t for t in tokens if t in low}
+    if len(hits) >= 2 or any(len(t) >= LONG_TOKEN and t != PACKAGE_NAME for t in hits):
+        return
+    raise ShipError(
+        "описание не опирается на изменения",
+        exit_code=EXIT_TRUNCATED,
+        hint="В тексте почти нет имён из файлов или коммитов дня; повтори стадию.",
+    )
 
 
 # --------------------------------------------------------------------- stages
 
 
+OVERRIDE_NAME = "description.override.txt"
+
+
+def _override_text(ctx: ShipContext) -> str | None:
+    path = ctx.workdir / OVERRIDE_NAME
+    if not path.is_file():
+        return None
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return None
+    try:
+        return validate_description(raw, ctx.env)
+    except Rejected as rejected:
+        raise ShipError(f"{OVERRIDE_NAME}: текст отклонён: {rejected}") from rejected
+
+
 def run_describe(ctx: ShipContext) -> StageResult:
+    override = _override_text(ctx)
+    if override is not None:  # the owner's text replaces the model call
+        line = comment_line(override)
+        digest = hashlib.sha256(override.encode("utf-8")).hexdigest()[:16]
+        return StageResult(
+            data={
+                "description": override,
+                "comment_line": line,
+                "source": "override",
+                "override_sha256": digest,
+            },
+            summary=f"из {OVERRIDE_NAME}, {len(override)} симв.: {line}",
+        )
     text = _ask(
         ctx,
         "ship_describe",
@@ -341,10 +387,10 @@ def run_describe(ctx: ShipContext) -> StageResult:
         validate=lambda t: validate_description(t, ctx.env),
     )
     changes = day_changes(ctx)
-    check_grounded(text, changes.files + changes.dirty_tracked, changes.commits)
+    check_grounded(text, changes.files + changes.dirty_tracked, changes.commits, changes.bodies)
     line = comment_line(text)
     return StageResult(
-        data={"description": text, "comment_line": line},
+        data={"description": text, "comment_line": line, "source": "llm"},
         summary=f"{len(text)} симв.: {line}",
     )
 

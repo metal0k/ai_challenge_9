@@ -140,3 +140,15 @@ def test_fingerprint_ignores_untracked_files(repo):
     base = gitutil.code_fingerprint(ctx)
     (repo / "scratch.txt").write_text("new\n", encoding="utf-8")
     assert gitutil.code_fingerprint(ctx) == base
+
+
+def test_day_changes_collects_bodies_aligned_with_subjects(repo):
+    commit(repo, "e.py", "feat(w07d35): second\n\nBody fact one.\nSecond line.")
+    changes = gitutil.day_changes(make_ctx(repo))
+    assert changes.commits[0] == "feat(w07d35): second"
+    assert changes.bodies == ["Body fact one. Second line.", ""]
+
+
+def test_commit_bodies_are_capped(repo):
+    commit(repo, "e.py", "feat(w07d35): big\n\n" + "x" * 5000)
+    assert sum(map(len, gitutil.day_changes(make_ctx(repo)).bodies)) <= gitutil.BODIES_MAX
