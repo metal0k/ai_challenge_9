@@ -172,3 +172,25 @@ def test_prepare_refuses_dirty_tracked_tree_but_ignores_untracked(
     (tmp_path / "a.py").write_text("x = 2\n", encoding="utf-8")
     with pytest.raises(AdventError, match="незакоммиченные"):
         record._prepare_w07d35(7, 35)
+
+
+def test_rehearsal_steps_are_free_and_use_adventship() -> None:
+    steps = record.rehearsal_steps(7, 35)
+    assert [s.title for s in steps] == [
+        "репетиция: status",
+        "репетиция: нет файла задания",
+    ]
+    assert {s.module for s in steps} == {"adventship.cli"}
+    assert steps[0].args == ["status", *DAY]
+    assert steps[0].expect_failure is False
+    assert steps[1].args == [
+        "run",
+        *DAY,
+        "--dry-run",
+        "--only",
+        "intake",
+        "--task-file",
+        "нет-такого-файла.md",
+    ]
+    assert steps[1].expect_failure is True
+    assert steps[1].stdin_lines == ["Проверка кириллицы через пайп"]

@@ -3297,6 +3297,37 @@ def rehearsal_steps(week: int, day: int) -> list[Step]:
                 timeout=60,
             )
         ]
+    if (week, day) == (7, 35):
+        # `advent w07 chat` does not exist. Both steps are free and write nothing:
+        # status only reads state; a missing --task-file fails at intake (exit 2)
+        # before checks/pytest and leaves the real w07d35 state untouched.
+        return [
+            Step(
+                title="репетиция: status",
+                module="adventship.cli",
+                args=["status", "--day", "35", "--week", "7"],
+                timeout=60,
+            ),
+            Step(
+                title="репетиция: нет файла задания",
+                module="adventship.cli",
+                args=[
+                    "run",
+                    "--day",
+                    "35",
+                    "--week",
+                    "7",
+                    "--dry-run",
+                    "--only",
+                    "intake",
+                    "--task-file",
+                    "нет-такого-файла.md",
+                ],
+                stdin_lines=["Проверка кириллицы через пайп"],
+                expect_failure=True,
+                timeout=60,
+            ),
+        ]
     return [rehearsal_step(week)]
 
 
