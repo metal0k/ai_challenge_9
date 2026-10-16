@@ -232,6 +232,17 @@ def run_tag(ctx: ShipContext) -> StageResult:
             hint=f"Перетегировать запрещено (без --force): реши вручную, например {tag}-2.",
         )
 
+    already_pushed = remote_tag is not None
+    branch_ref = _remote_ref(ctx, f"heads/{BRANCH}")
+    needs_push = not (already_pushed and branch_ref is not None and branch_ref[1] == sha)
+    if needs_push:
+        # The gate precedes every write (local tag included): a refusal changes nothing.
+        confirm(
+            ctx,
+            "Создать тег и запушить main и тег?",
+            f"Тег: {tag}\nКоммит: {sha[:8]}\nПуш: origin {BRANCH} + refs/tags/{tag}",
+        )
+
     local = _local_tag_sha(ctx, tag)
     if local is not None and local != sha:
         git(ctx, "tag", "-d", tag)  # not pushed (checked above), so moving it is safe
@@ -239,14 +250,7 @@ def run_tag(ctx: ShipContext) -> StageResult:
     if local is None:
         git(ctx, "tag", tag, sha)
 
-    already_pushed = remote_tag is not None
-    branch_ref = _remote_ref(ctx, f"heads/{BRANCH}")
-    if not (already_pushed and branch_ref is not None and branch_ref[1] == sha):
-        confirm(
-            ctx,
-            "Запушить main и тег?",
-            f"Тег: {tag}\nКоммит: {sha[:8]}\nПуш: origin {BRANCH} + refs/tags/{tag}",
-        )
+    if needs_push:
         _push(ctx, token, tag)
     _verify_remote(ctx, sha)
     data: dict = {

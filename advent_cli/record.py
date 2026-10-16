@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -91,6 +92,8 @@ MODULE_COMMANDS = {
     "adventassistant.support_demo": "python -m adventassistant.support_demo",
     # Day 34: run id carried between steps and the guarded second files-apply.
     "adventassistant.files_demo": "python -m adventassistant.files_demo",
+    # Day 35: the ship pipeline has its own entry point (pyproject: adventship.cli:main).
+    "adventship.cli": "adventship",
     # День 07 показывает файл сессии глазами — подпись в кадре должна
     # соответствовать тому, что зритель может повторить.
     "json.tool": "python -m json.tool",
@@ -143,6 +146,10 @@ class Step:
     # Sessions whose files are deleted before the step runs. `/new` inside the REPL keeps
     # the rag/strategy flags saved in the session state, so a take must start from no file.
     fresh_sessions: list[str] = field(default_factory=list)
+    # Exact exit code the step must end with (stricter than expect_failure's "any nonzero").
+    expect_exit: int | None = None
+    # Run the child with a non-tty stdin: a gate must be shown refusing, not asking.
+    no_tty: bool = False
 
 
 def _reset_sessions(names: list[str]) -> None:
@@ -236,6 +243,8 @@ def demo_steps(week: int, day: int, *, live: bool = False) -> list[Step]:
         return _demo_steps_w07d33()
     if week == 7 and day == 34:
         return _demo_steps_w07d34()
+    if week == 7 and day == 35:
+        return _demo_steps_w07d35()
     raise AdventError(
         f"Сценария демо для недели {week}, дня {day} нет.",
         hint="Добавь _demo_steps_wNNdDD() и ветку в demo_steps() — записывать нечего.",
@@ -2720,6 +2729,104 @@ def _prepare_w07d34(week: int, day: int) -> None:
     check_readme_absent(PROJECT_ROOT)
 
 
+_W07D35_HOLD = 8.0
+# Review runs live inside `run --dry-run`; the shared STEP_TIMEOUT is too tight for it.
+_W07D35_RUN_TIMEOUT = 600
+_W07D35_PROBE_TIMEOUT = 180
+_W07D35_ARGS = ["--day", "35", "--week", "7"]
+
+
+def _demo_steps_w07d35() -> list[Step]:
+    """Stage table, dry-run plan, read-only sheet probe, then the gate refusing without a tty."""
+    module = "adventship.cli"
+    return [
+        Step(
+            title="1. Таблица стадий дня: что сделано, что ещё нет",
+            module=module,
+            args=["status", *_W07D35_ARGS],
+            timeout=60,
+            line_pause=5.0,
+        ),
+        Step(
+            title="2. run --dry-run: готовые стадии пропущены, review идёт вживую",
+            module=module,
+            args=["run", *_W07D35_ARGS, "--dry-run"],
+            timeout=_W07D35_RUN_TIMEOUT,
+            line_pause=5.0,
+        ),
+        Step(
+            title="3. sheet-probe: ячейка и число комментариев, ничего не пишется",
+            module=module,
+            args=["sheet-probe", *_W07D35_ARGS],
+            timeout=_W07D35_PROBE_TIMEOUT,
+            line_pause=5.0,
+        ),
+        Step(
+            title="4. Реальный запуск без терминала: gate отказывает до любых изменений",
+            module=module,
+            args=["run", *_W07D35_ARGS],
+            timeout=_W07D35_RUN_TIMEOUT,
+            line_pause=_W07D35_HOLD,
+            expect_exit=8,
+            no_tty=True,
+        ),
+    ]
+
+
+def _git_out(*args: str) -> str:
+    done = subprocess.run(
+        ["git", *args],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+        check=True,
+    )
+    return done.stdout
+
+
+def _prepare_w07d35(week: int, day: int) -> None:
+    """Day 35 preflight: the 12-minute checks and the paid describe never run inside the take."""
+    if (week, day) != (7, 35):
+        return
+    from datetime import timedelta
+
+    state_path = PROJECT_ROOT / "logs" / "ship" / "w07d35" / "state.json"
+    hint = (
+        "Выполни `adventship run --day 35 --week 7 --dry-run` и `adventship sheet-probe` до записи."
+    )
+    try:
+        doc = json.loads(state_path.read_text(encoding="utf-8"))
+        stages = doc["stages"]
+        missing = [
+            n for n in ("intake", "checks", "describe", "review") if stages[n]["status"] != "done"
+        ]
+    except (OSError, ValueError, KeyError, TypeError):
+        raise AdventError("Нет состояния пайплайна Day 35 (state.json).", hint=hint) from None
+    if missing:
+        raise AdventError("Стадии не выполнены: " + ", ".join(missing) + ".", hint=hint)
+    try:
+        probe = doc["sheet_probe"]
+        age = datetime.now().astimezone() - datetime.fromisoformat(probe["at"])
+        fresh = age <= timedelta(hours=24) and probe["result"]["ok"] is True
+    except (KeyError, ValueError, TypeError):
+        fresh = False
+    if not fresh:
+        raise AdventError("sheet-probe отсутствует, старше 24 ч или неуспешен.", hint=hint)
+    # The real `run` in step 4 must reuse HEAD silently and reach the tag gate untouched.
+    git_hint = "Закоммить код дня (type(w07d35): ...) и оставь tracked-дерево чистым до записи."
+    try:
+        subject = _git_out("log", "-1", "--format=%s")
+        dirty = _git_out("status", "--porcelain", "--untracked-files=no")
+    except (OSError, subprocess.SubprocessError):
+        raise AdventError("Не удалось прочитать состояние git.", hint=git_hint) from None
+    if not re.match(r"^[a-z]+\(w07d35\): ", subject.strip()):
+        raise AdventError(f"HEAD не коммит дня: {subject.strip()!r}.", hint=git_hint)
+    if dirty.strip():
+        raise AdventError("В tracked-файлах есть незакоммиченные изменения.", hint=git_hint)
+
+
 def _prepare_w07d31(week: int, day: int) -> None:
     """Day 31 preflight: the docs index already exists. Building it on camera is paid."""
     if (week, day) != (7, 31):
@@ -3231,6 +3338,7 @@ def record(
     _prepare_w07d32(week, day)
     _prepare_w07d33(week, day)
     _prepare_w07d34(week, day)
+    _prepare_w07d35(week, day)
 
     if dry_run:
         console.note("dry-run: OBS не задействован")
@@ -3333,7 +3441,11 @@ def _run_step(step: Step, pause: float | None = None) -> None:
         # already capped. Same cap, same message.
         try:
             result = subprocess.run(
-                command, cwd=PROJECT_ROOT, env=env, timeout=step.timeout or STEP_TIMEOUT
+                command,
+                cwd=PROJECT_ROOT,
+                env=env,
+                timeout=step.timeout or STEP_TIMEOUT,
+                stdin=subprocess.DEVNULL if step.no_tty else None,
             )
         except subprocess.TimeoutExpired:
             raise AdventError(f"Шаг «{step.title}» завис и был снят по таймауту.") from None
@@ -3385,6 +3497,13 @@ def _run_step(step: Step, pause: float | None = None) -> None:
 
 
 def _check(step: Step, code: int) -> None:
+    if step.expect_exit is not None:
+        if code != step.expect_exit:
+            raise AdventError(
+                f"Шаг «{step.title}» должен был завершиться кодом {step.expect_exit}, "
+                f"а вернул {code}."
+            )
+        return
     if step.expect_failure:
         if code == 0:
             raise AdventError(f"Шаг «{step.title}» должен был упасть, но вернул 0.")

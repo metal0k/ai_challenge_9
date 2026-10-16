@@ -11,6 +11,7 @@ from adventship.ctx import (
     EXIT_AUTH,
     EXIT_CHECKS_FAIL,
     EXIT_GATE_DENIED,
+    EXIT_NO_TTY,
     ShipContext,
     ShipError,
     TaskSpec,
@@ -473,3 +474,27 @@ def test_commit_does_not_reuse_head_when_a_tracked_file_is_dirty(harness, tmp_pa
     second = gitops.run_commit(ctx)
     assert second.data["sha"] != first.data["sha"]
     assert "reused" not in second.data
+
+
+def _no_tty_gate(question, details):
+    raise ShipError("нужен tty для подтверждения", exit_code=EXIT_NO_TTY)
+
+
+@pytest.mark.parametrize("stale_local_tag", [False, True])
+def test_tag_gate_without_tty_changes_nothing(harness, tmp_path, stale_local_tag):
+    old = sh(harness.repo, "rev-parse", "HEAD")
+    if stale_local_tag:
+        sh(harness.repo, "tag", TAG, old)
+    ctx = committed_ctx(harness, tmp_path)
+    ctx.gate = _no_tty_gate
+    tags_before = sh(harness.repo, "tag", "--list")
+    refs_before = sh(harness.repo, "for-each-ref", "refs/tags")
+    harness.argvs.clear()
+    with pytest.raises(ShipError) as caught:
+        gitops.run_tag(ctx)
+    assert caught.value.exit_code == 8
+    # no write of any kind was issued: no `git tag`, no push
+    assert not any(a[:2] == ["git", "tag"] or "push" in a for a in harness.argvs)
+    assert sh(harness.repo, "tag", "--list") == tags_before == (TAG if stale_local_tag else "")
+    assert sh(harness.repo, "for-each-ref", "refs/tags") == refs_before
+    assert harness.pushed_sha is None
