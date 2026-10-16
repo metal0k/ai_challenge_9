@@ -1445,3 +1445,82 @@ cause is unknown.** "x264 eats the CPU" was refuted: a probe during a recording
 was fast. A recorded live run can therefore be slower than the saved
 measurement shown next to it on screen. Keep the measured numbers from saved
 runs and treat the live run as a demonstration, not as the measurement.
+
+**Day 30's private service runs on the VPS behind its own gateway, and the
+gateway — not llama-server — is where the limits live.** `week_06/gateway/` is
+self-contained (no `advent_core` imports, only starlette/uvicorn/httpx) because
+it is the only code that ships to the server; `week_06/deploy/deploy.py` ships
+it. Facts measured on llama.cpp b11541, 1 vCPU, 952 MB:
+- llama-server rejects only `prompt ≥ n_ctx` (400 `exceed_context_size_error`);
+  `prompt + max_tokens > n_ctx` returns 200 with a silently shortened
+  `finish_reason: length`. The honest max-context check is the gateway's
+  `input_tokens + max_tokens ≤ n_ctx` → 413.
+- `/v1/chat/completions/input_tokens` equals `usage.prompt_tokens` exactly and
+  runs in the HTTP thread without a slot (`handle_count_tokens` in
+  `server-context.cpp`) — it never waits behind a generation.
+- A client disconnect cancels generation within 0.5 s (stream and non-stream),
+  so closing the upstream is enough; `/slots` is only the fallback.
+- Usage arrives in the stream only with `stream_options.include_usage`.
+
+**Do not put `MemoryHigh` below the peak of a mmap'd model.** `memory.current`
+counts the model's page cache (664 MB peak against 602 MB VmHWM); a soft limit
+under it evicts the model's own pages on every token — the same cliff that took
+qwen3-0.6b from 10.9 to 2 tok/s in the probe. Only `MemoryMax` with headroom.
+`CPUQuota=70%` did not help the radio (static p95 0.15 s with and without) and
+cut generation from 8.3 to 6.8 tok/s, so the unit uses `CPUWeight` only.
+
+**A loopback HTTPS proxy can break TLS to the private LLM host while other
+hosts still answer.** curl then returns `000` and httpx raises
+`UNEXPECTED_EOF_WHILE_READING`. Clients of that host set `trust_env=False`
+(and `--noproxy '*'`). An SSL EOF here is the proxy, not the server — check a
+direct connection before debugging Caddy.
+
+**`install -m 700 -d` on an existing directory changes its mode.** On
+2026-10-10 a config push made `/etc/caddy` mode 700: `caddy validate` (root)
+passed and `reload` (the caddy user) failed with permission denied — the
+service kept serving the old config, so nothing looked broken. After a push,
+read `journalctl -u caddy` for the reload, not just the script's exit code.
+
+**An idle-unload demo is mostly waiting, and waiting does not belong on camera
+at 1×.** Day 30's first cut was 4:10, much of it `--wait-stopped` printing a line
+per second. The two waits were sped up ×6 in post with an «ускорено ×6» label
+(the timings shown elsewhere stay real) and the final screen held 6 s more.
+
+**`httpx` follows `ALL_PROXY`.** A `socks5h` value without the `socksio`
+package raises before the request ("Using SOCKS proxy, but the 'socksio'
+package is not installed"). On 2026-10-13 that stopped the day-31 index, and
+the same environment would have stopped the recording and `advent submit`.
+An `http://` `HTTPS_PROXY` still reaches Mistral, GitHub and Yandex Disk.
+Drop `ALL_PROXY` for those processes.
+
+**Balanced RAG retrieval has to survive both selection stages.** On day 32,
+adding watcher code pushed the Git authentication document out of a shared
+top-16 pool. Reserving eight documentation and eight Python candidates helped,
+but rerank could still fill all four answer slots with reviewer code. The
+answer now retains the strongest documentation hit that passes the existing
+relevance threshold; below-threshold documents remain excluded. Live video
+caught unsupported Git authentication advice that mocked tests could not.
+
+**`ministral-14b` makes one tool call per round, whatever the prompt allows.**
+Day 34's README goal took 6–11 calls, so `--max-rounds 8` ran out before the
+final answer; the default is 12. Size a tool-loop limit by measured calls, not
+by how many the model *could* batch. The same day, every scenario failure was
+the model's behaviour, not the plumbing, and each prompt rule in
+`adventassistant/prompts/files.md` answers one observed miss (guessing a
+directory and globbing it, reading 30 lines at a time, writing the document as
+chat text instead of `write_file`, explaining a call site from the search line
+alone).
+
+**`finish_reason="error"` comes back as an ordinary result.** A truncated half
+answer with no tool call looked like a final answer and exited 0. Any loop
+that ends on "no tool calls" must also check the finish reason; day 34 maps
+anything but `stop` to exit 7 with the partial diff.
+
+**An MCP child does not see `.env`, so its `redact()` redacts nothing.** The
+SDK passes only a safe env subset to the subprocess. A server that redacts its
+own output must call `load_env()` itself, and the parent should redact again.
+
+**OBS can stop rendering after days of uptime.** `GetSourceScreenshot` returned
+702 "Failed to render screenshot" for every source and the whole scene; the
+retries in `verify_capture()` cannot help. Restart OBS; for a few seconds after
+start it answers 207 "not ready".
