@@ -75,6 +75,9 @@ packages = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Pytest scratch dirs: an unreadable one makes ruff exit 2 even when every file is clean,
+# which fails the adventship checks stage for no real reason.
+extend-exclude = [".pytest-temp", ".pytest-temp-live", ".pytest-run"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

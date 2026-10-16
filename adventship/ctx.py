@@ -109,10 +109,14 @@ def run_command(
     timeout: float,
     input: str | None = None,
     env: dict[str, str] | None = None,
+    inherit_env: bool = True,
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """argv list, utf-8, stdin closed unless `input` is given, whole tree killed on timeout."""
-    full_env = {**os.environ, **(env or {})}
+    """argv list, utf-8, stdin closed unless `input` is given, whole tree killed on timeout.
+
+    `inherit_env=False` passes `env` as the complete environment (no os.environ merge).
+    """
+    full_env = {**(os.environ if inherit_env else {}), **(env or {})}
     popen_kwargs: dict[str, Any] = {}
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True

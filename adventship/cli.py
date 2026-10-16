@@ -66,8 +66,10 @@ def build_context(
     workdir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
 
-    def run(argv, *, timeout, input=None, env=None):
-        return run_command(argv, timeout=timeout, input=input, env=env, cwd=root)
+    def run(argv, *, timeout, input=None, env=None, inherit_env=True):
+        return run_command(
+            argv, timeout=timeout, input=input, env=env, inherit_env=inherit_env, cwd=root
+        )
 
     return ShipContext(
         week=week,
