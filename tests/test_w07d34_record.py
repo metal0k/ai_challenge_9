@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -115,20 +116,24 @@ def test_run_refuses_to_start_over_an_existing_readme(state: Path, monkeypatch) 
         files_demo.run_readme(GOAL_2)
 
 
-def test_apply_runs_files_apply_with_the_saved_id_then_prints_git_status(
+def test_apply_runs_files_apply_with_the_saved_id_and_shows_status_once(
     state: Path, monkeypatch, capsys
 ) -> None:
     (state / "run_id.txt").write_text(RUN_ID, encoding="utf-8")
     calls: list[list[str]] = []
-    monkeypatch.setattr(files_demo, "_cli", lambda args, **_kw: calls.append(args) or _proc(0))
-    monkeypatch.setattr(
-        files_demo.files_store, "git_status_short", lambda paths, root=None: "?? week_07/README.md"
-    )
+
+    def fake_cli(args, **_kw):
+        # the real command prints its own status line on stderr
+        calls.append(args)
+        sys.stderr.write("?? week_07/README.md\n")
+        return _proc(0)
+
+    monkeypatch.setattr(files_demo, "_cli", fake_cli)
     files_demo.apply_saved()
     assert calls == [["files-apply", RUN_ID]]
-    out = capsys.readouterr().out
-    assert "$ git status --short week_07/README.md" in out
-    assert "?? week_07/README.md" in out
+    captured = capsys.readouterr()
+    assert (captured.out + captured.err).count("?? week_07/README.md") == 1
+    assert "$ git status" not in captured.out
 
 
 def test_apply_failure_is_unexpected(state: Path, monkeypatch) -> None:

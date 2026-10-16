@@ -85,9 +85,7 @@ def apply_saved() -> None:
     proc = _cli(["files-apply", run_id], capture_stdout=False, capture_stderr=False)
     if proc.returncode != 0:
         raise AdventError(f"files-apply завершился с кодом {proc.returncode}.")
-    status = files_store.git_status_short([README_PATH], PROJECT_ROOT)
-    console.out.print(f"$ git status --short {README_PATH}", markup=False, highlight=False)
-    console.out.print(status or "(пусто)", markup=False, highlight=False)
+    # the command prints its own git status on stderr; no second copy here
 
 
 def apply_again() -> None:
