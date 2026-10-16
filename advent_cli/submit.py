@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import typer
@@ -41,20 +42,21 @@ def _git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def submit(
-    day: int = typer.Option(..., "--day", "-d", help="Номер дня внутри недели."),
-    week: int = typer.Option(1, "--week", "-w", help="Номер недели."),
-    video: str | None = typer.Option(None, "--video", help="Готовая ссылка на видео."),
-    no_publish: bool = typer.Option(
-        False, "--no-publish", help="Не публиковать видео на Яндекс.Диске."
-    ),
-    create_tag: bool = typer.Option(
-        False, "--create-tag", help="Создать тег на remote, если его нет."
-    ),
-) -> None:
-    """Проверяет тег и видео, публикует файл и печатает готовый комментарий."""
-    load_env()
+@dataclass(frozen=True)
+class Submission:
+    code_url: str
+    video_url: str
+    comment_text: str
 
+
+def build_submission(
+    week: int,
+    day: int,
+    video: str | None = None,
+    no_publish: bool = False,
+    create_tag: bool = False,
+) -> Submission:
+    """Verify the remote tag, publish the video, return the links and the plain comment."""
     github_url = os.getenv("GITHUB_URL")
     github_token = os.getenv("GITHUB_TOKEN")
     if not github_url:
@@ -109,13 +111,30 @@ def submit(
         console.note(f"публикую {remote}")
         video_url = publish_and_get_url(token, remote)
 
-    # --- 3. готовый текст ---
+    comment_text = f"Week {week:02d}, Day {day:02d}\nКод: {code_url}\nВидео: {video_url}"
+    return Submission(code_url=code_url, video_url=video_url, comment_text=comment_text)
+
+
+def submit(
+    day: int = typer.Option(..., "--day", "-d", help="Номер дня внутри недели."),
+    week: int = typer.Option(1, "--week", "-w", help="Номер недели."),
+    video: str | None = typer.Option(None, "--video", help="Готовая ссылка на видео."),
+    no_publish: bool = typer.Option(
+        False, "--no-publish", help="Не публиковать видео на Яндекс.Диске."
+    ),
+    create_tag: bool = typer.Option(
+        False, "--create-tag", help="Создать тег на remote, если его нет."
+    ),
+) -> None:
+    """Проверяет тег и видео, публикует файл и печатает готовый комментарий."""
+    load_env()
+    result = build_submission(week, day, video=video, no_publish=no_publish, create_tag=create_tag)
+
     console.out.print()
     console.out.print("[bold]Комментарий для таблицы:[/bold]")
     console.out.print()
-    console.out.print(f"Week {week:02d}, Day {day:02d}")
-    console.out.print(f"Код: {code_url}")
-    console.out.print(f"Видео: {video_url}")
+    for line in result.comment_text.splitlines():
+        console.out.print(line)
 
 
 def _locate_video(week: int, day: int) -> Path:

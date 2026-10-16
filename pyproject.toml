@@ -40,6 +40,12 @@ adventrag = "week_05.cli:main"
 adventlocal = "week_06.cli:main"
 # Week 07 day 31: docs assistant. Own entry point, not an `advent` group.
 adventassistant = "adventassistant.cli:main"
+# Week 07 day 35: day-submission pipeline.
+adventship = "adventship.cli:main"
+
+[project.optional-dependencies]
+# Google Sheets comment automation; not needed by tests (the driver is faked).
+ship = ["playwright>=1.48"]
 
 [dependency-groups]
 dev = [
@@ -63,6 +69,7 @@ packages = [
     "week_05",
     "week_06",
     "adventassistant",
+    "adventship",
 ]
 
 [tool.ruff]
