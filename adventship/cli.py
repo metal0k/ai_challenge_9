@@ -40,13 +40,13 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _driver_factory(env: dict[str, str], root: Path):
+def _driver_factory(env: dict[str, str], root: Path, day: int):
     """Built lazily: Playwright is an optional dependency and tests never import it."""
 
     def make():
         from adventship.sheet_driver import PlaywrightDriver
 
-        return PlaywrightDriver.from_env(env, root)
+        return PlaywrightDriver.from_env(env, root, day)
 
     return make
 
@@ -80,7 +80,7 @@ def build_context(
         run=run,
         complete=chat_core.complete,
         gate=tty_gate,
-        driver_factory=_driver_factory(env, root),
+        driver_factory=_driver_factory(env, root, day),
         now=_now,
         task_file=task_file,
         dry_run=dry_run,

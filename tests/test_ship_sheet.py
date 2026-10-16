@@ -245,3 +245,10 @@ def test_comment_line_from_describe_wins_over_long_description(tmp_path):
     )
     ctx.state.mark("submit", "done", at="t", data={"code_url": CODE, "video_url": VIDEO})
     assert sheet.build_comment(ctx).splitlines()[3] == "Задача: Короткая строка."
+
+
+def test_playwright_driver_owner_from_github_url_and_override(tmp_path):
+    env = {"COURSE_SHEET_URL": SHEET_URL, "GITHUB_URL": "https://github.com/fakeowner/repo.git"}
+    assert PlaywrightDriver.from_env(env, tmp_path, 35).owner == "fakeowner"
+    assert PlaywrightDriver.from_env(env, tmp_path, 35).day == 35
+    assert PlaywrightDriver.from_env({**env, "SHEET_OWNER": "other"}, tmp_path).owner == "other"
