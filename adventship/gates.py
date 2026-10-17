@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Callable
 
@@ -9,6 +10,31 @@ from advent_core import console
 from adventship.ctx import EXIT_GATE_DENIED, EXIT_NO_TTY, ShipContext, ShipError
 
 YES = {"да", "д", "y", "yes"}
+
+
+def _is_console_handle(stream) -> bool:
+    """Windows: the OS handle behind `stream` is a real console (NUL also reports isatty)."""
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        mode = wintypes.DWORD()
+        return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+    except (OSError, ValueError, AttributeError, ImportError):
+        return False
+
+
+def _is_real_tty(stream) -> bool:
+    try:
+        if not stream.isatty():
+            return False
+    except (OSError, ValueError, AttributeError):
+        return False
+    if os.name == "nt":
+        return _is_console_handle(stream)
+    return True
 
 
 def tty_gate(
@@ -23,7 +49,7 @@ def tty_gate(
     Without a tty nothing is asked and nothing runs (exit 8); any other answer, EOF
     included, is a refusal (exit 9). `is_tty`/`read` are test seams.
     """
-    tty_ok = is_tty() if is_tty else (sys.stdin.isatty() and sys.stderr.isatty())
+    tty_ok = is_tty() if is_tty else (_is_real_tty(sys.stdin) and _is_real_tty(sys.stderr))
     if not tty_ok:
         raise ShipError(
             "нужен tty для подтверждения",
