@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -2786,10 +2787,54 @@ def _git_out(*args: str) -> str:
     return done.stdout
 
 
-def _prepare_w07d35(week: int, day: int) -> None:
-    """Day 35 preflight: the 12-minute checks and the paid describe never run inside the take."""
+def _current_ship_inputs(week: int, day: int) -> dict[str, str]:
+    """Stage -> the fingerprint a fresh `adventship run` would record for it right now."""
+    from adventship import gitutil
+    from adventship.ctx import ShipContext, run_command
+    from adventship.stages import override_hash
+    from adventship.state import FINGERPRINTED, ShipState
+
+    root = PROJECT_ROOT.resolve()
+    workdir = root / "logs" / "ship" / f"w{week:02d}d{day:02d}"
+
+    def run(argv, *, timeout, input=None, env=None, inherit_env=True):
+        return run_command(
+            argv, timeout=timeout, input=input, env=env, inherit_env=inherit_env, cwd=root
+        )
+
+    # Read-only context: unlike build_context it never loads or quarantines state.json.
+    ctx = ShipContext(
+        week=week,
+        day=day,
+        tag=f"w{week:02d}d{day:02d}",
+        root=root,
+        workdir=workdir,
+        env={},
+        state=ShipState(workdir / "state.json"),
+        run=run,
+        complete=lambda *a, **k: None,
+        gate=lambda q, d: False,
+        driver_factory=lambda: None,
+        now=lambda: "",
+    )
+    value = gitutil.code_fingerprint(ctx)
+    inputs = {stage: value for stage in FINGERPRINTED}
+    inputs["describe"] = f"{value}|override:{override_hash(ctx)}"
+    return inputs
+
+
+def _prepare_w07d35(
+    week: int,
+    day: int,
+    current_inputs: Callable[[int, int], dict[str, str]] | None = None,
+) -> None:
+    """Day 35 preflight: the 12-minute checks and the paid describe never run inside the take.
+
+    `current_inputs` is the injectable fingerprint provider; None means the real git one.
+    """
     if (week, day) != (7, 35):
         return
+    provider = current_inputs if current_inputs is not None else _current_ship_inputs
     from datetime import timedelta
 
     state_path = PROJECT_ROOT / "logs" / "ship" / "w07d35" / "state.json"
@@ -2825,6 +2870,17 @@ def _prepare_w07d35(week: int, day: int) -> None:
         raise AdventError(f"HEAD не коммит дня: {subject.strip()!r}.", hint=git_hint)
     if dirty.strip():
         raise AdventError("В tracked-файлах есть незакоммиченные изменения.", hint=git_hint)
+    # Last: a dirty tree or a new HEAD changes the fingerprint too, and those messages are sharper.
+    try:
+        expected = provider(week, day)
+    except Exception as error:
+        raise AdventError(f"Не удалось вычислить fingerprint кода: {error}", hint=hint) from None
+    stale = [n for n in ("checks", "describe", "review") if stages[n].get("fp") != expected[n]]
+    if stale:
+        raise AdventError(
+            "состояние пайплайна устарело (код изменился): " + ", ".join(stale) + ".",
+            hint="Выполни `uv run adventship run --day 35 --week 7 --dry-run` до записи.",
+        )
 
 
 def _prepare_w07d31(week: int, day: int) -> None:

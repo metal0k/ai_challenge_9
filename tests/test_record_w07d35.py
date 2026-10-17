@@ -84,7 +84,11 @@ def _repo(tmp_path: Path) -> None:
 
 def _write_state(root: Path, *, probe_age: timedelta = timedelta(hours=1), ok: bool = True) -> None:
     now = datetime.now().astimezone()
+    fp_inputs = record._current_ship_inputs(7, 35)
     stages = {n: {"status": "done"} for n in ("intake", "checks", "describe", "review")}
+    for n in ("checks", "review"):
+        stages[n]["fp"] = fp_inputs[n]
+    stages["describe"]["fp"] = fp_inputs["describe"]
     doc = {
         "stages": stages,
         "sheet_probe": {
@@ -93,7 +97,7 @@ def _write_state(root: Path, *, probe_age: timedelta = timedelta(hours=1), ok: b
         },
     }
     path = root / "logs" / "ship" / "w07d35" / "state.json"
-    path.parent.mkdir(parents=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc), encoding="utf-8")
 
 
@@ -194,3 +198,61 @@ def test_rehearsal_steps_are_free_and_use_adventship() -> None:
     ]
     assert steps[1].expect_failure is True
     assert steps[1].stdin_lines == ["Проверка кириллицы через пайп"]
+
+
+def _stale_error(tmp_path: Path) -> AdventError:
+    with pytest.raises(AdventError) as info:
+        record._prepare_w07d35(7, 35)
+    return info.value
+
+
+@pytest.mark.parametrize("stage", ["checks", "describe", "review"])
+def test_prepare_refuses_a_stale_fingerprint_in_each_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    monkeypatch.setattr(record, "PROJECT_ROOT", tmp_path)
+    _write_state(tmp_path)
+    record._prepare_w07d35(7, 35)
+    path = tmp_path / "logs" / "ship" / "w07d35" / "state.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["stages"][stage]["fp"] = "0" * 64
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    error = _stale_error(tmp_path)
+    assert "состояние пайплайна устарело (код изменился)" in str(error)
+    assert stage in str(error)
+    assert "uv run adventship run --day 35 --week 7 --dry-run" in (error.hint or "")
+
+
+def test_prepare_refuses_when_the_fingerprint_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(record, "PROJECT_ROOT", tmp_path)
+    _write_state(tmp_path)
+    path = tmp_path / "logs" / "ship" / "w07d35" / "state.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    del doc["stages"]["checks"]["fp"]
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    assert "устарело" in str(_stale_error(tmp_path))
+
+
+def test_prepare_refuses_when_the_description_override_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(record, "PROJECT_ROOT", tmp_path)
+    _write_state(tmp_path)
+    record._prepare_w07d35(7, 35)
+    override = tmp_path / "logs" / "ship" / "w07d35" / "description.override.txt"
+    override.write_text("новое описание\n", encoding="utf-8")
+    error = _stale_error(tmp_path)
+    assert "устарело" in str(error) and "describe" in str(error)
+    assert "checks" not in str(error)
+
+
+def test_prepare_uses_an_injected_fingerprint_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(record, "PROJECT_ROOT", tmp_path)
+    _write_state(tmp_path)
+    wrong = {"checks": "x", "describe": "y", "review": "z"}
+    with pytest.raises(AdventError, match="устарело"):
+        record._prepare_w07d35(7, 35, current_inputs=lambda week, day: wrong)

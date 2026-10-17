@@ -92,7 +92,8 @@ def run_review(ctx: ShipContext) -> StageResult:
     text = scrub(text, ctx.env)
     out_file.write_text(text, encoding="utf-8")
     relative = _relative(ctx.root, out_file)
-    if result.returncode != 0 and not _VERDICT.search(text):
+    # A non-zero exit means the reviewer did not finish cleanly, whatever it had written.
+    if result.returncode != 0:
         tail = scrub("\n".join((result.stderr or "").strip().splitlines()[-8:]), ctx.env)
         raise ShipError(
             f"codex завершился с кодом {result.returncode}",

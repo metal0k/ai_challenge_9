@@ -150,6 +150,26 @@ def test_nonzero_exit_without_verdict_reports_stderr_tail(tmp_path):
     assert "auth required" in caught.value.hint
 
 
+def test_nonzero_exit_fails_even_when_the_text_says_pass(tmp_path):
+    ctx = make_ctx(tmp_path, FakeCodex("VERDICT: PASS", returncode=1, stderr="crashed: oom"))
+    with pytest.raises(ShipError, match="кодом 1") as caught:
+        review.run_review(ctx)
+    assert caught.value.exit_code == 10
+    assert "oom" in caught.value.hint
+
+
+def test_zero_exit_with_pass_is_ok(tmp_path):
+    ctx = make_ctx(tmp_path, FakeCodex("VERDICT: PASS", returncode=0))
+    assert review.run_review(ctx).data["verdict"] == "PASS"
+
+
+def test_zero_exit_with_fail_exits_11(tmp_path):
+    ctx = make_ctx(tmp_path, FakeCodex("VERDICT: FAIL", returncode=0))
+    with pytest.raises(ShipError) as caught:
+        review.run_review(ctx)
+    assert caught.value.exit_code == 11
+
+
 def test_falls_back_to_stdout_when_no_output_file(tmp_path):
     ctx = make_ctx(tmp_path, FakeCodex("VERDICT: PASS", via_file=False))
     assert review.run_review(ctx).data["verdict"] == "PASS"
