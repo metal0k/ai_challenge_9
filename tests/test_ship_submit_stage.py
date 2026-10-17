@@ -92,6 +92,31 @@ def test_existing_good_video_is_reused_without_recording(tmp_path):
     assert not runner.recorded()
 
 
+def test_existing_video_not_reused_when_head_is_not_the_tag(tmp_path):
+    write_video(tmp_path)
+    runner = Runner(head="other")
+    with pytest.raises(ShipError, match="HEAD не совпадает"):
+        submit_stage.run_record(make_ctx(tmp_path, runner))
+    assert not runner.recorded()
+
+
+def test_existing_video_not_reused_when_tracked_tree_is_dirty(tmp_path):
+    write_video(tmp_path)
+    runner = Runner(dirty="M a.py")
+    with pytest.raises(ShipError, match="не чистое"):
+        submit_stage.run_record(make_ctx(tmp_path, runner))
+    assert not runner.recorded()
+
+
+def test_reuse_on_clean_tag_checkout_reports_untracked_count(tmp_path):
+    write_video(tmp_path)
+    runner = Runner(untracked="a.txt\nb.txt")
+    result = submit_stage.run_record(make_ctx(tmp_path, runner))
+    assert result.data["skipped"] == "reuse"
+    assert result.data["warning"] == "untracked: 2"
+    assert not runner.recorded()
+
+
 def test_video_older_than_tag_is_not_reused(tmp_path):
     write_video(tmp_path, mtime=TAG_EPOCH - 3600)
     runner = Runner(dirty="M file.py")

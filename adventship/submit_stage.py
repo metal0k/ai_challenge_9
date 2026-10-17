@@ -100,10 +100,6 @@ def _record_result(path: Path, duration: float, **extra: object) -> StageResult:
 
 def run_record(ctx: ShipContext) -> StageResult:
     path = _video_path(ctx)
-    problem, duration = _video_problem(ctx, path)
-    if problem is None:
-        return _record_result(path, duration, skipped="reuse")
-
     sha = ctx.state.data("tag").get("sha") or _git(ctx, "rev-parse", f"{ctx.tag}^{{commit}}")
     if _git(ctx, "rev-parse", "HEAD") != sha:
         raise ShipError(
@@ -118,6 +114,12 @@ def run_record(ctx: ShipContext) -> StageResult:
 
     others = _git(ctx, "ls-files", "--others", "--exclude-standard")
     untracked = len([line for line in others.splitlines() if line.strip()])
+    extra = {"warning": f"untracked: {untracked}"} if untracked else {}
+
+    # A reused video must come from this exact checkout: checks above run first.
+    problem, duration = _video_problem(ctx, path)
+    if problem is None:
+        return _record_result(path, duration, skipped="reuse", **extra)
 
     result = ctx.run(
         ["uv", "run", "advent", "record", "--day", str(ctx.day), "--week", str(ctx.week)],
@@ -131,7 +133,6 @@ def run_record(ctx: ShipContext) -> StageResult:
     problem, duration = _video_problem(ctx, path)
     if problem is not None:
         raise ShipError(f"запись не прошла проверку: {problem}")
-    extra = {"warning": f"untracked: {untracked}"} if untracked else {}
     return _record_result(path, duration, **extra)
 
 
